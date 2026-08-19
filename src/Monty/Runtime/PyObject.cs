@@ -182,8 +182,33 @@ public class PyInt : PyObject
     /// <inheritdoc />
     public override bool IsTruthy() => !Value.IsZero;
 
+    /// <summary>
+    /// How many decimal digits an integer may be converted to or from.
+    /// </summary>
+    /// <remarks>
+    /// Decimal conversion of a huge integer is quadratic, so CPython caps it — and so does
+    /// this, at the same 4300 digits, because a script that can ask for a billion-digit
+    /// conversion can burn arbitrary CPU inside the sandbox. Binary, octal and hexadecimal
+    /// are linear and stay unbounded.
+    /// </remarks>
+    public const int MaxStringDigits = 4300;
+
     /// <inheritdoc />
-    public override string Repr() => Value.ToString(CultureInfo.InvariantCulture);
+    public override string Repr() => Decimal(Value);
+
+    /// <summary>Renders an integer in decimal, refusing one past the digit limit.</summary>
+    public static string Decimal(BigInteger value)
+    {
+        // The bound is checked before formatting, so a huge value costs nothing to reject.
+        if (BigInteger.Abs(value) >= BigInteger.Pow(10, MaxStringDigits))
+        {
+            throw new PyRaise(PyErrors.ValueError(
+                $"Exceeds the limit ({MaxStringDigits} digits) for integer string conversion: "
+                + "use sys.set_int_max_str_digits() to increase the limit"));
+        }
+
+        return value.ToString(CultureInfo.InvariantCulture);
+    }
 
     /// <inheritdoc />
     public override bool PyEquals(PyObject other) => other switch

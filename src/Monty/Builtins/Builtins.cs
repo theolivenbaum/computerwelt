@@ -473,13 +473,22 @@ public static class BuiltinNamespace
         return new PyStr((value.Sign < 0 ? "-" : string.Empty) + prefix + digits);
     }
 
-    internal static BigInteger RequireInt(PyObject value, string function) => value switch
+    /// <summary>
+    /// Reads an argument that must be an integer.
+    /// </summary>
+    /// <remarks>
+    /// A float is refused rather than truncated: <c>hex(1.5)</c> is a mistake in the call,
+    /// and silently rounding it would hide one.
+    /// </remarks>
+    internal static BigInteger RequireInt(PyObject value, string function)
     {
-        PyInt integer => integer.Value,
-        PyFloat number => new BigInteger(Math.Truncate(number.Value)),
-        _ => throw new PyRaise(PyErrors.TypeError(
-            $"'{value.TypeName}' object cannot be interpreted as an integer")),
-    };
+        _ = function;
+
+        return value is PyInt integer
+            ? integer.Value
+            : throw new PyRaise(PyErrors.TypeError(
+                $"'{value.TypeName}' object cannot be interpreted as an integer"));
+    }
 }
 
 /// <summary>The <c>NotImplemented</c> singleton returned by unsupported dunder operations.</summary>
@@ -526,14 +535,18 @@ internal static class StringFormatterAccess
 public static class Conversions
 {
     /// <summary>Implements <c>int()</c>.</summary>
-    public static PyObject ToInt(PyObject[] arguments)
+    public static PyObject ToInt(PyObject[] arguments, PyDict? keywords = null)
     {
         if (arguments.Length == 0)
         {
             return new PyInt(0);
         }
 
-        var radix = arguments.Length > 1 ? (int)BuiltinNamespace.RequireInt(arguments[1], "int") : 10;
+        var given = arguments.Length > 1 ? arguments[1]
+            : keywords is not null && keywords.TryGetValue(new PyStr("base"), out var named) ? named
+            : null;
+
+        var radix = given is null ? 10 : (int)BuiltinNamespace.RequireInt(given, "int");
 
         switch (arguments[0])
         {
@@ -552,9 +565,25 @@ public static class Conversions
 
                 return new PyInt(new BigInteger(Math.Truncate(number.Value)));
 
+            case PyBytes raw:
+                // A bytes literal is read as the ASCII text it spells.
+                return ToInt([new PyStr(System.Text.Encoding.UTF8.GetString(raw.Value)), .. arguments[1..]], keywords);
+
             case PyStr text:
             {
                 var trimmed = text.Value.Trim().Replace("_", string.Empty, StringComparison.Ordinal);
+
+                // A well-formed decimal literal that is merely too long gets the digit-limit
+                // error, and gets it before any number is built; a malformed one gets the
+                // ordinary complaint, however long it is.
+                if (radix is 10 or 0
+                    && trimmed.TrimStart('-', '+') is { Length: > PyInt.MaxStringDigits } digits
+                    && digits.All(char.IsAsciiDigit))
+                {
+                    throw new PyRaise(PyErrors.ValueError(
+                        $"Exceeds the limit ({PyInt.MaxStringDigits} digits) for integer string conversion: "
+                        + $"value has {digits.Length} digits"));
+                }
 
                 if (TryParseRadix(trimmed, radix, out var parsed))
                 {
@@ -587,19 +616,24 @@ public static class Conversions
             text = text[1..];
         }
 
+        // Base 0 asks for the prefix to decide, defaulting to decimal.
+        var detect = radix == 0;
+
+        if (detect)
+        {
+            radix = 10;
+        }
+
         // A literal may carry a radix prefix, which must agree with the requested base.
         if (text.Length > 2 && text[0] == '0')
         {
             var prefix = char.ToLowerInvariant(text[1]);
             var prefixRadix = prefix switch { 'x' => 16, 'o' => 8, 'b' => 2, _ => 0 };
 
-            if (prefixRadix != 0)
+            // A prefix is only a prefix when it agrees with the base being read. In base
+            // 16 `b` is a digit, so `int('0b10', 16)` is 0xb10, not binary 10.
+            if (prefixRadix != 0 && (detect || radix == 10 || radix == prefixRadix))
             {
-                if (radix != 10 && radix != prefixRadix)
-                {
-                    return false;
-                }
-
                 radix = prefixRadix;
                 text = text[2..];
             }

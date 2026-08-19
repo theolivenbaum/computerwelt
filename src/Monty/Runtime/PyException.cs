@@ -297,8 +297,23 @@ public static class PyErrors
     /// Creates a <c>KeyError</c>. Its message is the key's <c>repr</c>, not a sentence —
     /// scripts print it and expect exactly that.
     /// </summary>
-    public static PyException KeyError(PyObject key) =>
-        new(PyExceptionType.KeyError, key.Repr(), [key]);
+    public static PyException KeyError(PyObject key)
+    {
+        string text;
+
+        try
+        {
+            text = key.Repr();
+        }
+        catch (PyRaise)
+        {
+            // A key too large to render — a huge integer — still names a missing key, and
+            // reporting that is more useful than replacing it with the rendering failure.
+            text = $"<{key.TypeName}>";
+        }
+
+        return new PyException(PyExceptionType.KeyError, text, [key]);
+    }
 
     /// <summary>Creates a <c>ZeroDivisionError</c>.</summary>
     public static PyException ZeroDivisionError(string message) =>

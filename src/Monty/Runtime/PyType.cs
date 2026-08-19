@@ -106,7 +106,7 @@ public static class TypeRegistry
 
     /// <summary><c>int</c>. <c>bool</c> is a subtype, so a bool is an int.</summary>
     public static PyType Int { get; } = Define(
-        "int", static value => value is PyInt, static (arguments, _) => Builtins.Conversions.ToInt(arguments));
+        "int", static value => value is PyInt, static (arguments, keywords) => Builtins.Conversions.ToInt(arguments, keywords));
 
     /// <summary><c>float</c>.</summary>
     public static PyType Float { get; } = Define(

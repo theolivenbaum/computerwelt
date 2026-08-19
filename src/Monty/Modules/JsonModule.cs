@@ -16,7 +16,7 @@ namespace Monty.Modules;
 public static class JsonModule
 {
     /// <summary>The digit limit CPython applies to decimal integer conversion.</summary>
-    private const int MaxIntegerDigits = 4300;
+    private const int MaxIntegerDigits = PyInt.MaxStringDigits;
 
     /// <summary>Builds the module.</summary>
     public static PyModuleObject Create(VirtualMachine machine)
@@ -462,18 +462,7 @@ public static class JsonModule
     }
 
     /// <summary>Renders an integer, refusing one wider than the decimal conversion limit.</summary>
-    private static string Digits(BigInteger value)
-    {
-        // The bound is checked before formatting, so a multi-million-digit value costs
-        // nothing to reject.
-        if (BigInteger.Abs(value) >= BigInteger.Pow(10, MaxIntegerDigits))
-        {
-            throw new PyRaise(PyErrors.ValueError(
-                $"Exceeds the limit ({MaxIntegerDigits} digits) for integer string conversion"));
-        }
-
-        return value.ToString(CultureInfo.InvariantCulture);
-    }
+    private static string Digits(BigInteger value) => PyInt.Decimal(value);
 
     private static PyObject? Keyword(PyDict? keywords, string name) =>
         keywords is not null && keywords.TryGetValue(new PyStr(name), out var value) && value is not PyNone
