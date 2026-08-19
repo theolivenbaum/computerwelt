@@ -23,6 +23,9 @@ public sealed class SedBuiltin : IBuiltin
 {
     private static readonly TimeSpan MatchTimeout = TimeSpan.FromSeconds(2);
 
+    /// <summary>How many instructions one input line may execute before the script is called looping.</summary>
+    private const int MaxSteps = 1_000_000;
+
     /// <inheritdoc />
     public string Name => "sed";
 
@@ -94,7 +97,7 @@ public sealed class SedBuiltin : IBuiltin
             operands = operands[1..];
         }
 
-        List<SedCommand> program;
+        SedProgram program;
         try
         {
             program = SedParser.Parse(string.Join('\n', scripts), extended);
@@ -109,30 +112,47 @@ public sealed class SedBuiltin : IBuiltin
         var builder = new StringBuilder();
         var exitCode = errors.Length == 0 ? 0 : ExitCodes.Failure;
 
-        if (separate || inPlace)
+        try
         {
-            for (var i = 0; i < inputs.Count; i++)
+            if (separate || inPlace)
             {
-                var output = new StringBuilder();
-                Run(program, TextHelpers.SplitLines(inputs[i].Content), quiet, output);
+                for (var i = 0; i < inputs.Count; i++)
+                {
+                    var output = new StringBuilder();
+                    var code = Run(program, TextHelpers.SplitLines(inputs[i].Content), quiet, output);
 
-                if (inPlace && inputs[i].Name != "-")
-                {
-                    await context.FileSystem.WriteFileAsync(
-                        context.ResolvePath(inputs[i].Name),
-                        Encoding.UTF8.GetBytes(output.ToString()),
-                        cancellationToken);
+                    if (inPlace && inputs[i].Name != "-")
+                    {
+                        await context.FileSystem.WriteFileAsync(
+                            context.ResolvePath(inputs[i].Name),
+                            Encoding.UTF8.GetBytes(output.ToString()),
+                            cancellationToken);
+                    }
+                    else
+                    {
+                        builder.Append(output);
+                    }
+
+                    if (code != 0)
+                    {
+                        exitCode = code;
+                    }
                 }
-                else
+            }
+            else
+            {
+                var lines = inputs.SelectMany(static i => TextHelpers.SplitLines(i.Content)).ToArray();
+                var code = Run(program, lines, quiet, builder);
+
+                if (code != 0)
                 {
-                    builder.Append(output);
+                    exitCode = code;
                 }
             }
         }
-        else
+        catch (FormatException e)
         {
-            var lines = inputs.SelectMany(static i => TextHelpers.SplitLines(i.Content)).ToArray();
-            Run(program, lines, quiet, builder);
+            return ExecResult.Usage("sed", e.Message, ExitCodes.Usage);
         }
 
         return new ExecResult
@@ -144,47 +164,76 @@ public sealed class SedBuiltin : IBuiltin
     }
 
     /// <summary>Runs the parsed program over the input lines.</summary>
-    private static void Run(List<SedCommand> program, string[] lines, bool quiet, StringBuilder output)
+    /// <returns>The exit code a <c>q</c> or <c>Q</c> asked for, or zero.</returns>
+    private static int Run(SedProgram program, string[] lines, bool quiet, StringBuilder output)
     {
-        var state = new SedState(lines.Length);
+        // Ranges are stateful, and `-s` runs the same program over each file in turn.
+        program.Reset();
 
-        for (var index = 0; index < lines.Length; index++)
+        var state = new SedState(lines);
+
+        while (state.Index < lines.Length)
         {
-            state.LineNumber = index + 1;
-            state.PatternSpace = lines[index];
-            state.Deleted = false;
+            state.PatternSpace = lines[state.Index];
+            state.Substituted = false;
             state.Appended.Clear();
 
-            Execute(program, state, quiet, output);
+            SedFlow flow;
 
-            if (!state.Deleted && !quiet)
+            do
+            {
+                flow = Execute(program, state, quiet, output);
+            }
+            while (flow == SedFlow.Restart);
+
+            if (flow is SedFlow.Normal or SedFlow.Quit && !quiet)
             {
                 output.Append(state.PatternSpace).Append('\n');
             }
 
-            foreach (var appended in state.Appended)
+            // `Q` abandons the queued append text along with the pattern space.
+            if (flow != SedFlow.QuitSilent)
             {
-                output.Append(appended).Append('\n');
+                Flush(state, output);
             }
 
-            if (state.Quit)
+            if (flow is SedFlow.Quit or SedFlow.QuitSilent)
             {
-                return;
+                break;
             }
+
+            state.Index++;
         }
+
+        return state.ExitCode;
     }
 
-    private static void Execute(List<SedCommand> program, SedState state, bool quiet, StringBuilder output)
+    /// <summary>Runs the program once over the current pattern space.</summary>
+    /// <remarks>
+    /// The program is a flat instruction list rather than a tree so that <c>b</c>, <c>t</c>
+    /// and <c>T</c> can be a plain assignment to the program counter. A block is an
+    /// instruction that either falls through into its body or jumps past it.
+    /// </remarks>
+    private static SedFlow Execute(SedProgram program, SedState state, bool quiet, StringBuilder output)
     {
-        foreach (var command in program)
+        var commands = program.Commands;
+        var pc = 0;
+        var steps = 0;
+
+        while (pc < commands.Count)
         {
-            if (state.Deleted || state.Quit)
+            // `:x; b x` is a legal script that never ends. Bounding the step count keeps a
+            // runaway script an error rather than a hung sandbox.
+            if (++steps > MaxSteps)
             {
-                return;
+                throw new FormatException("script does not terminate");
             }
+
+            var command = commands[pc];
 
             if (!command.Address.Matches(state))
             {
+                pc = command.Kind == SedKind.Block ? command.Jump : pc + 1;
                 continue;
             }
 
@@ -192,20 +241,44 @@ public sealed class SedBuiltin : IBuiltin
             {
                 case SedKind.Substitute:
                     state.PatternSpace = command.Substitute!.Apply(state.PatternSpace, out var changed);
-                    if (changed && command.Substitute.Print)
+                    if (changed)
                     {
-                        output.Append(state.PatternSpace).Append('\n');
+                        state.Substituted = true;
+
+                        if (command.Substitute.Print)
+                        {
+                            output.Append(state.PatternSpace).Append('\n');
+                        }
                     }
 
                     break;
 
                 case SedKind.Delete:
-                    state.Deleted = true;
-                    return;
+                    return SedFlow.Deleted;
+
+                case SedKind.DeleteFirstLine:
+                {
+                    var newline = state.PatternSpace.IndexOf('\n', StringComparison.Ordinal);
+
+                    if (newline < 0)
+                    {
+                        return SedFlow.Deleted;
+                    }
+
+                    state.PatternSpace = state.PatternSpace[(newline + 1)..];
+                    return SedFlow.Restart;
+                }
 
                 case SedKind.Print:
                     output.Append(state.PatternSpace).Append('\n');
                     break;
+
+                case SedKind.PrintFirstLine:
+                {
+                    var newline = state.PatternSpace.IndexOf('\n', StringComparison.Ordinal);
+                    output.Append(newline < 0 ? state.PatternSpace : state.PatternSpace[..newline]).Append('\n');
+                    break;
+                }
 
                 case SedKind.PrintLineNumber:
                     output.Append(state.LineNumber.ToString(CultureInfo.InvariantCulture)).Append('\n');
@@ -220,29 +293,126 @@ public sealed class SedBuiltin : IBuiltin
                     break;
 
                 case SedKind.Change:
-                    state.Deleted = true;
-                    output.Append(command.Text).Append('\n');
-                    return;
+                    // Over a range, the replacement text stands for the whole range and so
+                    // is emitted once, as the range closes.
+                    if (command.Address.JustClosed)
+                    {
+                        output.Append(command.Text).Append('\n');
+                    }
+
+                    return SedFlow.Deleted;
 
                 case SedKind.Transliterate:
                     state.PatternSpace = Transliterate(state.PatternSpace, command.From!, command.To!);
                     break;
 
                 case SedKind.Quit:
+                    state.ExitCode = command.ExitCode;
+                    return SedFlow.Quit;
+
+                case SedKind.QuitSilent:
+                    state.ExitCode = command.ExitCode;
+                    return SedFlow.QuitSilent;
+
+                case SedKind.Next:
                     if (!quiet)
                     {
                         output.Append(state.PatternSpace).Append('\n');
                     }
 
-                    state.Deleted = true;
-                    state.Quit = true;
-                    return;
+                    Flush(state, output);
 
+                    if (state.Index + 1 >= state.TotalLines)
+                    {
+                        return SedFlow.QuitSilent;
+                    }
+
+                    state.Index++;
+                    state.PatternSpace = state.Lines[state.Index];
+                    break;
+
+                case SedKind.AppendNext:
+                    Flush(state, output);
+
+                    // GNU prints what it has when `N` meets the end of input; POSIX would
+                    // discard it, and scripts in the wild rely on the GNU reading.
+                    if (state.Index + 1 >= state.TotalLines)
+                    {
+                        return SedFlow.Quit;
+                    }
+
+                    state.Index++;
+                    state.PatternSpace = state.PatternSpace + "\n" + state.Lines[state.Index];
+                    break;
+
+                case SedKind.Hold:
+                    state.HoldSpace = state.PatternSpace;
+                    break;
+
+                case SedKind.HoldAppend:
+                    state.HoldSpace = state.HoldSpace + "\n" + state.PatternSpace;
+                    break;
+
+                case SedKind.Get:
+                    state.PatternSpace = state.HoldSpace;
+                    break;
+
+                case SedKind.GetAppend:
+                    state.PatternSpace = state.PatternSpace + "\n" + state.HoldSpace;
+                    break;
+
+                case SedKind.Exchange:
+                    (state.PatternSpace, state.HoldSpace) = (state.HoldSpace, state.PatternSpace);
+                    break;
+
+                case SedKind.Zap:
+                    state.PatternSpace = string.Empty;
+                    break;
+
+                case SedKind.Branch:
+                    pc = command.Jump;
+                    continue;
+
+                case SedKind.BranchIf:
+                    if (state.Substituted)
+                    {
+                        state.Substituted = false;
+                        pc = command.Jump;
+                        continue;
+                    }
+
+                    break;
+
+                case SedKind.BranchUnless:
+                    if (!state.Substituted)
+                    {
+                        pc = command.Jump;
+                        continue;
+                    }
+
+                    state.Substituted = false;
+                    break;
+
+                case SedKind.Label:
                 case SedKind.Block:
-                    Execute(command.Block!, state, quiet, output);
                     break;
             }
+
+            pc++;
         }
+
+        return SedFlow.Normal;
+    }
+
+    /// <summary>Emits and clears the queued <c>a</c> text.</summary>
+    private static void Flush(SedState state, StringBuilder output)
+    {
+        foreach (var appended in state.Appended)
+        {
+            output.Append(appended).Append('\n');
+        }
+
+        state.Appended.Clear();
     }
 
     private static string Transliterate(string text, string from, string to)
@@ -258,18 +428,45 @@ public sealed class SedBuiltin : IBuiltin
         return builder.ToString();
     }
 
-    /// <summary>The mutable state one input line is processed against.</summary>
-    private sealed class SedState(int totalLines)
+    /// <summary>What running the script over one pattern space decided to do next.</summary>
+    private enum SedFlow
     {
+        /// <summary>Fell off the end: print the pattern space and read the next line.</summary>
+        Normal,
+
+        /// <summary>Start the next cycle without printing.</summary>
+        Deleted,
+
+        /// <summary>Re-run the script over what is left of the pattern space (<c>D</c>).</summary>
+        Restart,
+
+        /// <summary>Print the pattern space and stop (<c>q</c>).</summary>
+        Quit,
+
+        /// <summary>Stop without printing anything further (<c>Q</c>).</summary>
+        QuitSilent,
+    }
+
+    /// <summary>The mutable state one input line is processed against.</summary>
+    private sealed class SedState(string[] lines)
+    {
+        public string[] Lines { get; } = lines;
+
+        /// <summary>The zero-based index of the line in the pattern space.</summary>
+        public int Index { get; set; }
+
         public string PatternSpace { get; set; } = string.Empty;
 
-        public int LineNumber { get; set; }
+        public string HoldSpace { get; set; } = string.Empty;
 
-        public int TotalLines { get; } = totalLines;
+        public int LineNumber => Index + 1;
 
-        public bool Deleted { get; set; }
+        public int TotalLines => Lines.Length;
 
-        public bool Quit { get; set; }
+        /// <summary>Whether an <c>s</c> succeeded since the last line or <c>t</c>.</summary>
+        public bool Substituted { get; set; }
+
+        public int ExitCode { get; set; }
 
         public List<string> Appended { get; } = [];
     }
@@ -278,13 +475,28 @@ public sealed class SedBuiltin : IBuiltin
     {
         Substitute,
         Delete,
+        DeleteFirstLine,
         Print,
+        PrintFirstLine,
         PrintLineNumber,
         Append,
         Insert,
         Change,
         Transliterate,
         Quit,
+        QuitSilent,
+        Next,
+        AppendNext,
+        Hold,
+        HoldAppend,
+        Get,
+        GetAppend,
+        Exchange,
+        Zap,
+        Label,
+        Branch,
+        BranchIf,
+        BranchUnless,
         Block,
     }
 
@@ -298,11 +510,29 @@ public sealed class SedBuiltin : IBuiltin
 
         public string? To { get; init; }
 
-        public List<SedCommand>? Block { get; init; }
+        /// <summary>Where a branch goes, or where a block's body ends.</summary>
+        public int Jump { get; init; }
+
+        public int ExitCode { get; init; }
+    }
+
+    /// <summary>A parsed script: a flat instruction list with its jumps already resolved.</summary>
+    private sealed class SedProgram(List<SedCommand> commands)
+    {
+        public List<SedCommand> Commands { get; } = commands;
+
+        /// <summary>Clears the range state, so a fresh input starts outside every range.</summary>
+        public void Reset()
+        {
+            foreach (var command in Commands)
+            {
+                command.Address.Reset();
+            }
+        }
     }
 
     /// <summary>
-    /// A command's address: nothing (every line), one line or pattern, or a range.
+    /// A command's address: nothing (every line), one line, a step, a pattern, or a range.
     /// A range is stateful — once entered it stays active until its end matches.
     /// </summary>
     private sealed class SedAddress
@@ -315,17 +545,44 @@ public sealed class SedBuiltin : IBuiltin
 
         public bool Last { get; init; }
 
+        /// <summary>The <c>step</c> of a <c>first~step</c> address.</summary>
+        public int? Step { get; init; }
+
         public int? EndLine { get; init; }
 
         public Regex? EndPattern { get; init; }
 
         public bool EndLast { get; init; }
 
+        /// <summary>The <c>N</c> of an <c>addr,+N</c> range.</summary>
+        public int? EndRelative { get; init; }
+
+        /// <summary>The <c>N</c> of an <c>addr,~N</c> range.</summary>
+        public int? EndMultiple { get; init; }
+
         public bool IsRange { get; init; }
 
         public bool Negated { get; init; }
 
+        /// <summary>
+        /// True for <c>0,/re/</c>, whose range is open before the first line is read so that
+        /// the end pattern can match on line one.
+        /// </summary>
+        public bool StartsBeforeInput { get; init; }
+
+        /// <summary>True when the last evaluation was this address's final line.</summary>
+        public bool JustClosed { get; private set; }
+
         private bool _inRange;
+
+        private int _rangeStart;
+
+        public void Reset()
+        {
+            _inRange = StartsBeforeInput;
+            _rangeStart = 0;
+            JustClosed = false;
+        }
 
         public bool Matches(SedState state)
         {
@@ -335,6 +592,8 @@ public sealed class SedBuiltin : IBuiltin
 
         private bool Evaluate(SedState state)
         {
+            JustClosed = !IsRange;
+
             if (!IsRange)
             {
                 return MatchesStart(state);
@@ -345,6 +604,7 @@ public sealed class SedBuiltin : IBuiltin
                 if (MatchesEnd(state))
                 {
                     _inRange = false;
+                    JustClosed = true;
                 }
 
                 return true;
@@ -355,16 +615,30 @@ public sealed class SedBuiltin : IBuiltin
                 return false;
             }
 
-            // A range whose end is a line number already passed closes immediately.
-            _inRange = !(EndLine is { } end && end <= state.LineNumber);
+            _rangeStart = state.LineNumber;
+            _inRange = !ClosesImmediately(state);
+            JustClosed = !_inRange;
             return true;
         }
+
+        private bool ClosesImmediately(SedState state) =>
+            (EndLine is { } end && end <= state.LineNumber)
+            || EndRelative == 0
+            || (EndMultiple is { } multiple && multiple > 1 && state.LineNumber % multiple == 0);
 
         private bool MatchesStart(SedState state)
         {
             if (Last)
             {
                 return state.LineNumber == state.TotalLines;
+            }
+
+            if (Step is { } step)
+            {
+                var first = Line ?? 0;
+                return step > 0
+                    ? state.LineNumber >= first && (state.LineNumber - first) % step == 0
+                    : state.LineNumber == first;
             }
 
             if (Line is { } line)
@@ -390,6 +664,16 @@ public sealed class SedBuiltin : IBuiltin
             if (EndLine is { } line)
             {
                 return state.LineNumber >= line;
+            }
+
+            if (EndRelative is { } offset)
+            {
+                return state.LineNumber >= _rangeStart + offset;
+            }
+
+            if (EndMultiple is { } multiple)
+            {
+                return multiple <= 1 || state.LineNumber % multiple == 0;
             }
 
             return EndPattern is not null && SafeMatch(EndPattern, state.PatternSpace);
@@ -500,29 +784,63 @@ public sealed class SedBuiltin : IBuiltin
     /// <summary>Parses a sed script into commands.</summary>
     private static class SedParser
     {
-        public static List<SedCommand> Parse(string script, bool extended)
-        {
-            var position = 0;
-            return ParseBlock(script, ref position, extended, terminator: '\0');
-        }
-
-        private static List<SedCommand> ParseBlock(string script, ref int position, bool extended, char terminator)
+        public static SedProgram Parse(string script, bool extended)
         {
             var commands = new List<SedCommand>();
+            var labels = new Dictionary<string, int>(StringComparer.Ordinal);
+            var position = 0;
 
+            ParseBlock(script, ref position, extended, terminator: '\0', commands, labels);
+
+            // Labels may be referenced before they are defined, so branches are resolved
+            // once the whole script is known. An empty label means "end of script".
+            for (var i = 0; i < commands.Count; i++)
+            {
+                if (commands[i].Kind is not (SedKind.Branch or SedKind.BranchIf or SedKind.BranchUnless))
+                {
+                    continue;
+                }
+
+                var label = commands[i].Text ?? string.Empty;
+
+                if (label.Length == 0)
+                {
+                    commands[i] = commands[i] with { Jump = commands.Count };
+                    continue;
+                }
+
+                if (!labels.TryGetValue(label, out var target))
+                {
+                    throw new FormatException($"can't find label for jump to `{label}'");
+                }
+
+                commands[i] = commands[i] with { Jump = target };
+            }
+
+            return new SedProgram(commands);
+        }
+
+        private static void ParseBlock(
+            string script,
+            ref int position,
+            bool extended,
+            char terminator,
+            List<SedCommand> commands,
+            Dictionary<string, int> labels)
+        {
             while (position < script.Length)
             {
                 SkipSeparators(script, ref position);
 
                 if (position >= script.Length)
                 {
-                    break;
+                    return;
                 }
 
                 if (script[position] == terminator)
                 {
                     position++;
-                    return commands;
+                    return;
                 }
 
                 if (script[position] == '#')
@@ -535,10 +853,8 @@ public sealed class SedBuiltin : IBuiltin
                     continue;
                 }
 
-                commands.Add(ParseCommand(script, ref position, extended));
+                ParseCommand(script, ref position, extended, commands, labels);
             }
-
-            return commands;
         }
 
         private static void SkipSeparators(string script, ref int position)
@@ -549,7 +865,12 @@ public sealed class SedBuiltin : IBuiltin
             }
         }
 
-        private static SedCommand ParseCommand(string script, ref int position, bool extended)
+        private static void ParseCommand(
+            string script,
+            ref int position,
+            bool extended,
+            List<SedCommand> commands,
+            Dictionary<string, int> labels)
         {
             var address = ParseAddress(script, ref position, extended);
 
@@ -568,28 +889,19 @@ public sealed class SedBuiltin : IBuiltin
             switch (kind)
             {
                 case 's':
-                    return new SedCommand(SedKind.Substitute, address)
+                    commands.Add(new SedCommand(SedKind.Substitute, address)
                     {
                         Substitute = ParseSubstitution(script, ref position, extended),
-                    };
+                    });
+
+                    return;
 
                 case 'y':
                 {
                     var (from, to) = ParseTransliteration(script, ref position);
-                    return new SedCommand(SedKind.Transliterate, address) { From = from, To = to };
+                    commands.Add(new SedCommand(SedKind.Transliterate, address) { From = from, To = to });
+                    return;
                 }
-
-                case 'd':
-                    return new SedCommand(SedKind.Delete, address);
-
-                case 'p':
-                    return new SedCommand(SedKind.Print, address);
-
-                case '=':
-                    return new SedCommand(SedKind.PrintLineNumber, address);
-
-                case 'q':
-                    return new SedCommand(SedKind.Quit, address);
 
                 case 'a' or 'i' or 'c':
                 {
@@ -601,18 +913,112 @@ public sealed class SedBuiltin : IBuiltin
                         _ => SedKind.Change,
                     };
 
-                    return new SedCommand(mapped, address) { Text = text };
+                    commands.Add(new SedCommand(mapped, address) { Text = text });
+                    return;
+                }
+
+                case 'q' or 'Q':
+                    commands.Add(new SedCommand(kind == 'q' ? SedKind.Quit : SedKind.QuitSilent, address)
+                    {
+                        ExitCode = ReadExitCode(script, ref position),
+                    });
+
+                    return;
+
+                case ':':
+                {
+                    // A label names the instruction that follows it, so nothing is emitted.
+                    var name = ReadLabel(script, ref position);
+
+                    if (name.Length == 0)
+                    {
+                        throw new FormatException("\":\" lacks a label");
+                    }
+
+                    labels[name] = commands.Count;
+                    return;
+                }
+
+                case 'b' or 't' or 'T':
+                {
+                    var mapped = kind switch
+                    {
+                        'b' => SedKind.Branch,
+                        't' => SedKind.BranchIf,
+                        _ => SedKind.BranchUnless,
+                    };
+
+                    commands.Add(new SedCommand(mapped, address) { Text = ReadLabel(script, ref position) });
+                    return;
                 }
 
                 case '{':
-                    return new SedCommand(SedKind.Block, address)
-                    {
-                        Block = ParseBlock(script, ref position, extended, terminator: '}'),
-                    };
+                {
+                    var index = commands.Count;
+                    commands.Add(new SedCommand(SedKind.Block, address));
+                    ParseBlock(script, ref position, extended, terminator: '}', commands, labels);
+                    commands[index] = commands[index] with { Jump = commands.Count };
+                    return;
+                }
 
                 default:
-                    throw new FormatException($"unknown command: `{kind}'");
+                    commands.Add(new SedCommand(Simple(kind), address));
+                    return;
             }
+        }
+
+        /// <summary>Maps a command letter that carries no argument.</summary>
+        private static SedKind Simple(char kind) => kind switch
+        {
+            'd' => SedKind.Delete,
+            'D' => SedKind.DeleteFirstLine,
+            'p' => SedKind.Print,
+            'P' => SedKind.PrintFirstLine,
+            '=' => SedKind.PrintLineNumber,
+            'n' => SedKind.Next,
+            'N' => SedKind.AppendNext,
+            'h' => SedKind.Hold,
+            'H' => SedKind.HoldAppend,
+            'g' => SedKind.Get,
+            'G' => SedKind.GetAppend,
+            'x' => SedKind.Exchange,
+            'z' => SedKind.Zap,
+            _ => throw new FormatException($"unknown command: `{kind}'"),
+        };
+
+        private static int ReadExitCode(string script, ref int position)
+        {
+            while (position < script.Length && script[position] == ' ')
+            {
+                position++;
+            }
+
+            var start = position;
+
+            while (position < script.Length && char.IsAsciiDigit(script[position]))
+            {
+                position++;
+            }
+
+            return position == start ? 0 : int.Parse(script[start..position], CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>Reads a label name, which runs to the end of the command.</summary>
+        private static string ReadLabel(string script, ref int position)
+        {
+            while (position < script.Length && script[position] == ' ')
+            {
+                position++;
+            }
+
+            var start = position;
+
+            while (position < script.Length && script[position] is not (';' or '\n' or '}'))
+            {
+                position++;
+            }
+
+            return script[start..position].TrimEnd();
         }
 
         private static SedAddress ParseAddress(string script, ref int position, bool extended)
@@ -627,9 +1033,9 @@ public sealed class SedBuiltin : IBuiltin
                 return SedAddress.Always;
             }
 
-            var (line, pattern, last, found) = ParseOneAddress(script, ref position, extended);
+            var start = ParseOneAddress(script, ref position, extended, isEnd: false);
 
-            if (!found)
+            if (!start.Found)
             {
                 return SedAddress.Always;
             }
@@ -637,48 +1043,65 @@ public sealed class SedBuiltin : IBuiltin
             if (position < script.Length && script[position] == ',')
             {
                 position++;
-                var (endLine, endPattern, endLast, _) = ParseOneAddress(script, ref position, extended);
-                var range = new SedAddress
+                var end = ParseOneAddress(script, ref position, extended, isEnd: true);
+
+                return new SedAddress
                 {
-                    Line = line,
-                    Pattern = pattern,
-                    Last = last,
-                    EndLine = endLine,
-                    EndPattern = endPattern,
-                    EndLast = endLast,
+                    Line = start.Line,
+                    Pattern = start.Pattern,
+                    Last = start.Last,
+                    Step = start.Step,
+                    EndLine = end.Line,
+                    EndPattern = end.Pattern,
+                    EndLast = end.Last,
+                    EndRelative = end.Relative,
+                    EndMultiple = end.Multiple,
                     IsRange = true,
+
+                    // `0,/re/` is GNU's way of saying "up to the first match, even on line 1".
+                    StartsBeforeInput = start.Line == 0 && start.Step is null,
                     Negated = ConsumeNegation(script, ref position),
                 };
-
-                return range;
             }
 
             return new SedAddress
             {
-                Line = line,
-                Pattern = pattern,
-                Last = last,
+                Line = start.Line,
+                Pattern = start.Pattern,
+                Last = start.Last,
+                Step = start.Step,
                 Negated = ConsumeNegation(script, ref position),
             };
         }
 
         private static bool ConsumeNegation(string script, ref int position)
         {
-            while (position < script.Length && script[position] == ' ')
+            var negated = false;
+
+            while (position < script.Length && (script[position] == ' ' || script[position] == '!'))
             {
+                if (script[position] == '!')
+                {
+                    negated = !negated;
+                }
+
                 position++;
             }
 
-            if (position < script.Length && script[position] == '!')
-            {
-                position++;
-                return true;
-            }
-
-            return false;
+            return negated;
         }
 
-        private static (int? Line, Regex? Pattern, bool Last, bool Found) ParseOneAddress(string script, ref int position, bool extended)
+        /// <summary>One half of an address specification.</summary>
+        private readonly record struct AddressPart(
+            int? Line,
+            Regex? Pattern,
+            bool Last,
+            int? Step,
+            int? Relative,
+            int? Multiple,
+            bool Found);
+
+        private static AddressPart ParseOneAddress(string script, ref int position, bool extended, bool isEnd)
         {
             while (position < script.Length && script[position] == ' ')
             {
@@ -687,31 +1110,48 @@ public sealed class SedBuiltin : IBuiltin
 
             if (position >= script.Length)
             {
-                return (null, null, false, false);
+                return default;
             }
 
             if (script[position] == '$')
             {
                 position++;
-                return (null, null, true, true);
+                return new AddressPart(null, null, true, null, null, null, true);
+            }
+
+            // `addr,+N` and `addr,~N` are relative ends and only make sense as the second half.
+            if (isEnd && script[position] is '+' or '~')
+            {
+                var relative = script[position] == '+';
+                position++;
+                var count = ReadNumber(script, ref position) ?? 0;
+
+                return relative
+                    ? new AddressPart(null, null, false, null, count, null, true)
+                    : new AddressPart(null, null, false, null, null, count, true);
             }
 
             if (char.IsAsciiDigit(script[position]))
             {
-                var start = position;
-                while (position < script.Length && char.IsAsciiDigit(script[position]))
+                var line = ReadNumber(script, ref position) ?? 0;
+
+                // `first~step` selects every step'th line from `first`.
+                if (!isEnd && position < script.Length && script[position] == '~')
                 {
                     position++;
+                    var step = ReadNumber(script, ref position) ?? 0;
+                    return new AddressPart(line, null, false, step, null, null, true);
                 }
 
-                return (int.Parse(script[start..position], CultureInfo.InvariantCulture), null, false, true);
+                return new AddressPart(line, null, false, null, null, null, true);
             }
 
             if (script[position] == '/')
             {
                 position++;
                 var text = ReadDelimited(script, ref position, '/');
-                return (null, CompileRegex(text, extended, ReadRegexFlags(script, ref position)), false, true);
+                var pattern = CompileRegex(text, extended, ReadRegexFlags(script, ref position));
+                return new AddressPart(null, pattern, false, null, null, null, true);
             }
 
             // `\cREGEXc` allows any delimiter.
@@ -720,10 +1160,23 @@ public sealed class SedBuiltin : IBuiltin
                 var delimiter = script[position + 1];
                 position += 2;
                 var text = ReadDelimited(script, ref position, delimiter);
-                return (null, CompileRegex(text, extended, ReadRegexFlags(script, ref position)), false, true);
+                var pattern = CompileRegex(text, extended, ReadRegexFlags(script, ref position));
+                return new AddressPart(null, pattern, false, null, null, null, true);
             }
 
-            return (null, null, false, false);
+            return default;
+        }
+
+        private static int? ReadNumber(string script, ref int position)
+        {
+            var start = position;
+
+            while (position < script.Length && char.IsAsciiDigit(script[position]))
+            {
+                position++;
+            }
+
+            return position == start ? null : int.Parse(script[start..position], CultureInfo.InvariantCulture);
         }
 
         private static bool ReadRegexFlags(string script, ref int position)
@@ -890,7 +1343,7 @@ public sealed class SedBuiltin : IBuiltin
 
         private static Regex CompileRegex(string pattern, bool extended, bool ignoreCase)
         {
-            var translated = extended ? pattern : BasicRegex.Translate(pattern);
+            var translated = PosixRegex.Translate(pattern, extended);
             var options = ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None;
 
             try

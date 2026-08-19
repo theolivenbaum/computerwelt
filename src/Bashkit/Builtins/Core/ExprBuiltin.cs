@@ -301,43 +301,11 @@ public sealed class ExprBuiltin : IBuiltin
     }
 }
 
-/// <summary>Translates POSIX basic regular expressions into .NET regex syntax.</summary>
+/// <summary>
+/// Translates POSIX basic regular expressions into .NET syntax.
+/// </summary>
 internal static class BasicRegex
 {
-    /// <summary>
-    /// In a BRE, <c>\(</c> groups and a bare <c>(</c> is literal — the opposite of .NET.
-    /// The same inversion applies to <c>{}</c>, <c>+</c> and <c>?</c>.
-    /// </summary>
-    public static string Translate(string pattern)
-    {
-        var builder = new System.Text.StringBuilder(pattern.Length);
-
-        for (var i = 0; i < pattern.Length; i++)
-        {
-            var c = pattern[i];
-
-            if (c != '\\' || i + 1 >= pattern.Length)
-            {
-                if (c is '(' or ')' or '{' or '}' or '+' or '?' or '|')
-                {
-                    builder.Append('\\');
-                }
-
-                builder.Append(c);
-                continue;
-            }
-
-            var next = pattern[++i];
-
-            if (next is '(' or ')' or '{' or '}' or '+' or '?' or '|')
-            {
-                builder.Append(next);
-                continue;
-            }
-
-            builder.Append('\\').Append(next);
-        }
-
-        return builder.ToString();
-    }
+    /// <summary>Rewrites a BRE for .NET.</summary>
+    public static string Translate(string pattern) => PosixRegex.TranslateBasic(pattern);
 }

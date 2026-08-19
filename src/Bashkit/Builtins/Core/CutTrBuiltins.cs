@@ -292,6 +292,22 @@ public sealed class TrBuiltin : IBuiltin
 
             if (c == '\\' && i + 1 < spec.Length)
             {
+                // `\NNN` is an octal character, which is how `\0` reaches tr as a NUL.
+                if (IsOctal(spec[i + 1]))
+                {
+                    var value = 0;
+                    var digits = 0;
+
+                    while (digits < 3 && i + 1 < spec.Length && IsOctal(spec[i + 1]))
+                    {
+                        value = (value * 8) + (spec[++i] - '0');
+                        digits++;
+                    }
+
+                    builder.Append((char)value);
+                    continue;
+                }
+
                 builder.Append(Unescape(spec[++i]));
                 continue;
             }
@@ -338,6 +354,8 @@ public sealed class TrBuiltin : IBuiltin
 
         return builder.ToString();
     }
+
+    private static bool IsOctal(char c) => c is >= '0' and <= '7';
 
     private static char Unescape(char c) => c switch
     {

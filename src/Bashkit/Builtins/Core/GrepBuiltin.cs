@@ -24,6 +24,9 @@ public sealed class GrepBuiltin : IBuiltin
 {
     private static readonly TimeSpan MatchTimeout = TimeSpan.FromSeconds(2);
 
+    /// <summary>How the prefixing modes name standard input.</summary>
+    private const string StandardInput = "(standard input)";
+
     /// <summary>Creates the builtin under <paramref name="name"/>: grep, egrep or fgrep.</summary>
     public GrepBuiltin(string name = "grep") => Name = name;
 
@@ -91,7 +94,12 @@ public sealed class GrepBuiltin : IBuiltin
                 case "-o" or "--only-matching": options.OnlyMatching = true; break;
                 case "-q" or "--quiet" or "--silent": options.Quiet = true; break;
                 case "-s" or "--no-messages": options.NoMessages = true; break;
-                case "-a" or "--text" or "--color" or "--colour" or "-I" or "-b" or "-Z" or "-z": break;
+                case "-a" or "--text" or "--binary-files=text": options.Text = true; break;
+                case "-b" or "--byte-offset": options.ByteOffset = true; break;
+                case "-z" or "--null-data": options.NullData = true; break;
+                case "-P" or "--perl-regexp": options.Perl = true; break;
+                case "--color" or "--colour" or "-I" or "-Z" or "-U" or "-u"
+                    or "--line-buffered" or "--binary" or "--mmap": break;
 
                 case "-e" or "--regexp":
                     if (cursor.TakeValue() is { } pattern)
@@ -126,11 +134,31 @@ public sealed class GrepBuiltin : IBuiltin
                 }
 
                 case "-m" or "--max-count":
-                    int.TryParse(cursor.TakeValue(), CultureInfo.InvariantCulture, out options.MaxCount);
+                    if (int.TryParse(cursor.TakeValue(), CultureInfo.InvariantCulture, out var maxCount))
+                    {
+                        options.MaxCount = maxCount;
+                    }
+
                     break;
 
                 case "--include": options.Include = cursor.TakeValue(); break;
                 case "--exclude": options.Exclude = cursor.TakeValue(); break;
+
+                case "--exclude-dir":
+                    if (cursor.TakeValue() is { } excludedDirectory)
+                    {
+                        options.ExcludedDirectories.Add(excludedDirectory);
+                    }
+
+                    break;
+
+                case "--include-dir":
+                    if (cursor.TakeValue() is { } includedDirectory)
+                    {
+                        options.IncludedDirectories.Add(includedDirectory);
+                    }
+
+                    break;
 
                 default:
                     // `grep -5` is shorthand for `-C 5`.
@@ -205,9 +233,11 @@ public sealed class GrepBuiltin : IBuiltin
                 }
                 catch (FileSystemException)
                 {
-                    anyError = true;
+                    // `-s` asks for the error to go unreported, and unlike GNU the reference
+                    // implementation also drops it from the exit status.
                     if (!options.NoMessages)
                     {
+                        anyError = true;
                         errors.Append("grep: ").Append(label).Append(": No such file or directory\n");
                     }
 
@@ -215,7 +245,34 @@ public sealed class GrepBuiltin : IBuiltin
                 }
             }
 
-            var matched = Search(regex, content, label, showNames, options, builder);
+            bool matched;
+
+            if (options.Text)
+            {
+                // `-a` reads binary content as text, with the NUL bytes filtered out.
+                matched = Search(regex, content.Replace("\0", string.Empty, StringComparison.Ordinal), label, showNames, options, builder);
+            }
+            else if (!options.NullData && content.Contains('\0', StringComparison.Ordinal))
+            {
+                // Binary content is reported rather than printed, so a terminal is not left
+                // holding control bytes. The counting and listing modes are unaffected.
+                var sink = new StringBuilder();
+                matched = Search(regex, content, label, showNames, options, sink);
+
+                if (options.CountOnly || options.NamesOnly || options.NamesWithoutMatch)
+                {
+                    builder.Append(sink);
+                }
+                else if (matched)
+                {
+                    builder.Append("Binary file ").Append(label).Append(" matches\n");
+                }
+            }
+            else
+            {
+                matched = Search(regex, content, label, showNames, options, builder);
+            }
+
             anyMatch |= matched;
 
             if (matched && options.Quiet)
@@ -240,8 +297,17 @@ public sealed class GrepBuiltin : IBuiltin
 
     private static bool Search(Regex regex, string content, string label, bool showNames, GrepOptions options, StringBuilder builder)
     {
-        var lines = TextHelpers.SplitLines(content);
+        // `-z` makes NUL the record separator rather than the newline.
+        var lines = options.NullData
+            ? content.Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            : TextHelpers.SplitLines(content);
+
         var matches = new List<int>();
+
+        if (options.MaxCount == 0)
+        {
+            return Report(matches, lines, regex, label, showNames, options, builder);
+        }
 
         for (var i = 0; i < lines.Length; i++)
         {
@@ -258,13 +324,27 @@ public sealed class GrepBuiltin : IBuiltin
             if (isMatch != options.Invert)
             {
                 matches.Add(i);
-                if (options.MaxCount > 0 && matches.Count >= options.MaxCount)
+
+                if (options.MaxCount is { } max && matches.Count >= max)
                 {
                     break;
                 }
             }
         }
 
+        return Report(matches, lines, regex, label, showNames, options, builder);
+    }
+
+    /// <summary>Renders the lines a search selected, in whichever mode was asked for.</summary>
+    private static bool Report(
+        List<int> matches,
+        string[] lines,
+        Regex regex,
+        string label,
+        bool showNames,
+        GrepOptions options,
+        StringBuilder builder)
+    {
         if (options.CountOnly)
         {
             if (showNames)
@@ -280,7 +360,8 @@ public sealed class GrepBuiltin : IBuiltin
         {
             if (matches.Count > 0)
             {
-                builder.Append(label).Append('\n');
+                // The listing modes name standard input more briefly than the prefixing ones.
+                builder.Append(label == StandardInput ? "(stdin)" : label).Append('\n');
             }
 
             return matches.Count > 0;
@@ -290,10 +371,11 @@ public sealed class GrepBuiltin : IBuiltin
         {
             if (matches.Count == 0)
             {
-                builder.Append(label).Append('\n');
+                builder.Append(label == StandardInput ? "(stdin)" : label).Append('\n');
             }
 
-            return matches.Count > 0;
+            // `-L` succeeds when it listed something, which is the opposite condition.
+            return matches.Count == 0;
         }
 
         if (options.Quiet)
@@ -314,6 +396,7 @@ public sealed class GrepBuiltin : IBuiltin
 
         var previous = -2;
         var hasContext = options.Before > 0 || options.After > 0;
+        var offsets = ByteOffsets(lines, options);
 
         foreach (var index in emitted)
         {
@@ -335,21 +418,49 @@ public sealed class GrepBuiltin : IBuiltin
 
                 foreach (Match match in regex.Matches(lines[index]))
                 {
-                    AppendPrefix(builder, label, showNames, index, separator, options);
+                    AppendPrefix(builder, label, showNames, index, separator, options, offsets[index] + match.Index);
                     builder.Append(match.Value).Append('\n');
                 }
 
                 continue;
             }
 
-            AppendPrefix(builder, label, showNames, index, separator, options);
+            AppendPrefix(builder, label, showNames, index, separator, options, offsets[index]);
             builder.Append(lines[index]).Append('\n');
         }
 
         return matches.Count > 0;
     }
 
-    private static void AppendPrefix(StringBuilder builder, string label, bool showNames, int index, char separator, GrepOptions options)
+    /// <summary>The byte offset each record starts at, for <c>-b</c>.</summary>
+    private static long[] ByteOffsets(string[] lines, GrepOptions options)
+    {
+        var offsets = new long[lines.Length];
+
+        if (!options.ByteOffset)
+        {
+            return offsets;
+        }
+
+        var offset = 0L;
+
+        for (var i = 0; i < lines.Length; i++)
+        {
+            offsets[i] = offset;
+            offset += Encoding.UTF8.GetByteCount(lines[i]) + 1;
+        }
+
+        return offsets;
+    }
+
+    private static void AppendPrefix(
+        StringBuilder builder,
+        string label,
+        bool showNames,
+        int index,
+        char separator,
+        GrepOptions options,
+        long offset)
     {
         if (showNames)
         {
@@ -359,6 +470,11 @@ public sealed class GrepBuiltin : IBuiltin
         if (options.LineNumbers)
         {
             builder.Append((index + 1).ToString(CultureInfo.InvariantCulture)).Append(separator);
+        }
+
+        if (options.ByteOffset)
+        {
+            builder.Append(offset.ToString(CultureInfo.InvariantCulture)).Append(separator);
         }
     }
 
@@ -371,9 +487,12 @@ public sealed class GrepBuiltin : IBuiltin
             // `-e 'a\nb'` and `-f file` may carry several patterns per entry.
             foreach (var line in pattern.Split('\n'))
             {
+                // A Perl pattern is close enough to .NET's dialect to pass through as it is.
                 var translated = options.Fixed
                     ? Regex.Escape(line)
-                    : options.Extended ? line : BasicRegex.Translate(line);
+                    : options.Perl
+                        ? line
+                        : PosixRegex.Translate(line, options.Extended);
 
                 if (options.WholeLine)
                 {
@@ -404,7 +523,7 @@ public sealed class GrepBuiltin : IBuiltin
 
         if (operands.Count == 0)
         {
-            targets.Add(("(standard input)", null));
+            targets.Add((StandardInput, null));
             return targets;
         }
 
@@ -412,7 +531,7 @@ public sealed class GrepBuiltin : IBuiltin
         {
             if (operand == "-")
             {
-                targets.Add(("(standard input)", null));
+                targets.Add((StandardInput, null));
                 continue;
             }
 
@@ -461,8 +580,24 @@ public sealed class GrepBuiltin : IBuiltin
 
         foreach (var entry in await context.FileSystem.ReadDirectoryAsync(path, cancellationToken))
         {
+            if (entry.IsDirectory && !IncludedDirectory(entry.Name, options))
+            {
+                continue;
+            }
+
             await CollectAsync(context, path.Join(entry.Name), label + "/" + entry.Name, targets, options, cancellationToken);
         }
+    }
+
+    private static bool IncludedDirectory(string name, GrepOptions options)
+    {
+        if (options.IncludedDirectories.Count > 0
+            && !options.IncludedDirectories.Any(pattern => Interpreter.PatternMatcher.IsMatch(name, pattern)))
+        {
+            return false;
+        }
+
+        return !options.ExcludedDirectories.Any(pattern => Interpreter.PatternMatcher.IsMatch(name, pattern));
     }
 
     private static bool Included(string name, GrepOptions options)
@@ -493,10 +628,16 @@ public sealed class GrepBuiltin : IBuiltin
         public bool OnlyMatching;
         public bool Quiet;
         public bool NoMessages;
+        public bool Text;
+        public bool ByteOffset;
+        public bool NullData;
+        public bool Perl;
         public int After;
         public int Before;
-        public int MaxCount;
+        public int? MaxCount;
         public string? Include;
         public string? Exclude;
+        public readonly List<string> ExcludedDirectories = [];
+        public readonly List<string> IncludedDirectories = [];
     }
 }
