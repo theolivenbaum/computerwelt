@@ -90,6 +90,20 @@ public sealed class ShellOptions
         _ => null,
     };
 
+    /// <summary>Reads a single-letter <c>set</c> option, or null when the letter is unknown.</summary>
+    public bool? GetByLetter(char letter) => letter switch
+    {
+        'e' => ErrExit,
+        'u' => NoUnset,
+        'x' => XTrace,
+        'v' => Verbose,
+        'f' => NoGlob,
+        'n' => NoExec,
+        'C' => NoClobber,
+        'a' => AllExport,
+        _ => null,
+    };
+
     /// <summary>Sets a <c>set -o</c> option by name. Returns false for an unknown name.</summary>
     public bool SetByName(string name, bool value)
     {

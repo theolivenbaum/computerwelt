@@ -866,8 +866,18 @@ public sealed class Interpreter
         // changes are discarded when it finishes. The filesystem is deliberately shared:
         // a subshell writing a file is visible outside, exactly as with a real fork.
         var fork = State.Fork();
-        var nested = new Interpreter(fork, FileSystem, Budget, _builtins);
+        var nested = new Interpreter(fork, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
         var result = await nested.ExecuteAsync(subshell.Body, stdin, cancellationToken);
+
+        // The subshell exits when its body ends, so its own EXIT trap fires here — the
+        // parent's does not, because the fork replaced it.
+        var atExit = await nested.RunTrapAsync("EXIT", cancellationToken);
+
+        result = result with
+        {
+            Stdout = StreamData.Concat(result.Stdout, atExit.Stdout),
+            Stderr = StreamData.Concat(result.Stderr, atExit.Stderr),
+        };
 
         State.LastExitCode = result.ExitCode;
 
@@ -887,6 +897,31 @@ public sealed class Interpreter
     }
 
     private async ValueTask<ExecResult> ExecuteSimpleAsync(SimpleCommand command, StreamData? stdin, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await ExecuteSimpleCoreAsync(command, stdin, cancellationToken);
+        }
+        catch (GlobFailureException e)
+        {
+            // A `failglob` miss fails only the command that used the pattern.
+            return ExecResult.Error($"bash: {e.Message}\n", ExitCodes.Failure);
+        }
+        catch (BashkitException e) when (e.Kind is BashkitErrorKind.Internal or BashkitErrorKind.PermissionDenied)
+        {
+            // An expansion error — `${x:?}` or `set -u` on an unset name — ends a
+            // non-interactive shell rather than the command. A subshell catches the exit
+            // and contains it, which is what bash does too.
+            return new ExecResult
+            {
+                Stderr = StreamData.FromText($"bash: {e.Message}\n"),
+                ExitCode = ExitCodes.Failure,
+                ControlFlow = ControlFlow.Exit(ExitCodes.Failure),
+            };
+        }
+    }
+
+    private async ValueTask<ExecResult> ExecuteSimpleCoreAsync(SimpleCommand command, StreamData? stdin, CancellationToken cancellationToken)
     {
         // A bare assignment list with no command name assigns in the current shell.
         if (command.Words.Count == 0)

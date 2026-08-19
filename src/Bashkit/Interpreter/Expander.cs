@@ -1083,7 +1083,7 @@ public sealed class Expander
             {
                 if (_state.Options.FailGlob)
                 {
-                    throw new BashkitException(BashkitErrorKind.Internal, $"no match: {field}");
+                    throw new GlobFailureException($"no match: {field}");
                 }
 
                 if (!_state.Options.NullGlob)

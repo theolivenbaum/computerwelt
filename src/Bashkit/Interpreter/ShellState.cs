@@ -345,6 +345,15 @@ public sealed class ShellState
 
         }
 
+        // `SHOPT_x` reports whether the single-letter `set` option x is on, which is how a
+        // script asks about shell state without parsing `set -o` output.
+        if (name.StartsWith("SHOPT_", StringComparison.Ordinal) && name.Length == 7)
+        {
+            return Options.GetByLetter(name[6]) is { } enabled
+                ? enabled ? "1" : "0"
+                : null;
+        }
+
         if (name.Length > 0 && name.All(char.IsAsciiDigit))
         {
             var index = int.Parse(name, CultureInfo.InvariantCulture);
