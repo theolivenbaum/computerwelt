@@ -305,15 +305,24 @@ public static class WordParser
         // $'...' — ANSI-C quoting, decoded here because its escapes are not shell escapes.
         if (next == '\'')
         {
-            var end = raw.IndexOf('\'', index + 2);
-            if (end < 0)
+            // A backslash-escaped quote does not end the string: `$'it\'s'` is one word.
+            var end = index + 2;
+
+            while (end < raw.Length && raw[end] != '\'')
             {
-                end = raw.Length;
+                end += raw[end] == '\\' && end + 1 < raw.Length ? 2 : 1;
             }
 
             Flush();
-            parts.Add(new WordPart.Literal(DecodeAnsiC(raw[(index + 2)..end])) { Quoted = true });
+            parts.Add(new WordPart.Literal(DecodeAnsiC(raw[(index + 2)..Math.Min(end, raw.Length)])) { Quoted = true });
             return Math.Min(end + 1, raw.Length) - index;
+        }
+
+        // $"..." asks for a locale translation, which in a sandbox is the string itself.
+        if (next == '"')
+        {
+            Flush();
+            return ParseDoubleQuoted(raw, index + 2, parts) - index;
         }
 
         // $name

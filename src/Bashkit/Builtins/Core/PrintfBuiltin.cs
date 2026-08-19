@@ -202,7 +202,7 @@ public sealed class PrintfBuiltin : IBuiltin
         }
 
         // Length modifiers carry no meaning here; every integer is 64-bit.
-        while (i < format.Length && format[i] is 'l' or 'h' or 'q' or 'j' or 'z' or 't' or 'L')
+        while (i < format.Length && format[i] is 'l' or 'h' or 'j' or 'z' or 't' or 'L')
         {
             i++;
         }
@@ -219,6 +219,62 @@ public sealed class PrintfBuiltin : IBuiltin
 
         builder.Append(Pad(text, width, flags.ToString(), conversion));
         return i - start;
+    }
+
+    /// <summary>
+    /// Quotes an argument so the shell would read it back unchanged.
+    /// </summary>
+    /// <remarks>
+    /// This is not <c>${x@Q}</c>: that produces a single-quoted string, while <c>%q</c>
+    /// backslash-escapes each character that needs it and falls back to <c>$'...'</c> only
+    /// for control characters, which have no backslash spelling outside it.
+    /// </remarks>
+    private static string QuoteArgument(string argument)
+    {
+        if (argument.Length == 0)
+        {
+            return "''";
+        }
+
+        if (argument.Any(static c => c < ' ' || c == '\u007f'))
+        {
+            var quoted = new StringBuilder("$'");
+
+            foreach (var c in argument)
+            {
+                quoted.Append(c switch
+                {
+                    '\n' => "\\n",
+                    '\t' => "\\t",
+                    '\r' => "\\r",
+                    '\a' => "\\a",
+                    '\b' => "\\b",
+                    '\f' => "\\f",
+                    '\v' => "\\v",
+                    '\\' => "\\\\",
+                    '\'' => "\\'",
+                    < ' ' or '\u007f' => "\\" + Convert.ToString(c, 8).PadLeft(3, '0'),
+                    _ => c.ToString(),
+                });
+            }
+
+            return quoted.Append('\'').ToString();
+        }
+
+        var builder = new StringBuilder(argument.Length);
+
+        foreach (var c in argument)
+        {
+            if (c < 128 && !char.IsAsciiLetterOrDigit(c)
+                && c is not ('_' or '.' or '/' or '-' or ':' or '=' or '@' or '+' or ',' or '%'))
+            {
+                builder.Append('\\');
+            }
+
+            builder.Append(c);
+        }
+
+        return builder.ToString();
     }
 
     private static int? ReadNumberOrStar(string format, ref int i, List<string> arguments, ref int consumed)
@@ -264,7 +320,7 @@ public sealed class PrintfBuiltin : IBuiltin
             }
 
             case 'q':
-                return Interpreter.Expander.Quote(argument);
+                return QuoteArgument(argument);
 
             case 'd' or 'i':
             {
