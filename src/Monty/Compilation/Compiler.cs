@@ -441,6 +441,10 @@ public sealed class Compiler
                     Emit(OpCode.LoadConst, _code.AddConstant(PyNone.Instance), returnStatement.Line);
                 }
 
+                // The return value is computed before the `finally` bodies run, and waits
+                // on the stack while they do — which is why `return f()` inside a `try`
+                // calls `f` first and the cleanup second.
+                UnwindFinallies(returnStatement.Line, all: true);
                 Emit(OpCode.Return, 0, returnStatement.Line);
                 break;
 
@@ -767,17 +771,39 @@ public sealed class Compiler
     /// does, so their finallys have to run before the jump — otherwise the cleanup a script
     /// wrote is silently skipped, which is exactly the bug <c>finally</c> exists to prevent.
     /// </remarks>
-    private void UnwindFinallies(int line)
+    /// <summary>
+    /// Runs the <c>finally</c> bodies a jump out of them would skip.
+    /// </summary>
+    /// <param name="line">The line to attribute the emitted code to.</param>
+    /// <param name="all">
+    /// True to unwind every enclosing <c>finally</c>, as a <c>return</c> does; false to
+    /// stop at the current loop, which is as far as a <c>break</c> or <c>continue</c> goes.
+    /// </param>
+    private void UnwindFinallies(int line, bool all = false)
     {
-        for (var i = _finallies.Count - 1; i >= 0; i--)
-        {
-            if (_finallies[i].LoopDepth != _loops.Count)
-            {
-                break;
-            }
+        var pending = new List<FinallyContext>(_finallies);
 
-            Emit(OpCode.PopBlock, 0, line);
-            CompileStatements(_finallies[i].Body);
+        try
+        {
+            for (var i = pending.Count - 1; i >= 0; i--)
+            {
+                if (!all && pending[i].LoopDepth != _loops.Count)
+                {
+                    break;
+                }
+
+                Emit(OpCode.PopBlock, 0, line);
+
+                // A `return` inside the body being emitted must not unwind this same body
+                // again, so it is dropped from the pending set while it is compiled.
+                _finallies.RemoveRange(i, _finallies.Count - i);
+                CompileStatements(pending[i].Body);
+            }
+        }
+        finally
+        {
+            _finallies.Clear();
+            _finallies.AddRange(pending);
         }
     }
 
