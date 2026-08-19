@@ -313,8 +313,52 @@ public static class BuiltinNamespace
                 _ => false,
             }));
 
-        DefineArity("iter", 1, 2, static arguments =>
+        DefineArity("iter", 1, 2, arguments =>
         {
+            // `iter(callable, sentinel)` builds an iterator that calls until the result
+            // equals the sentinel; the sentinel itself is never yielded.
+            if (arguments.Length == 2)
+            {
+                if (arguments[0] is not PyCallable and not PyFunction and not PyBoundMethod)
+                {
+                    throw new PyRaise(PyErrors.TypeError("iter(v, w): v must be callable"));
+                }
+
+                var (callable, sentinel) = (arguments[0], arguments[1]);
+                var stopped = false;
+
+                return new PyIterator(
+                    () =>
+                    {
+                        if (stopped)
+                        {
+                            return null;
+                        }
+
+                        PyObject value;
+
+                        try
+                        {
+                            value = machine.Call(callable, []);
+                        }
+                        catch (PyRaise raise)
+                            when (raise.Exception.ExceptionType == PyExceptionType.StopIteration)
+                        {
+                            stopped = true;
+                            return null;
+                        }
+
+                        if (!PyObject.SameOrEqual(value, sentinel))
+                        {
+                            return value;
+                        }
+
+                        stopped = true;
+                        return null;
+                    },
+                    "callable_iterator");
+            }
+
             if (arguments[0] is PyIterator or PyGenerator)
             {
                 return arguments[0];
@@ -324,7 +368,15 @@ public static class BuiltinNamespace
             // is the contract every hand-written iterator relies on.
             if (arguments[0] is PyInstance instance && instance.Dunder("__iter__") is { } method)
             {
-                return instance.Invoke(method, []);
+                var iterator = instance.Invoke(method, []);
+
+                // Whatever `__iter__` hands back must itself be an iterator, or the loop
+                // that trusts it would fail somewhere far less informative.
+                return iterator is PyIterator or PyGenerator
+                    || (iterator is PyInstance produced && produced.Dunder("__next__") is not null)
+                    ? iterator
+                    : throw new PyRaise(PyErrors.TypeError(
+                        $"iter() returned non-iterator of type '{iterator.TypeName}'"));
             }
 
             return new PyIterator(VirtualMachine.RequireIterable(arguments[0]), IteratorName(arguments[0]));
@@ -332,12 +384,38 @@ public static class BuiltinNamespace
 
         DefineArity("next", 1, 2, static arguments =>
         {
-            var value = arguments[0] switch
+            PyObject? value;
+
+            switch (arguments[0])
             {
-                PyIterator iterator => iterator.Next(),
-                PyGenerator generator => generator.Next(),
-                var other => throw new PyRaise(PyErrors.TypeError($"'{other.TypeName}' object is not an iterator")),
-            };
+                case PyIterator iterator:
+                    value = iterator.Next();
+                    break;
+
+                case PyGenerator generator:
+                    value = generator.Next();
+                    break;
+
+                // A hand-written iterator is any object with `__next__`; its StopIteration
+                // is what a default argument rescues.
+                case PyInstance instance when instance.Dunder("__next__") is { } advance:
+                    try
+                    {
+                        value = instance.Invoke(advance, []);
+                    }
+                    catch (PyRaise raise)
+                        when (raise.Exception.ExceptionType == PyExceptionType.StopIteration
+                            && arguments.Length > 1)
+                    {
+                        return arguments[1];
+                    }
+
+                    break;
+
+                default:
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"'{arguments[0].TypeName}' object is not an iterator"));
+            }
 
             if (value is not null)
             {
@@ -394,12 +472,20 @@ public static class BuiltinNamespace
     {
         PyList => "list_iterator",
         PyTuple => "tuple_iterator",
-        PyStr => "str_iterator",
+        // CPython has a separate, faster iterator for a string that is all ASCII.
+        PyStr text => text.Value.All(char.IsAscii) ? "str_ascii_iterator" : "str_iterator",
         PySet => "set_iterator",
         PyDict => "dict_keyiterator",
         PyRange => "range_iterator",
         PyBytes => "bytes_iterator",
-        PyView view => view.TypeName + "_iterator",
+        // `dict_keys` iterates as a `dict_keyiterator`, not a `dict_keys_iterator`.
+        PyView view => view.TypeName switch
+        {
+            "dict_keys" => "dict_keyiterator",
+            "dict_items" => "dict_itemiterator",
+            "dict_values" => "dict_valueiterator",
+            var other => other + "_iterator",
+        },
         _ => "iterator",
     };
 

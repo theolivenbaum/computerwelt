@@ -1244,7 +1244,11 @@ public static class BuiltinMethods
         PyBytes bytes => new PyStr(Encoding.Latin1.GetString(bytes.Value)),
         PyList items => new PyList([.. items.Items.Select(Latin1)]),
         PyTuple items => new PyTuple([.. items.Items.Select(Latin1)]),
-        _ => value,
+        PyStr or PyInt or PyNone => value,
+
+        // `join` takes any iterable, including a hand-written one, and its items are the
+        // bytes to convert.
+        _ => value.Iterate() is { } sequence ? new PyList([.. sequence.Select(Latin1)]) : value,
     };
 
     /// <summary>Converts a str result — or a container of them — back to bytes.</summary>

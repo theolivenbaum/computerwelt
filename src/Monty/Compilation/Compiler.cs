@@ -630,7 +630,10 @@ public sealed class Compiler
             case Parsing.Name name:
                 EmitLoad(name.Id, augmented.Line);
                 CompileExpression(augmented.Value);
-                Emit(OpCode.BinaryOp, _code.AddName(augmented.Operator), augmented.Line);
+
+                // The `=` is kept on the operator name so the runtime can mutate a list or
+                // a set in place rather than rebinding the name to a new object.
+                Emit(OpCode.BinaryOp, _code.AddName(augmented.Operator + "="), augmented.Line);
                 EmitStore(name.Id, augmented.Line);
                 break;
 
@@ -639,7 +642,7 @@ public sealed class Compiler
                 Emit(OpCode.Duplicate, 0, augmented.Line);
                 Emit(OpCode.LoadAttr, _code.AddName(attribute.AttributeName), augmented.Line);
                 CompileExpression(augmented.Value);
-                Emit(OpCode.BinaryOp, _code.AddName(augmented.Operator), augmented.Line);
+                Emit(OpCode.BinaryOp, _code.AddName(augmented.Operator + "="), augmented.Line);
                 Emit(OpCode.Swap, 0, augmented.Line);
                 Emit(OpCode.StoreAttr, _code.AddName(attribute.AttributeName), augmented.Line);
                 break;
@@ -650,7 +653,7 @@ public sealed class Compiler
                 Emit(OpCode.Duplicate, 2, augmented.Line);
                 Emit(OpCode.LoadSubscript, 0, augmented.Line);
                 CompileExpression(augmented.Value);
-                Emit(OpCode.BinaryOp, _code.AddName(augmented.Operator), augmented.Line);
+                Emit(OpCode.BinaryOp, _code.AddName(augmented.Operator + "="), augmented.Line);
                 Emit(OpCode.RotateThree, 0, augmented.Line);
                 Emit(OpCode.StoreSubscript, 0, augmented.Line);
                 break;

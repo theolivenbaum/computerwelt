@@ -64,7 +64,18 @@ public sealed class PyList : PyObject
     public override int? Length() => Items.Count;
 
     /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => Items.ToList();
+    /// <remarks>
+    /// The iteration follows the live list by index rather than a copy, so appending
+    /// inside a <c>for</c> extends the loop — a Python behaviour scripts rely on, and a
+    /// snapshot would hide.
+    /// </remarks>
+    public override IEnumerable<PyObject>? Iterate()
+    {
+        for (var i = 0; i < Items.Count; i++)
+        {
+            yield return Items[i];
+        }
+    }
 
     /// <inheritdoc />
     public override string Repr()

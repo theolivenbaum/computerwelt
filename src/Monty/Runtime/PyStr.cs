@@ -16,6 +16,69 @@ public sealed class PyStr : PyObject
     /// <summary>The underlying text.</summary>
     public string Value { get; }
 
+    /// <summary>
+    /// The offset of each code point, or null when every code point is one UTF-16 unit.
+    /// </summary>
+    /// <remarks>
+    /// Python indexes a string by code point, .NET by UTF-16 unit; the two differ only for
+    /// a string holding an astral character, so the map is built only for those and every
+    /// other string keeps direct indexing.
+    /// </remarks>
+    private int[]? Offsets
+    {
+        get
+        {
+            if (_offsets is null && !_scanned)
+            {
+                _scanned = true;
+
+                for (var i = 0; i < Value.Length; i++)
+                {
+                    if (!char.IsHighSurrogate(Value[i]))
+                    {
+                        continue;
+                    }
+
+                    var offsets = new List<int>(Value.Length);
+
+                    for (var j = 0; j < Value.Length; j++)
+                    {
+                        offsets.Add(j);
+
+                        if (char.IsHighSurrogate(Value[j]) && j + 1 < Value.Length && char.IsLowSurrogate(Value[j + 1]))
+                        {
+                            j++;
+                        }
+                    }
+
+                    _offsets = [.. offsets];
+                    break;
+                }
+            }
+
+            return _offsets;
+        }
+    }
+
+    private int[]? _offsets;
+    private bool _scanned;
+
+    /// <summary>The number of code points, which is what Python calls the length.</summary>
+    private int Count => Offsets?.Length ?? Value.Length;
+
+    /// <summary>The code point at <paramref name="index"/>, as a one-character string.</summary>
+    private string At(int index)
+    {
+        if (Offsets is not { } offsets)
+        {
+            return Value[index].ToString();
+        }
+
+        var start = offsets[index];
+        var end = index + 1 < offsets.Length ? offsets[index + 1] : Value.Length;
+        return Value[start..end];
+    }
+
     /// <inheritdoc />
     public override string TypeName => "str";
 
@@ -40,10 +103,16 @@ public sealed class PyStr : PyObject
         other is PyStr text ? string.CompareOrdinal(Value, text.Value) : null;
 
     /// <inheritdoc />
-    public override int? Length() => Value.Length;
+    public override int? Length() => Count;
 
     /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => Value.Select(static c => new PyStr(c.ToString()));
+    public override IEnumerable<PyObject>? Iterate()
+    {
+        for (var i = 0; i < Count; i++)
+        {
+            yield return new PyStr(At(i));
+        }
+    }
 
     /// <inheritdoc />
     public override bool Contains(PyObject item) =>
@@ -57,12 +126,12 @@ public sealed class PyStr : PyObject
     {
         if (index is PySlice slice)
         {
-            var (start, _, step, count) = slice.Resolve(Value.Length);
+            var (start, _, step, count) = slice.Resolve(Count);
             var builder = new StringBuilder(count);
 
             for (var i = 0; i < count; i++)
             {
-                builder.Append(Value[start + (i * step)]);
+                builder.Append(At(start + (i * step)));
             }
 
             return new PyStr(builder.ToString());
@@ -73,8 +142,7 @@ public sealed class PyStr : PyObject
             throw new PyRaise(PyErrors.TypeError($"string indices must be integers, not '{index.TypeName}'"));
         }
 
-        var position = Normalize(integer.ToIndex(), Value.Length, "string index out of range");
-        return new PyStr(Value[position].ToString());
+        return new PyStr(At(Normalize(integer.ToIndex(), Count, "string index out of range")));
     }
 
     /// <summary>Resolves a possibly negative index, raising when it is out of range.</summary>

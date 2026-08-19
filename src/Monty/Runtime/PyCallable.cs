@@ -493,7 +493,7 @@ public sealed class PyInstance : PyObject
 /// <summary>An iterator over a materialized sequence of values.</summary>
 public sealed class PyIterator : PyObject
 {
-    private readonly IEnumerator<PyObject> _enumerator;
+    private readonly Func<PyObject?> _advance;
 
     /// <summary>Creates an iterator over <paramref name="values"/>.</summary>
     /// <param name="values">What to iterate.</param>
@@ -503,7 +503,23 @@ public sealed class PyIterator : PyObject
     /// </param>
     public PyIterator(IEnumerable<PyObject> values, string typeName = "iterator")
     {
-        _enumerator = values.GetEnumerator();
+        var enumerator = values.GetEnumerator();
+        _advance = () => enumerator.MoveNext() ? enumerator.Current : null;
+        TypeName = typeName;
+    }
+
+    /// <summary>
+    /// Creates an iterator driven by a function rather than a sequence.
+    /// </summary>
+    /// <remarks>
+    /// A C# iterator block cannot be re-entered — its state machine reports itself
+    /// exhausted — and Python code reached through <c>iter(f, sentinel)</c> or a
+    /// <c>__next__</c> can call <c>next</c> on the very iterator being advanced. A plain
+    /// function has no such state to alias.
+    /// </remarks>
+    public PyIterator(Func<PyObject?> advance, string typeName)
+    {
+        _advance = advance;
         TypeName = typeName;
     }
 
@@ -514,7 +530,7 @@ public sealed class PyIterator : PyObject
     public override string Repr() => $"<{TypeName} object>";
 
     /// <summary>Advances the iterator. Returns null when exhausted.</summary>
-    public PyObject? Next() => _enumerator.MoveNext() ? _enumerator.Current : null;
+    public PyObject? Next() => _advance();
 
     /// <inheritdoc />
     public override IEnumerable<PyObject>? Iterate()

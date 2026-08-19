@@ -36,6 +36,18 @@ public static class Operators
     /// <summary>Applies a binary operator.</summary>
     public static PyObject Binary(string op, PyObject left, PyObject right)
     {
+        // An augmented assignment arrives with its `=` still attached: `x += y` is `+=`,
+        // which mutates a mutable container instead of building a new one.
+        if (op.Length > 1 && op[^1] == '=')
+        {
+            op = op[..^1];
+
+            if (InPlace(op, left, right) is { } mutated)
+            {
+                return mutated;
+            }
+        }
+
         // A user class defines an operator by its dunder; the reflected form is tried when
         // the left operand does not implement the forward one.
         if ((left is PyInstance || right is PyInstance) && ArithmeticDunders.TryGetValue(op, out var dunders))
@@ -484,6 +496,90 @@ public static class Operators
 
         return new PyInt(RequireInt(left, "&") & RequireInt(right, "&"));
     }
+
+    /// <summary>
+    /// Applies an augmented assignment in place, or returns null when the type has no
+    /// in-place form and the ordinary operator should run instead.
+    /// </summary>
+    /// <remarks>
+    /// The identity matters: <c>a = b; a += [1]</c> must leave <c>b</c> holding the longer
+    /// list, which rebinding a fresh one would not.
+    /// </remarks>
+    private static PyObject? InPlace(string op, PyObject left, PyObject right)
+    {
+        if (left is PyInstance instance
+            && InPlaceDunders.TryGetValue(op, out var dunder)
+            && instance.Dunder(dunder) is { } method)
+        {
+            return instance.Invoke(method, [right]);
+        }
+
+        switch (op, left)
+        {
+            case ("+", PyList list):
+            {
+                // `lst += lst` must append the items the list had, not the ones it grows;
+                // the source is read out before the target is touched.
+                var extra = VirtualMachine.RequireIterable(right).ToList();
+                list.Items.AddRange(extra);
+                return list;
+            }
+
+            case ("*", PyList list) when right is PyInt count:
+            {
+                var original = list.Items.ToList();
+                list.Items.Clear();
+
+                for (var i = 0; i < count.Value; i++)
+                {
+                    list.Items.AddRange(original);
+                }
+
+                return list;
+            }
+
+            case ("|" or "&" or "-" or "^", PySet { IsFrozen: false } set) when AsSet(right) is { } other:
+            {
+                var items = op switch
+                {
+                    "|" => set.Items.Concat(other.Items),
+                    "&" => set.Items.Where(other.Contains),
+                    "-" => set.Items.Where(item => !other.Contains(item)),
+                    _ => set.Items.Where(item => !other.Contains(item))
+                        .Concat(other.Items.Where(item => !set.Contains(item))),
+                };
+
+                var replacement = items.ToList();
+                set.Clear();
+
+                foreach (var item in replacement)
+                {
+                    set.Add(item);
+                }
+
+                return set;
+            }
+
+            case ("|", PyDict dict) when right is PyDict source:
+                foreach (var (key, value) in source.Entries)
+                {
+                    dict.Set(key, value);
+                }
+
+                return dict;
+
+            default:
+                return null;
+        }
+    }
+
+    private static readonly Dictionary<string, string> InPlaceDunders = new(StringComparer.Ordinal)
+    {
+        ["+"] = "__iadd__", ["-"] = "__isub__", ["*"] = "__imul__", ["/"] = "__itruediv__",
+        ["//"] = "__ifloordiv__", ["%"] = "__imod__", ["**"] = "__ipow__", ["|"] = "__ior__",
+        ["&"] = "__iand__", ["^"] = "__ixor__", ["<<"] = "__ilshift__", [">>"] = "__irshift__",
+        ["@"] = "__imatmul__",
+    };
 
     /// <summary>
     /// Views a value as a set for the set operators.
