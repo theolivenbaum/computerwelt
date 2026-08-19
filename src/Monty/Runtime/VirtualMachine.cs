@@ -104,8 +104,8 @@ public sealed class VirtualMachine
             case PyClass type:
                 return Instantiate(type, arguments, keywords);
 
-            case Monty.Modules.NamedTupleFactory factory:
-                return factory.Instantiate(arguments, keywords);
+            case PyNamedTupleType namedTuple:
+                return namedTuple.Instantiate(arguments, keywords);
 
             case PyCallable constructible when Monty.Modules.DatetimeModule.TryConstruct(constructible, arguments) is { } built:
                 return built;

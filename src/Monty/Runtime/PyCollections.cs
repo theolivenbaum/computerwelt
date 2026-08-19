@@ -196,7 +196,7 @@ public sealed class PyList : PyObject
 }
 
 /// <summary><c>tuple</c>.</summary>
-public sealed class PyTuple : PyObject
+public class PyTuple : PyObject
 {
     /// <summary>Creates a tuple.</summary>
     public PyTuple(IReadOnlyList<PyObject> items) => Items = items;

@@ -311,10 +311,7 @@ public static class BuiltinMethods
                 return Predicate(receiver, name, static text => text.Length > 0 && text.All(char.IsDigit));
 
             case "isidentifier":
-                return Predicate(receiver, name, static text =>
-                    text.Length > 0
-                    && (char.IsLetter(text[0]) || text[0] == '_')
-                    && text.All(static c => char.IsLetterOrDigit(c) || c == '_'));
+                return Predicate(receiver, name, Identifiers.IsIdentifier);
 
             case "istitle":
                 return Predicate(receiver, name, static text => text.Length > 0 && text == TitleCase(text));

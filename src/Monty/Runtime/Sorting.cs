@@ -28,24 +28,14 @@ public static class Sorting
             }
         }
 
-        var decorated = new List<(PyObject Key, PyObject Value, int Position)>(source.Count);
+        var decorated = new List<Entry>(source.Count);
 
-        for (var i = 0; i < source.Count; i++)
+        foreach (var item in source)
         {
-            decorated.Add((key is null ? source[i] : machine.Call(key, [source[i]]), source[i], i));
+            decorated.Add(new Entry(key is null ? item : machine.Call(key, [item]), item));
         }
 
-        decorated.Sort((left, right) =>
-        {
-            var comparison = left.Key.PyCompare(right.Key)
-                ?? throw new PyRaise(PyErrors.TypeError(
-                    $"'<' not supported between instances of '{left.Key.TypeName}' and '{right.Key.TypeName}'"));
-
-            // Falling back to the original position is what makes the sort stable.
-            return comparison != 0 ? comparison : left.Position.CompareTo(right.Position);
-        });
-
-        var result = decorated.Select(static entry => entry.Value).ToList();
+        var result = MergeSort(decorated).Select(static entry => entry.Value).ToList();
 
         if (reverse)
         {
@@ -54,4 +44,56 @@ public static class Sorting
 
         return result;
     }
+
+    /// <summary>
+    /// A stable bottom-up merge sort of the decorated entries.
+    /// </summary>
+    /// <remarks>
+    /// <c>List.Sort</c> cannot be used for two reasons: it wraps an exception thrown by the
+    /// comparison in an <c>InvalidOperationException</c>, hiding the Python error, and it
+    /// gives no control over which operand lands on the left of a failed <c>&lt;</c> —
+    /// which the error message names.
+    /// </remarks>
+    private static List<Entry> MergeSort(List<Entry> items)
+    {
+        var source = items;
+        var target = new List<Entry>(source);
+
+        for (var width = 1; width < source.Count; width *= 2)
+        {
+            for (var start = 0; start < source.Count; start += 2 * width)
+            {
+                var middle = Math.Min(start + width, source.Count);
+                var end = Math.Min(start + (2 * width), source.Count);
+                Merge(source, target, start, middle, end);
+            }
+
+            (source, target) = (target, source);
+        }
+
+        return source;
+    }
+
+    private static void Merge(List<Entry> source, List<Entry> target, int start, int middle, int end)
+    {
+        var left = start;
+        var right = middle;
+
+        for (var i = start; i < end; i++)
+        {
+            // Taking from the left run unless the right one is strictly smaller keeps the
+            // sort stable — and asks `right < left`, which is the order CPython compares in.
+            target[i] = left < middle && (right >= end || !Less(source[right].Key, source[left].Key))
+                ? source[left++]
+                : source[right++];
+        }
+    }
+
+    private static bool Less(PyObject right, PyObject left) =>
+        (right.PyCompare(left)
+            ?? throw new PyRaise(PyErrors.TypeError(
+                $"'<' not supported between instances of '{right.TypeName}' and '{left.TypeName}'"))) < 0;
+
+    /// <summary>One element, paired with its sort key.</summary>
+    private readonly record struct Entry(PyObject Key, PyObject Value);
 }

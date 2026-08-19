@@ -19,8 +19,15 @@ public static class SysModule
         module.Add("maxsize", new PyInt(long.MaxValue));
         module.Add("argv", new PyList([new PyStr("<script>")]));
         module.Add("path", new PyList());
-        module.Add("version", new PyStr("3.12.0 (monty)"));
-        module.Add("version_info", new PyTuple([new PyInt(3), new PyInt(12), new PyInt(0)]));
+        module.Add("version", new PyStr("3.14.0 (monty)"));
+
+        // A structseq, not a namedtuple: named fields but none of the `_`-prefixed helpers.
+        module.Add("version_info", new PyNamedTuple(
+            new PyNamedTupleType(
+                "sys.version_info",
+                ["major", "minor", "micro", "releaselevel", "serial"],
+                structSeq: true),
+            [new PyInt(3), new PyInt(14), new PyInt(0), new PyStr("final"), new PyInt(0)]));
         module.Add("byteorder", new PyStr(BitConverter.IsLittleEndian ? "little" : "big"));
 
         module.Add("stdout", new StandardStream("stdout", machine.Write));
@@ -55,7 +62,8 @@ public static class SysModule
     private sealed class StandardStream(string name, Action<string> write) : PyObject
     {
         /// <inheritdoc />
-        public override string TypeName => "TextIOWrapper";
+        /// <remarks>CPython names it for the module it lives in, and so does `type()`.</remarks>
+        public override string TypeName => "_io.TextIOWrapper";
 
         /// <inheritdoc />
         public override string Repr() => $"<sys.{name}>";

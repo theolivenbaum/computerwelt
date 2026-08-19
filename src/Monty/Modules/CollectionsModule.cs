@@ -69,17 +69,35 @@ public static class SupportModules
         module.Add("deque", new PyBuiltinFunction("deque", static arguments =>
             new PyList(arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0]).ToList())));
 
-        module.Add("namedtuple", new PyBuiltinFunction("namedtuple", static arguments =>
+        module.Add("namedtuple", new PyBuiltinFunction("namedtuple", static (arguments, keywords) =>
         {
-            var fields = arguments[1] is PyStr text
-                ? text.Value.Replace(',', ' ').Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                : [.. VirtualMachine.RequireIterable(arguments[1]).Select(static f => f.Display())];
+            var fields = PyNamedTupleType.ParseFields(arguments[1]);
+            var rename = Keyword(arguments, keywords, 2, "rename")?.IsTruthy() ?? false;
 
-            return new NamedTupleFactory(arguments[0].Display(), fields);
+            // CPython coerces the type name with `str()` before validating it, so anything
+            // with a `__str__` that yields an identifier is accepted.
+            var name = arguments[0].Display();
+            PyNamedTupleType.Validate(name, fields, rename);
+
+            var defaults = Keyword(arguments, keywords, 3, "defaults") is { } supplied and not PyNone
+                ? VirtualMachine.RequireIterable(supplied).ToList()
+                : [];
+
+            var module = Keyword(arguments, keywords, 4, "module") is { } named and not PyNone
+                ? named
+                : new PyStr("__main__");
+
+            return new PyNamedTupleType(name, fields, defaults, module);
         }));
 
         return module;
     }
+
+    /// <summary>Reads an argument that may be given positionally or by name.</summary>
+    private static PyObject? Keyword(PyObject[] arguments, PyDict? keywords, int position, string name) =>
+        arguments.Length > position ? arguments[position]
+        : keywords is not null && keywords.TryGetValue(new PyStr(name), out var value) ? value
+        : null;
 
     /// <summary>Builds <c>itertools</c>.</summary>
     public static PyModuleObject CreateItertools(VirtualMachine machine)
@@ -405,79 +423,4 @@ public sealed class PyDefaultDict(VirtualMachine machine, PyObject? factory) : P
 
     /// <summary>The wrapped dictionary, for method dispatch.</summary>
     public PyDict Entries => _entries;
-}
-
-/// <summary>The class object <c>namedtuple</c> returns.</summary>
-public sealed class NamedTupleFactory(string name, string[] fields) : PyCallable
-{
-    /// <inheritdoc />
-    public override string Name => name;
-
-    /// <inheritdoc />
-    public override string TypeName => "type";
-
-    /// <inheritdoc />
-    public override string Repr() => $"<class '{name}'>";
-
-    /// <summary>The field names, in order.</summary>
-    public string[] Fields => fields;
-
-    /// <summary>Builds an instance from positional and keyword arguments.</summary>
-    public PyObject Instantiate(PyObject[] arguments, PyDict? keywords)
-    {
-        var values = new List<PyObject>(fields.Length);
-
-        for (var i = 0; i < fields.Length; i++)
-        {
-            if (i < arguments.Length)
-            {
-                values.Add(arguments[i]);
-                continue;
-            }
-
-            if (keywords is not null && keywords.TryGetValue(new PyStr(fields[i]), out var value))
-            {
-                values.Add(value);
-                continue;
-            }
-
-            throw new PyRaise(PyErrors.TypeError($"{name}() missing argument: '{fields[i]}'"));
-        }
-
-        return new NamedTupleInstance(this, values);
-    }
-}
-
-/// <summary>An instance of a named tuple: a tuple whose fields also have names.</summary>
-internal sealed class NamedTupleInstance(NamedTupleFactory factory, IReadOnlyList<PyObject> values) : PyObject
-{
-    /// <summary>The field values, in declaration order.</summary>
-    public IReadOnlyList<PyObject> Values => values;
-
-    /// <inheritdoc />
-    public override string TypeName => factory.Name;
-
-    /// <inheritdoc />
-    public override string Repr() =>
-        factory.Name + "(" + string.Join(", ", factory.Fields.Zip(values, static (field, value) => $"{field}={value.Repr()}")) + ")";
-
-    /// <inheritdoc />
-    public override int? Length() => values.Count;
-
-    /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => values;
-
-    /// <inheritdoc />
-    public override PyObject GetItem(PyObject index) => new PyTuple(values).GetItem(index);
-
-    /// <inheritdoc />
-    public override bool PyEquals(PyObject other) => new PyTuple(values).PyEquals(
-        other is NamedTupleInstance named ? new PyTuple(named.Values) : other);
-
-    /// <inheritdoc />
-    public override PyObject? GetAttribute(string name)
-    {
-        var index = Array.IndexOf(factory.Fields, name);
-        return index >= 0 ? values[index] : null;
-    }
 }

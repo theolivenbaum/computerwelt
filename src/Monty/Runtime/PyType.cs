@@ -236,6 +236,8 @@ public static class TypeRegistry
         PyStr => Str,
         PyBytes => Bytes,
         PyList => List,
+        // A named tuple reports its own class, which is what makes `type(p) is Point` hold.
+        PyNamedTuple named => named.Type,
         PyTuple => Tuple,
         PySet { IsFrozen: true } => FrozenSet,
         PySet => Set,
@@ -248,7 +250,9 @@ public static class TypeRegistry
         // A host record names its own type; the type object is made on demand and cached,
         // so `type(x) is type(y)` holds for two records of the same shape.
         PyDataclass record => Named(record.Name),
-        _ => All.TryGetValue(value.TypeName, out var known) ? known : Object,
+        // Anything else answers with a type object named for itself, made on demand and
+        // cached, so `type(x) is type(y)` holds for two values of the same host type.
+        _ => Named(value.TypeName),
     };
 
     /// <summary>Gets, creating if needed, the type object for a host-supplied name.</summary>
@@ -261,7 +265,10 @@ public static class TypeRegistry
                 return known;
             }
 
-            var type = new PyType(name, value => value is PyDataclass record && record.Name == name, static (_, _) =>
+            var type = new PyType(
+                name,
+                value => value.TypeName == name,
+                static (_, _) =>
                 throw new PyRaise(PyErrors.TypeError("cannot create instances of a host type")));
 
             All[name] = type;
@@ -282,6 +289,9 @@ public static class TypeRegistry
 
             case PyClass pyClass:
                 return value is PyInstance instance && ReferenceEquals(instance.Class, pyClass);
+
+            case PyNamedTupleType namedTuple:
+                return value is PyNamedTuple named && ReferenceEquals(named.Type, namedTuple);
 
             case PyType builtin:
                 // `bool` is a subtype of `int`, so a bool satisfies both.
