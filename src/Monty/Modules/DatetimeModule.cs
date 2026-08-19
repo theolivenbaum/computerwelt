@@ -173,8 +173,16 @@ public static class DatetimeModule
             "isoformat" => new PyBuiltinFunction("isoformat", _ =>
                 new PyStr(value.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture))),
 
-            "strftime" => new PyBuiltinFunction("strftime", arguments =>
-                new PyStr(Strftime(value, arguments[0].Display()))),
+            // `format` is spellable as a keyword, which is how the stdlib declares it.
+            "strftime" => new PyBuiltinFunction("strftime", (arguments, keywords) =>
+            {
+                var format = arguments.Length > 0 ? arguments[0]
+                    : keywords is not null && keywords.TryGetValue(new PyStr("format"), out var named) ? named
+                    : throw new PyRaise(PyErrors.TypeError(
+                        "strftime() missing required argument 'format' (pos 1)"));
+
+                return new PyStr(Strftime(value, format.Display()));
+            }),
 
             "timestamp" => new PyBuiltinFunction("timestamp", _ =>
                 new PyFloat(value.ToUnixTimeMilliseconds() / 1000.0)),

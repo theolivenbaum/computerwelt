@@ -231,11 +231,15 @@ public static class TypeRegistry
 
                 return builtin.Matches(value);
 
-            default:
-                // Anything else is not a type at all, and asking about it is a mistake in
-                // the call rather than a false answer.
+            // A value that is plainly not a type — a string, a number, a container — is a
+            // mistake in the call rather than a false answer. Anything else that acts as a
+            // constructor is left to answer for itself.
+            case PyStr or PyInt or PyFloat or PyList or PyDict or PySet or PyNone or PyBytes:
                 throw new PyRaise(PyErrors.TypeError(
                     "isinstance() arg 2 must be a type, a tuple of types, or a union"));
+
+            default:
+                return false;
         }
     }
 

@@ -13,9 +13,16 @@ public static class SupportModules
 
         // A Counter is a dict of counts; building it as a plain dict keeps every dict
         // method working on it, which is what the fixtures exercise.
-        module.Add("Counter", new PyBuiltinFunction("Counter", arguments =>
+        module.Add("Counter", new PyBuiltinFunction("Counter", (arguments, keywords) =>
         {
             var counter = new PyDict();
+
+            // `Counter(a=2, b=3)` counts by name, which is why the keywords are not an
+            // error here the way they are for most builtins.
+            foreach (var (key, value) in keywords?.Entries ?? [])
+            {
+                counter.Set(key, value);
+            }
 
             if (arguments.Length == 0)
             {

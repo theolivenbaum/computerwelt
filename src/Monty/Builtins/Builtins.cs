@@ -246,9 +246,14 @@ public static class BuiltinNamespace
                 PyInt integer when digits >= 0 => integer,
                 PyInt when digits <= -400 => new PyInt(BigInteger.Zero),
                 // Python rounds half to even, unlike the usual half-away-from-zero.
+                // .NET only rounds to 15 decimal places; beyond that a double has no
+                // digits left to lose, so the value is already its own rounding.
                 PyFloat value => given is null or PyNone
                     ? new PyInt(new BigInteger(Math.Round(value.Value, MidpointRounding.ToEven)))
-                    : new PyFloat(Math.Round(value.Value, digits, MidpointRounding.ToEven)),
+                    : digits > 15 ? value
+                    : digits >= 0 ? new PyFloat(Math.Round(value.Value, digits, MidpointRounding.ToEven))
+                    : new PyFloat((double)RoundToMultiple(
+                        new BigInteger(value.Value), BigInteger.Pow(10, Math.Min(-digits, 400)))),
                 PyInt integer => new PyInt(RoundToMultiple(integer.Value, BigInteger.Pow(10, -digits))),
                 var other => throw new PyRaise(PyErrors.TypeError(
                     $"type {other.TypeName} doesn't define __round__ method")),
@@ -409,6 +414,11 @@ public static class BuiltinNamespace
                 throw new PyRaise(PyErrors.TypeError(
                     $"{name}() got an unexpected keyword argument '{keyword.Display()}'"));
             }
+        }
+
+        if (arguments.Length == 0)
+        {
+            throw new PyRaise(PyErrors.TypeError($"{name} expected at least 1 argument, got 0"));
         }
 
         // One iterable argument means "over its elements"; several mean "among them".
