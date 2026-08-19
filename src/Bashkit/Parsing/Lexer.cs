@@ -167,6 +167,10 @@ public sealed class Lexer
             case '|':
                 return Emit(TokenKind.Pipe, 1, out token);
 
+            case '>' when next == '(':
+                token = default;
+                return false; // process substitution is part of a word
+
             case '>' when next == '>':
                 return Emit(TokenKind.DoubleGreat, 2, out token);
             case '>' when next == '&':

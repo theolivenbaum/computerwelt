@@ -1065,7 +1065,33 @@ public sealed class Interpreter
             };
         }
 
-        return await redirection.ApplyAsync(result, cancellationToken);
+        return await DrainWritersAsync(await redirection.ApplyAsync(result, cancellationToken), cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs the <c>&gt;(...)</c> commands whose input file the finished command wrote.
+    /// </summary>
+    private async ValueTask<ExecResult> DrainWritersAsync(ExecResult result, CancellationToken cancellationToken)
+    {
+        var pending = Expander.TakePendingWriters();
+
+        if (pending.Count == 0)
+        {
+            return result;
+        }
+
+        var stdout = result.Stdout;
+        var stderr = result.Stderr;
+
+        foreach (var (path, script) in pending)
+        {
+            var content = await FileSystem.ReadFileAsync(path, cancellationToken);
+            var run = await RunFragmentAsync(script, StreamData.FromBytes(content), cancellationToken);
+            stdout = StreamData.Concat(stdout, run.Stdout);
+            stderr = StreamData.Concat(stderr, run.Stderr);
+        }
+
+        return result with { Stdout = stdout, Stderr = stderr };
     }
 
     private async ValueTask<ExecResult> DispatchAsync(

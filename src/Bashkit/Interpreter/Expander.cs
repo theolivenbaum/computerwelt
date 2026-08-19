@@ -297,19 +297,39 @@ public sealed class Expander
         WordPart.ProcessSubstitution substitution,
         CancellationToken cancellationToken)
     {
+        var path = VPath.Parse($"/tmp/.bashkit-procsub-{Interlocked.Increment(ref _processSubstitutionCount)}");
+        await _fileSystem.CreateDirectoryAsync(VPath.Parse("/tmp"), recursive: true, cancellationToken);
+
         if (substitution.Output)
         {
-            // `>(cmd)` would need the command to run as the writer drains it, which without
-            // concurrent processes cannot be arranged.
-            return "/dev/null";
+            // `>(cmd)` runs after the writer, once the file it wrote is complete. With no
+            // concurrency the two cannot overlap, so the command is deferred rather than
+            // being fed as the writer produces output.
+            await _fileSystem.WriteFileAsync(path, ReadOnlyMemory<byte>.Empty, cancellationToken);
+            _pendingWriters.Add((path, substitution.Script));
+            return path.Value;
         }
 
         var result = await _runCommandSubstitution(substitution.Script, cancellationToken);
-        var path = VPath.Parse($"/tmp/.bashkit-procsub-{Interlocked.Increment(ref _processSubstitutionCount)}");
-
-        await _fileSystem.CreateDirectoryAsync(VPath.Parse("/tmp"), recursive: true, cancellationToken);
         await _fileSystem.WriteFileAsync(path, result.Stdout.Memory, cancellationToken);
         return path.Value;
+    }
+
+    private readonly List<(VPath Path, string Script)> _pendingWriters = [];
+
+    /// <summary>
+    /// Takes the <c>&gt;(...)</c> commands waiting for the file they read to be written.
+    /// </summary>
+    public List<(VPath Path, string Script)> TakePendingWriters()
+    {
+        if (_pendingWriters.Count == 0)
+        {
+            return [];
+        }
+
+        var pending = new List<(VPath, string)>(_pendingWriters);
+        _pendingWriters.Clear();
+        return pending;
     }
 
     private static int _processSubstitutionCount;

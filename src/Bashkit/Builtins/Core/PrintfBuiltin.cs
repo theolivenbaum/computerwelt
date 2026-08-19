@@ -171,7 +171,13 @@ public sealed class PrintfBuiltin : IBuiltin
                     return 1;
                 }
 
-                builder.Append((char)value);
+                // `\x00` names a byte that no string here can carry, so it contributes
+                // nothing rather than a stray terminator.
+                if (value != 0)
+                {
+                    builder.Append((char)value);
+                }
+
                 return digits + 1;
             }
 
