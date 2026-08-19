@@ -180,6 +180,21 @@ public sealed class VirtualMachine
         public void Dispose() => machine._depth--;
     }
 
+    /// <summary>
+    /// Resolves an awaited value.
+    /// </summary>
+    /// <remarks>
+    /// Only a coroutine or a settled future can be awaited. Anything else is a mistake in
+    /// the program rather than something to pass through, and saying so is the difference
+    /// between a typo being caught and it silently doing nothing.
+    /// </remarks>
+    public PyObject Await(PyObject value) => value switch
+    {
+        PyCoroutine coroutine => coroutine.Resolve(),
+        PyFuture future => future.Resolve(),
+        _ => throw new PyRaise(PyErrors.TypeError($"'{value.TypeName}' object can't be awaited")),
+    };
+
     private PyObject CallFunction(PyFunction function, PyObject[] arguments, PyDict? keywords)
     {
         if (++_depth > RecursionLimit)
@@ -199,6 +214,12 @@ public sealed class VirtualMachine
             {
                 // A generator call runs nothing yet; it materializes lazily on iteration.
                 return new PyGenerator(this, frame);
+            }
+
+            // Calling an `async def` produces a coroutine; the body runs when it is awaited.
+            if (function.Code.IsCoroutine)
+            {
+                return new PyCoroutine(function.Name, () => Execute(frame));
             }
 
             return Execute(frame);
@@ -1082,6 +1103,10 @@ public sealed class VirtualMachine
                 frame.Push(Call(callable, [.. positional.Items], keywords.Count > 0 ? keywords : null));
                 return false;
             }
+
+            case OpCode.Await:
+                frame.Push(Await(frame.Pop()));
+                return false;
 
             case OpCode.Return:
                 result = frame.Pop();

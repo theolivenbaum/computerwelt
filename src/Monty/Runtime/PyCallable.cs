@@ -106,11 +106,24 @@ public sealed class PyBuiltinFunction : PyCallable
     /// <inheritdoc />
     public override string Name { get; }
 
-    /// <inheritdoc />
-    public override string TypeName => "builtin_function_or_method";
+    /// <summary>
+    /// What kind of callable this presents as.
+    /// </summary>
+    /// <remarks>
+    /// Some of the standard library is written in Python upstream even where it is written
+    /// in C# here — <c>asyncio.gather</c> among them — and a program that prints one sees
+    /// the Python spelling.
+    /// </remarks>
+    public string Kind { get; init; } = "builtin_function_or_method";
 
     /// <inheritdoc />
-    public override string Repr() => $"<built-in function {Name}>";
+    public override string TypeName => Kind;
+
+    /// <inheritdoc />
+    public override string Repr() =>
+        Kind == "function"
+            ? $"<function {Name} at 0x{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this):x8}>"
+            : $"<built-in function {Name}>";
 
     /// <summary>Invokes the builtin.</summary>
     public PyObject Invoke(PyObject[] arguments, PyDict? keywords = null) =>

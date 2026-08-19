@@ -48,6 +48,16 @@ public sealed class CodeObject
     /// <summary>True when the body contains a <c>yield</c>, making calls produce a generator.</summary>
     public bool IsGenerator { get; set; }
 
+    /// <summary>
+    /// True for an <c>async def</c> body.
+    /// </summary>
+    /// <remarks>
+    /// Calling one produces a coroutine rather than running the body: the deferral is the
+    /// only observable difference in a runtime with no I/O to wait on, and it is what makes
+    /// awaiting the same coroutine twice an error.
+    /// </remarks>
+    public bool IsCoroutine { get; set; }
+
     /// <summary>Adds a constant, reusing an existing slot when the value is already present.</summary>
     public int AddConstant(PyObject value)
     {

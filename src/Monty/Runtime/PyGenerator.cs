@@ -62,6 +62,93 @@ public sealed class PyGenerator : PyObject
 }
 
 /// <summary>
+/// A coroutine: an <c>async def</c> body that has been called but not yet awaited.
+/// </summary>
+/// <remarks>
+/// With no I/O to wait on, nothing a coroutine does can actually block, so awaiting one
+/// runs it straight through. What the object buys is the deferral — the body does not run
+/// at the call — and the record of having been awaited, which is what makes awaiting the
+/// same coroutine twice the error CPython reports.
+/// </remarks>
+public sealed class PyCoroutine : PyObject
+{
+    private readonly Func<PyObject> _run;
+    private bool _awaited;
+
+    internal PyCoroutine(string name, Func<PyObject> run)
+    {
+        Name = name;
+        _run = run;
+    }
+
+    /// <summary>The name of the function that produced it.</summary>
+    public string Name { get; }
+
+    /// <inheritdoc />
+    public override string TypeName => "coroutine";
+
+    /// <inheritdoc />
+    public override string Repr() => $"<coroutine object {Name}>";
+
+    /// <summary>Runs the body and returns its result.</summary>
+    public PyObject Resolve()
+    {
+        if (_awaited)
+        {
+            throw new PyRaise(PyErrors.RuntimeError("cannot reuse already awaited coroutine"));
+        }
+
+        _awaited = true;
+        return _run();
+    }
+}
+
+/// <summary>
+/// A value that is already settled, standing in for a future.
+/// </summary>
+/// <remarks>
+/// <c>gather</c> has to return something awaitable, and with every coroutine completing
+/// synchronously there is nothing left to wait for by the time it returns — so the result
+/// is simply carried until the <c>await</c> unwraps it.
+/// </remarks>
+public sealed class PyFuture : PyObject
+{
+    private Func<PyObject>? _pending;
+    private PyObject? _value;
+
+    /// <summary>Creates a future that has already settled.</summary>
+    public PyFuture(PyObject value) => _value = value;
+
+    /// <summary>Creates a future whose work runs when it is first awaited.</summary>
+    public PyFuture(Func<PyObject> pending) => _pending = pending;
+
+    /// <inheritdoc />
+    public override string TypeName => "Future";
+
+    /// <inheritdoc />
+    public override string Repr() =>
+        _pending is null ? $"<Future finished result={_value!.Repr()}>" : "<Future pending>";
+
+    /// <summary>
+    /// Settles the future, running its work the first time and caching the result.
+    /// </summary>
+    /// <remarks>
+    /// Unlike a coroutine, a future may be awaited any number of times: the second await
+    /// gets the same object back rather than an error.
+    /// </remarks>
+    public PyObject Resolve()
+    {
+        if (_pending is { } work)
+        {
+            _pending = null;
+            _value = work();
+        }
+
+        return _value!;
+    }
+}
+
+/// <summary>
 /// Runs a generator frame, yielding each value the body produces.
 /// </summary>
 /// <remarks>

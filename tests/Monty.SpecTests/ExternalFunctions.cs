@@ -47,6 +47,13 @@ public static class ExternalFunctions
         },
 
         ["make_empty"] = static _ => new PyDataclass("Empty", [], [], frozen: true),
+
+        // The async half of the boundary: a host call that returns an awaitable. Both are
+        // already settled, because a host call in this harness has nothing to wait on.
+        ["async_call"] = static arguments => new PyFuture(arguments.Length > 0 ? arguments[0] : PyNone.Instance),
+
+        ["async_fail"] = static arguments => new PyFuture(() =>
+            throw new PyRaise(PyErrors.Create(arguments[0].Display(), arguments[1].Display()))),
     };
 
     /// <summary>

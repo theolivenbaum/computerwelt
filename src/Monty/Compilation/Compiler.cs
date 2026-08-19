@@ -938,6 +938,8 @@ public sealed class Compiler
         var code = CompileFunctionBody(
             function.Name, function.Parameters, function.Body, function.Line, isGeneratorHint: null);
 
+        code.IsCoroutine = function.IsAsync;
+
         // Decorator *expressions* evaluate top to bottom, but the decorators *apply*
         // bottom up. Pushing every expression first, then the function, leaves the stack
         // as [d0 … dn-1, f] — so each Call(1) naturally consumes the innermost pair.
@@ -1209,9 +1211,8 @@ public sealed class Compiler
                 break;
 
             case Await await:
-                // Without a scheduler an await is the value itself; the fixtures that need
-                // real concurrency are the asyncio ones, which are not yet in scope.
                 CompileExpression(await.Value);
+                Emit(OpCode.Await, 0, await.Line);
                 break;
 
             case Starred starred:

@@ -167,6 +167,9 @@ public enum OpCode
     /// <summary>Delegate to a sub-iterator, for <c>yield from</c>.</summary>
     YieldFrom,
 
+    /// <summary>Await the top value, replacing it with the result.</summary>
+    Await,
+
     /// <summary>Build a function from the code object named by the operand.</summary>
     MakeFunction,
 

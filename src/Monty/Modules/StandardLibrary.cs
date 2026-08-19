@@ -44,6 +44,7 @@ public static class StandardLibrary
         ["math"] = MathModule.Create(),
         ["sys"] = SysModule.Create(machine),
         ["json"] = JsonModule.Create(machine),
+        ["asyncio"] = AsyncioModule.Create(machine),
         ["collections"] = SupportModules.CreateCollections(machine),
         ["itertools"] = SupportModules.CreateItertools(machine),
         ["typing"] = SupportModules.CreateTyping(),
