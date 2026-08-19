@@ -762,7 +762,17 @@ public sealed class Parser
         return ParseCommand();
     }
 
-    private Node ParseBlockUntil(params string[] terminators)
+    /// <summary>
+    /// Parses the commands up to one of <paramref name="terminators"/>.
+    /// </summary>
+    /// <remarks>
+    /// An empty body is a syntax error in bash — <c>while true; do done</c> does not run an
+    /// empty loop, it fails to parse — so callers that require a body say so. Only
+    /// <c>case ... esac</c> may legitimately be empty.
+    /// </remarks>
+    private Node ParseBlockUntil(params string[] terminators) => ParseBlockUntil(true, terminators);
+
+    private Node ParseBlockUntil(bool required, params string[] terminators)
     {
         var terminatorSet = new HashSet<string>(terminators, StringComparer.Ordinal);
         var commands = new List<Node>();
@@ -773,6 +783,11 @@ public sealed class Parser
             _budget?.ChargeParserFuel();
             commands.Add(ParseList());
             SkipTerminators();
+        }
+
+        if (required && commands.Count == 0)
+        {
+            throw Unexpected($"syntax error near unexpected token `{Current.Text}'");
         }
 
         return Sequence(commands);

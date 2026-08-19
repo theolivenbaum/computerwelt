@@ -24,6 +24,11 @@ public sealed record ShellHooks(
     /// defines or unsets is visible afterwards — the isolation a real <c>fork</c> gives.
     /// </remarks>
     public Func<ChildShell, CancellationToken, ValueTask<ExecResult>>? RunIsolated { get; init; }
+
+    /// <summary>
+    /// Replaces the shell's standard input, as a bare <c>exec &lt; file</c> does.
+    /// </summary>
+    public Action<StreamData?>? SetStandardInput { get; init; }
 }
 
 /// <summary>A request to run a script in an isolated child shell.</summary>

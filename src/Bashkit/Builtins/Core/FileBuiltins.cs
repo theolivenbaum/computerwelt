@@ -12,8 +12,25 @@ public sealed class CatBuiltin : IBuiltin
     public string? LlmHint => "cat: Prints file contents. Supports -n (number lines), -A/-E (show ends), -s (squeeze blanks).";
 
     /// <inheritdoc />
+    public string? Help =>
+        """
+        Usage: cat [OPTION]... [FILE]...
+        Concatenate FILE(s) to standard output.
+
+          -n    number every output line
+          -b    number non-blank output lines
+          -E    display $ at the end of each line
+          -s    squeeze repeated blank lines
+        """;
+
+    /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
+        if (CommandHelp.Handle(context.Arguments, Help!, "cat 0.1.0") is { } help)
+        {
+            return help;
+        }
+
         var cursor = new ArgCursor(context.Arguments);
         var numberAll = false;
         var numberNonBlank = false;

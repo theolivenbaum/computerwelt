@@ -32,8 +32,26 @@ public sealed class DateBuiltin : IBuiltin
     public string? LlmHint => "date: Prints the date. Supports +FORMAT strftime specifiers, -u, -d, -r, --iso-8601.";
 
     /// <inheritdoc />
+    public string? Help =>
+        """
+        Usage: date [+FORMAT] [-u] [-R] [-I[TIMESPEC]] [-d STRING] [-r FILE]
+        Display the current time in the given FORMAT.
+
+          -u            use UTC
+          -R            output in RFC 5322 format
+          -I[SPEC]      output in ISO 8601 format
+          -d STRING     display the time described by STRING
+          -r FILE       display FILE's modification time
+        """;
+
+    /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
+        if (CommandHelp.Handle(context.Arguments, Help!, "date 0.1.0") is { } help)
+        {
+            return help;
+        }
+
         var cursor = new ArgCursor(context.Arguments);
         var utc = false;
         string? dateSpec = null;

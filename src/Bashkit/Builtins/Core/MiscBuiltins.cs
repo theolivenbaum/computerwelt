@@ -143,7 +143,17 @@ public sealed class EnvBuiltin : IBuiltin
     /// <inheritdoc />
     public ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
-        var environment = context.State.ExportedEnvironment();
+        // The reported environment is what the script itself exported. The shell's own
+        // defaults are inherited by child shells but are not part of it, so a fresh shell
+        // reports nothing — the same as a process started with an empty environ.
+        var environment = context.State.ExportedEnvironment()
+            .Where(entry => !context.State.ShellDefaults.Contains(entry.Key))
+            .ToDictionary(static entry => entry.Key, static entry => entry.Value, StringComparer.Ordinal);
+
+        if (Name == "env")
+        {
+            return ValueTask.FromResult(RunEnv(context, environment));
+        }
 
         // `printenv NAME` prints one value and fails when it is unset.
         if (Name == "printenv" && context.Arguments.Count > 0)
@@ -177,6 +187,59 @@ public sealed class EnvBuiltin : IBuiltin
         }
 
         return ValueTask.FromResult(ExecResult.Ok(output.ToString()));
+    }
+
+    /// <summary>
+    /// Runs <c>env</c>, which prints the environment its own options describe.
+    /// </summary>
+    /// <remarks>
+    /// Running a command through <c>env</c> is not supported: it would need a process, and
+    /// the shell already offers the same effect with a temporary assignment prefix.
+    /// </remarks>
+    private static ExecResult RunEnv(BuiltinContext context, Dictionary<string, string> environment)
+    {
+        var result = new Dictionary<string, string>(environment, StringComparer.Ordinal);
+
+        for (var i = 0; i < context.Arguments.Count; i++)
+        {
+            var argument = context.Arguments[i];
+
+            switch (argument)
+            {
+                case "-i" or "--ignore-environment" or "-":
+                    result.Clear();
+                    continue;
+
+                case "-0" or "--null":
+                    continue;
+
+                case "-u" or "--unset" when i + 1 < context.Arguments.Count:
+                    result.Remove(context.Arguments[++i]);
+                    continue;
+            }
+
+            var equals = argument.IndexOf('=', StringComparison.Ordinal);
+
+            if (equals > 0)
+            {
+                result[argument[..equals]] = argument[(equals + 1)..];
+                continue;
+            }
+
+            if (!argument.StartsWith('-'))
+            {
+                return ExecResult.Error($"env: '{argument}': running commands is not supported\n", 127);
+            }
+        }
+
+        var output = new StringBuilder();
+
+        foreach (var (name, value) in result.OrderBy(static p => p.Key, StringComparer.Ordinal))
+        {
+            output.Append(name).Append('=').Append(value).Append('\n');
+        }
+
+        return ExecResult.Ok(output.ToString());
     }
 }
 

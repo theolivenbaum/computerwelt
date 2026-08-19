@@ -59,6 +59,17 @@ public sealed class ShellState
     /// <summary>The names of functions currently executing, innermost first.</summary>
     public List<string> CallStack { get; } = [];
 
+    /// <summary>
+    /// Variables the shell seeded at start-up rather than the script exporting them.
+    /// </summary>
+    /// <remarks>
+    /// <c>env</c> and <c>printenv</c> report the environment a script has built, which
+    /// starts empty — the shell's own <c>HOME</c>, <c>PATH</c> and friends are inherited by
+    /// child shells but are not part of what the script put there. Exporting a name
+    /// explicitly removes it from this set, so a re-exported <c>PATH</c> does show up.
+    /// </remarks>
+    public HashSet<string> ShellDefaults { get; private set; } = new(StringComparer.Ordinal);
+
     /// <summary>The number of scopes currently pushed beyond the global one.</summary>
     public int ScopeDepth => _scopes.Count - 1;
 
@@ -322,6 +333,7 @@ public sealed class ShellState
             WorkingDirectory = WorkingDirectory,
             LastExitCode = LastExitCode,
             PipeStatus = [.. PipeStatus],
+            ShellDefaults = new HashSet<string>(ShellDefaults, StringComparer.Ordinal),
         };
 
         fork._scopes.Clear();

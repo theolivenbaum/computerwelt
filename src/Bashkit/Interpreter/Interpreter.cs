@@ -61,6 +61,7 @@ public sealed class Interpreter
         BuiltinNames: () => _builtins.Keys)
     {
         RunIsolated = RunIsolatedAsync,
+        SetStandardInput = data => _standardInput = data,
     };
 
     private Builtins.ShellHooks? _hooks;
@@ -353,6 +354,11 @@ public sealed class Interpreter
     private async ValueTask<ExecResult> ExecuteCompoundAsync(CompoundCommand compound, StreamData? stdin, CancellationToken cancellationToken)
     {
         var redirection = await Redirection.PrepareAsync(this, compound.Redirects, stdin, cancellationToken);
+
+        if (redirection.Failure is { } redirectionFailure)
+        {
+            return redirectionFailure;
+        }
         var result = await ExecuteAsync(compound.Body, redirection.Stdin, cancellationToken);
         return await redirection.ApplyAsync(result, cancellationToken);
     }
@@ -709,6 +715,11 @@ public sealed class Interpreter
         if (command.Words.Count == 0)
         {
             var redirectionOnly = await Redirection.PrepareAsync(this, command.Redirects, stdin, cancellationToken);
+
+            if (redirectionOnly.Failure is { } assignmentFailure)
+            {
+                return assignmentFailure;
+            }
             foreach (var assignment in command.Assignments)
             {
                 await ApplyAssignmentAsync(assignment, cancellationToken);
@@ -741,6 +752,11 @@ public sealed class Interpreter
             && State.Aliases.TryGetValue(name, out var alias))
         {
             var redirected = await Redirection.PrepareAsync(this, command.Redirects, stdin, cancellationToken);
+
+            if (redirected.Failure is { } aliasFailure)
+            {
+                return aliasFailure;
+            }
             _aliasesInProgress.Add(name);
             try
             {
@@ -755,6 +771,11 @@ public sealed class Interpreter
         }
 
         var redirection = await Redirection.PrepareAsync(this, command.Redirects, stdin, cancellationToken);
+
+        if (redirection.Failure is { } failure)
+        {
+            return failure;
+        }
 
         if (State.Options.XTrace)
         {
@@ -781,6 +802,10 @@ public sealed class Interpreter
         StreamData? stdin,
         CancellationToken cancellationToken)
     {
+        // A command with no input of its own reads the shell's, which `exec < file` may
+        // have redirected.
+        stdin ??= _standardInput;
+
         if (State.Functions.TryGetValue(name, out var function))
         {
             return await CallFunctionAsync(function, arguments, assignments, stdin, cancellationToken);

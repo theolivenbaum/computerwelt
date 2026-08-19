@@ -10,8 +10,27 @@ public sealed class SortBuiltin : IBuiltin
     public string Name => "sort";
 
     /// <inheritdoc />
+    public string? Help =>
+        """
+        Usage: sort [OPTION]... [FILE]...
+        Write the sorted concatenation of all FILE(s) to standard output.
+
+          -n    compare numerically
+          -r    reverse the result
+          -u    output only the first of an equal run
+          -f    fold case
+          -k    sort by a key
+          -t    use a field separator
+        """;
+
+    /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
+        if (CommandHelp.Handle(context.Arguments, Help!, "sort 0.1.0") is { } help)
+        {
+            return help;
+        }
+
         var cursor = new ArgCursor(context.Arguments);
         var numeric = false;
         var reverse = false;

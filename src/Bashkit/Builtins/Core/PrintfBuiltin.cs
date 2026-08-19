@@ -129,6 +129,31 @@ public sealed class PrintfBuiltin : IBuiltin
                 return digits;
             }
 
+            // `\uXXXX` and `\UXXXXXXXX` name a codepoint, which is how a script emits a
+            // character it cannot type.
+            case 'u' or 'U':
+            {
+                var limit = c == 'u' ? 4 : 8;
+                var digits = 0;
+                var value = 0;
+                var offset = index + 2;
+
+                while (digits < limit && offset < format.Length && Uri.IsHexDigit(format[offset]))
+                {
+                    value = (value * 16) + Convert.ToInt32(format[offset++].ToString(), 16);
+                    digits++;
+                }
+
+                if (digits == 0)
+                {
+                    builder.Append('\\').Append(c);
+                    return 1;
+                }
+
+                builder.Append(value <= 0x10FFFF ? char.ConvertFromUtf32(value) : string.Empty);
+                return digits + 1;
+            }
+
             case 'x':
             {
                 var digits = 0;

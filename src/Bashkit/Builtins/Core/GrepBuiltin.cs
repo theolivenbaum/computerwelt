@@ -35,8 +35,31 @@ public sealed class GrepBuiltin : IBuiltin
         "grep: Searches text. Supports -i -v -n -c -l -L -w -x -E -F -r -A -B -C -o -q -e -f --include --exclude.";
 
     /// <inheritdoc />
+    public string? Help =>
+        """
+        Usage: grep [OPTION]... PATTERN [FILE]...
+        Search for PATTERN in each FILE.
+
+          -i    ignore case
+          -v    select non-matching lines
+          -n    prefix each line with its line number
+          -c    print only a count of matching lines
+          -l    print only the names of files with matches
+          -r    search directories recursively
+          -E    the pattern is an extended regular expression
+          -F    the pattern is a fixed string
+          -o    print only the matching parts
+          -q    suppress all output; exit status reports the match
+        """;
+
+    /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
+        if (CommandHelp.Handle(context.Arguments, Help!, $"{Name} (bashkit) 0.1") is { } help)
+        {
+            return help;
+        }
+
         var options = new GrepOptions
         {
             Extended = Name == "egrep",

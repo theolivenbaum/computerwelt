@@ -33,6 +33,18 @@ public sealed class Redirection
     /// <summary>Standard input for the command after input redirections are resolved.</summary>
     public StreamData? Stdin { get; private set; }
 
+    /// <summary>
+    /// The error a redirection failed with, or <see langword="null"/> when they all
+    /// resolved.
+    /// </summary>
+    /// <remarks>
+    /// A redirection that cannot be set up — a missing input file, an output path that is a
+    /// directory — stops the command without running it and reports status 1, which is what
+    /// bash does. Letting the failure escape as an exception would instead abort the whole
+    /// script.
+    /// </remarks>
+    public ExecResult? Failure { get; private set; }
+
     /// <summary>Resolves the redirection list, reading any input sources.</summary>
     public static async ValueTask<Redirection> PrepareAsync(
         Interpreter interpreter,
@@ -44,7 +56,16 @@ public sealed class Redirection
 
         foreach (var redirect in redirects)
         {
-            await redirection.AddAsync(interpreter, redirect, cancellationToken);
+            try
+            {
+                await redirection.AddAsync(interpreter, redirect, cancellationToken);
+            }
+            catch (BashkitException exception)
+                when (exception.Kind is BashkitErrorKind.FileSystem or BashkitErrorKind.PermissionDenied)
+            {
+                redirection.Failure = ExecResult.Error($"bash: {exception.Message}\n", ExitCodes.Failure);
+                return redirection;
+            }
         }
 
         return redirection;
@@ -56,8 +77,16 @@ public sealed class Redirection
         {
             case RedirectKind.Input:
             {
-                var path = interpreter.State.WorkingDirectory.Join(
-                    await interpreter.Expander.ExpandToStringAsync(redirect.Target, cancellationToken));
+                var target = await interpreter.Expander.ExpandToStringAsync(redirect.Target, cancellationToken);
+
+                // The sandbox has no device nodes, so `/dev/null` is recognised by name.
+                if (target == "/dev/null")
+                {
+                    Stdin = StreamData.Empty;
+                    return;
+                }
+
+                var path = interpreter.State.WorkingDirectory.Join(target);
                 var bytes = await FileSystem.ReadFileAsync(path, cancellationToken);
                 Stdin = StreamData.FromBytes(bytes);
                 return;

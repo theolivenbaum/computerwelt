@@ -65,6 +65,10 @@ public sealed class ExportBuiltin : IBuiltin
             else
             {
                 variable.Attributes |= VariableAttributes.Exported;
+
+                // Exporting explicitly makes the name part of the script's own
+                // environment, even when the shell had seeded it.
+                context.State.ShellDefaults.Remove(name);
             }
         }
 

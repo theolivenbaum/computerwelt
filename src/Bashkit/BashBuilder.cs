@@ -153,6 +153,10 @@ public sealed class BashBuilder
         {
             state.Set(name, value);
             state.GetOrCreate(name).Attributes |= VariableAttributes.Exported;
+
+            // Seeded, not exported by the script: `env` starts empty even though a child
+            // shell still inherits these.
+            state.ShellDefaults.Add(name);
         }
 
         // IFS is deliberately not exported, matching bash.
@@ -223,6 +227,7 @@ public sealed class BashBuilder
         Register(new UnaliasBuiltin());
         Register(new TypeBuiltin());
         Register(new EvalBuiltin());
+        Register(new ExecBuiltin());
 
         Register(new GrepBuiltin());
         Register(new GrepBuiltin("egrep"));
@@ -240,6 +245,34 @@ public sealed class BashBuilder
         Register(new TeeBuiltin());
         Register(new XargsBuiltin());
         Register(new FindBuiltin());
+
+        Register(new BcBuiltin());
+        Register(new CompgenBuiltin());
+        Register(new NumfmtBuiltin());
+        Register(new CommBuiltin());
+        Register(new OdBuiltin());
+        Register(new XxdBuiltin());
+        Register(new ShufBuiltin());
+        Register(new DfBuiltin());
+        Register(new DuBuiltin());
+        Register(new FileBuiltin());
+        Register(new StringsBuiltin());
+        Register(new ColumnBuiltin());
+        Register(new TreeBuiltin());
+        Register(new PagerBuiltin());
+        Register(new PagerBuiltin("more"));
+        Register(new WatchBuiltin());
+        Register(new HistoryBuiltin());
+        Register(new DiffBuiltin());
+        Register(new TarBuiltin());
+        Register(new ChownBuiltin());
+        Register(new ChownBuiltin("chgrp"));
+        Register(new KillBuiltin());
+
+        foreach (var checksum in ChecksumBuiltin.All())
+        {
+            Register(checksum);
+        }
 
         Register(new RealpathBuiltin());
         Register(new ReadlinkBuiltin());

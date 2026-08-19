@@ -13,8 +13,29 @@ public sealed class LsBuiltin : IBuiltin
     public string? LlmHint => "ls: Lists files. Supports -l (long), -a (all), -R (recursive), -1, -d, -r, -t, -S.";
 
     /// <inheritdoc />
+    public string? Help =>
+        """
+        Usage: ls [OPTION]... [FILE]...
+        List information about the FILEs, the current directory by default.
+
+          -l    use a long listing format
+          -a    do not ignore entries starting with .
+          -R    list subdirectories recursively
+          -1    list one file per line
+          -d    list directories themselves, not their contents
+          -r    reverse the order
+          -t    sort by modification time
+          -S    sort by size
+        """;
+
+    /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
+        if (CommandHelp.Handle(context.Arguments, Help!, "ls 0.1.0") is { } help)
+        {
+            return help;
+        }
+
         var cursor = new ArgCursor(context.Arguments);
         var longFormat = false;
         var showHidden = false;
