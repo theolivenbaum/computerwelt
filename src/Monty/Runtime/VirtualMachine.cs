@@ -113,8 +113,19 @@ public sealed class VirtualMachine
         switch (type.GetAttribute("__init__"))
         {
             case PyFunction initializer:
-                CallFunction(initializer.Bind(instance), arguments, keywords);
+            {
+                // An initializer produces the instance by mutating it, so returning
+                // anything is a mistake worth reporting rather than quietly dropping.
+                var returned = CallFunction(initializer.Bind(instance), arguments, keywords);
+
+                if (returned is not PyNone)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"__init__() should return None, not '{returned.TypeName}'"));
+                }
+
                 break;
+            }
 
             // A decorator such as `@dataclass` installs a builtin `__init__`, which is
             // unbound and therefore takes the receiver as its first argument.
@@ -230,6 +241,22 @@ public sealed class VirtualMachine
             {
                 var name = key.Display();
                 var slot = code.LocalNames.IndexOf(name);
+                var positionalOnly = declared.Take(parameters.PositionalOnlyCount).Any(p => p.Name == name);
+
+                // A parameter before `/` can only be filled positionally; naming it is an
+                // error even though the name exists.
+                if (positionalOnly)
+                {
+                    if (parameters.KeywordArgs is null)
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            $"{code.Name}() got some positional-only arguments passed as keyword arguments: '{name}'"));
+                    }
+
+                    leftoverKeywords.Set(key, value);
+                    continue;
+                }
+
                 var isParameter = declared.Any(p => p.Name == name) || parameters.KeywordOnly.Any(p => p.Name == name);
 
                 if (isParameter && slot >= 0)
@@ -777,6 +804,34 @@ public sealed class VirtualMachine
                 var value = frame.Pop();
                 var key = frame.Pop();
                 ((PyDict)frame.Peek(instruction.Operand - 2)).Set(key, value);
+                return false;
+            }
+
+            case OpCode.MapMerge:
+            {
+                var incoming = frame.Pop();
+                var keywordTarget = (PyDict)frame.Peek(instruction.Operand - 1);
+
+                if (incoming is not PyDict merged)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"argument after ** must be a mapping, not {incoming.TypeName}"));
+                }
+
+                // The callable sits under the positional list, which sits under the map.
+                var name = frame.Peek(instruction.Operand + 1) is PyCallable callee ? callee.Name : "function";
+
+                foreach (var (key, value) in merged.Entries)
+                {
+                    if (keywordTarget.TryGetValue(key, out _))
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            $"{name}() got multiple values for keyword argument '{key.Display()}'"));
+                    }
+
+                    keywordTarget.Set(key, value);
+                }
+
                 return false;
             }
 

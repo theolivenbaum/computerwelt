@@ -336,7 +336,26 @@ public sealed class PyDict : PyObject
     public override int? Length() => _entries.Count;
 
     /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => _entries.Select(static e => e.Key).ToList();
+    /// <remarks>
+    /// The size is re-checked on every step: growing or shrinking a dictionary while
+    /// looping over it would otherwise silently visit the wrong keys.
+    /// </remarks>
+    public override IEnumerable<PyObject>? Iterate() => IterateKeys();
+
+    private IEnumerable<PyObject> IterateKeys()
+    {
+        var expected = _entries.Count;
+
+        for (var i = 0; i < _entries.Count; i++)
+        {
+            yield return _entries[i].Key;
+
+            if (_entries.Count != expected)
+            {
+                throw new PyRaise(PyErrors.RuntimeError("dictionary changed size during iteration"));
+            }
+        }
+    }
 
     /// <inheritdoc />
     public override string Repr()

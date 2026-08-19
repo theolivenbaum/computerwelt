@@ -76,6 +76,16 @@ public enum OpCode
     /// <summary>Build a dict from the top 2N values, keys and values interleaved.</summary>
     BuildMap,
 
+    /// <summary>
+    /// Merges a mapping into the keyword dictionary of a call, rejecting a duplicate key.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from <see cref="MapUpdate"/> because a dict display may legitimately
+    /// override a key — <c>{**a, **b}</c> — while a call may not name the same argument
+    /// twice.
+    /// </remarks>
+    MapMerge,
+
     /// <summary>Build a slice from the top 3 values.</summary>
     BuildSlice,
 

@@ -186,6 +186,13 @@ public sealed class Compiler
                 break;
 
             case Nonlocal nonlocal:
+                // There is no enclosing function to bind to at module level, so the
+                // declaration cannot mean anything there.
+                if (!_isFunctionScope)
+                {
+                    throw new PythonSyntaxError("nonlocal declaration not allowed at module level", nonlocal.Line, nonlocal.Column);
+                }
+
                 foreach (var name in nonlocal.Names)
                 {
                     _nonlocalDeclarations.Add(name);
@@ -1376,7 +1383,7 @@ public sealed class Compiler
             if (keyword.Name is null)
             {
                 CompileExpression(keyword.Value);
-                Emit(OpCode.MapUpdate, 1, call.Line);
+                Emit(OpCode.MapMerge, 1, call.Line);
                 continue;
             }
 
