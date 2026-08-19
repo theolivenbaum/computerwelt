@@ -7,9 +7,16 @@ Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-
 `python` and `typescript` suites). Ratchet file: `tests/spec/baseline.json`.
 
 **Current state:** solution builds clean, 151 unit tests green,
-**1,225 / 2,521 conformance cases passing (48.6 %)** — of which 1,221 of ~2,094 in the
-core `bash` suite (58 %). The `awk`, `grep`, `sed`, `jq` and `yq` suites are at zero
-because those commands are not implemented yet; they account for ~450 cases.
+**1,578 / 2,521 conformance cases passing (62.6 %)**.
+
+| suite | passing |
+|---|---|
+| `bash` | 1,440 / 2,094 |
+| `grep` | 70 / 95 |
+| `sed` | 66 / 80 |
+| `jq` | 2 / 124 |
+| `awk` | 0 / 126 |
+| `yq` | 0 / 26 |
 
 ---
 
@@ -110,7 +117,7 @@ Upstream: `interpreter/` (~730 KB — the largest single area)
 - [ ] Command substitution trailing-newline stripping + nested quoting edge cases
 - [x] `[[ ]]` conditional expressions incl. `=~` regex + `BASH_REMATCH`
 - [~] Arrays: indexed + associative + splat + append done; slicing and `${!arr[@]}` not
-- [ ] `trap` / signal simulation, `EXIT`/`ERR`/`DEBUG`/`RETURN` traps
+- [~] `trap` records handlers; firing them on `EXIT`/`ERR`/`DEBUG`/`RETURN` is not done
 - [ ] Job control simulation (`&`, `jobs`, `wait`, `%1`)
 - [~] `set -e` fires and is suppressed after `&&`/`||`/`!`; the full context list is unverified
 - [~] `set -x` emits `+ cmd` to stderr; `PS4` and structured `TraceEvent` not yet
@@ -121,25 +128,29 @@ Upstream: `interpreter/` (~730 KB — the largest single area)
 ## Phase 6 — Builtins  (`src/Bashkit/Builtins/`)
 
 ~160 commands. `IBuiltin`, `BuiltinContext` and the `ArgCursor` option parser are in
-place; 38 commands are registered so far.
+place, along with `ShellHooks` for the builtins that call back into the shell
+(`eval`, `source`, `command`, `xargs`, `find -exec`). 71 commands are registered.
 
 ### Shell builtins
 - [x] `echo` `printf` `true` `false` `:` `exit` `cd` `pwd` `test` `[`
 - [x] `export` `unset` `set` `shift` `local` `readonly` `read` `shopt`
 - [x] `declare`/`typeset` `alias` `unalias` `type`
-- [ ] `eval` `source`/`.` `trap` `which` `hash` `command`
+- [x] `eval` `source`/`.` `trap` `which` `hash` `command` `getopts` `let`
 - [ ] `mapfile`/`readarray` `caller` `times` `wait` `kill`
-- [ ] `compgen` `fc` `history` `help` `getopts` `let` `ulimit` `umask`
+- [ ] `compgen` `fc` `history` `help` `ulimit` `umask`
+- [~] `trap` records handlers; they are not yet fired on EXIT/ERR/DEBUG
 
 ### File & directory
 - [x] `cat` `ls` `mkdir` `rm` `cp` `mv` `touch` `basename` `dirname`
-- [ ] `find` `tree` `rmdir` `ln` `chmod` `chown` `stat` `file` `truncate` `mktemp`
-      `mkfifo` `realpath` `readlink` `less` `du` `df` `pushd` `popd` `dirs`
+- [x] `find` `rmdir` `ln` `chmod` `stat` `truncate` `mktemp` `realpath` `readlink`
+      `pushd` `popd` `dirs`
+- [ ] `tree` `chown` `file` `mkfifo` `less` `du` `df`
 
 ### Text processing
-- [x] `head` `tail` `wc` `sort` `uniq` `cut` `tr` `rev` `tac` `seq` `yes`
-- [ ] `grep` `sed` `awk` `nl` `paste` `column` `comm` `diff` `patch` `join` `split`
-      `fold` `expand` `unexpand` `strings` `shuf` `csv` `template` `envsubst` `iconv`
+- [x] `head` `tail` `wc` `sort` `uniq` `rev` `tac` `seq` `yes`
+- [x] `grep` (+ `egrep`, `fgrep`) `sed` `cut` `tr` `nl` `paste`
+- [ ] `awk` `column` `comm` `diff` `patch` `join` `split` `fold` `expand` `unexpand`
+      `strings` `shuf` `csv` `template` `envsubst` `iconv`
 - [ ] `rg` (ripgrep subset)
 
 ### Data formats
@@ -151,8 +162,9 @@ place; 38 commands are registered so far.
 
 ### Math / misc
 - [x] `expr` `env` `printenv`
-- [ ] `bc` `numfmt` `semver` `sleep` `timeout` `retry` `watch` `parallel` `xargs` `tee`
-- [ ] `id` `whoami` `hostname` `uname` `clear` `assert` `verify` `dotenv` `glob` `log`
+- [x] `sleep` `xargs` `tee` `id` `whoami` `hostname` `uname`
+- [ ] `bc` `numfmt` `semver` `timeout` `retry` `watch` `parallel` `date`
+- [ ] `clear` `assert` `verify` `dotenv` `glob` `log`
 
 ### Network (allowlist-gated)
 - [ ] `curl` `wget` `http`

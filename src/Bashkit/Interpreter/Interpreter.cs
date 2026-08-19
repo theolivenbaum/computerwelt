@@ -23,6 +23,7 @@ public sealed class Interpreter
 {
     private readonly IReadOnlyDictionary<string, IBuiltin> _builtins;
     private readonly StringBuilder _stderr = new();
+    private readonly HashSet<string> _aliasesInProgress = new(StringComparer.Ordinal);
     private int _loopDepth;
 
     /// <summary>Creates an interpreter over the given state, filesystem and builtin table.</summary>
@@ -50,6 +51,15 @@ public sealed class Interpreter
 
     /// <summary>The word expander bound to this interpreter.</summary>
     public Expander Expander { get; }
+
+    /// <summary>The shell capabilities handed to builtins that call back into the shell.</summary>
+    public Builtins.ShellHooks Hooks => _hooks ??= new Builtins.ShellHooks(
+        RunFragment: RunFragmentAsync,
+        RunCommand: RunBuiltinDirectlyAsync,
+        IsBuiltin: HasBuiltin,
+        BuiltinNames: () => _builtins.Keys);
+
+    private Builtins.ShellHooks? _hooks;
 
     /// <summary>Runs a whole script and returns its combined result.</summary>
     public async ValueTask<ExecResult> RunAsync(Script script, StreamData? stdin = null, CancellationToken cancellationToken = default)
@@ -628,6 +638,27 @@ public sealed class Interpreter
         var name = words[0];
         var arguments = words[1..];
 
+        // An alias substitutes textually for the command word before dispatch. It is
+        // resolved here rather than in the parser because aliases can be defined by the
+        // very script being run, so the parser has not seen them yet.
+        if (State.Options.ExpandAliases
+            && !_aliasesInProgress.Contains(name)
+            && State.Aliases.TryGetValue(name, out var alias))
+        {
+            var redirected = await Redirection.PrepareAsync(this, command.Redirects, stdin, cancellationToken);
+            _aliasesInProgress.Add(name);
+            try
+            {
+                var expandedLine = alias + (arguments.Count > 0 ? " " + string.Join(' ', arguments.Select(Expander_Quote)) : string.Empty);
+                var aliasResult = await RunFragmentAsync(expandedLine, redirected.Stdin, cancellationToken);
+                return await redirected.ApplyAsync(aliasResult, cancellationToken);
+            }
+            finally
+            {
+                _aliasesInProgress.Remove(name);
+            }
+        }
+
         var redirection = await Redirection.PrepareAsync(this, command.Redirects, stdin, cancellationToken);
 
         if (State.Options.XTrace)
@@ -669,7 +700,7 @@ public sealed class Interpreter
         var saved = await ApplyTemporaryAssignmentsAsync(assignments, cancellationToken);
         try
         {
-            var context = new BuiltinContext(name, arguments, State, FileSystem, Budget, stdin);
+            var context = new BuiltinContext(name, arguments, State, FileSystem, Budget, stdin, Hooks);
             return await builtin.ExecuteAsync(context, cancellationToken);
         }
         finally
@@ -862,6 +893,12 @@ public sealed class Interpreter
         }
     }
 
+    /// <summary>
+    /// Re-quotes an already-expanded argument so that re-parsing an alias expansion does
+    /// not split or glob it a second time.
+    /// </summary>
+    private static string Expander_Quote(string value) => Expander.Quote(value);
+
     private static string StripQuotes(string text) =>
         text.Length >= 2 && ((text[0] == '"' && text[^1] == '"') || (text[0] == '\'' && text[^1] == '\''))
             ? text[1..^1]
@@ -891,6 +928,26 @@ public sealed class Interpreter
         var parsed = Parser.Parse(script, Budget);
         var nested = new Interpreter(State, FileSystem, Budget, _builtins);
         return await nested.RunAsync(parsed, stdin, cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs one already-expanded command line, bypassing function lookup. This is what
+    /// <c>command</c> needs: the words are final, and a shell function of the same name
+    /// must not shadow the builtin.
+    /// </summary>
+    public async ValueTask<ExecResult> RunBuiltinDirectlyAsync(
+        IReadOnlyList<string> words,
+        StreamData? stdin,
+        CancellationToken cancellationToken)
+    {
+        if (words.Count == 0 || !_builtins.TryGetValue(words[0], out var builtin))
+        {
+            return ExecResult.Error($"bash: {(words.Count > 0 ? words[0] : string.Empty)}: command not found\n", ExitCodes.NotFound);
+        }
+
+        Budget.ChargeCommand();
+        var context = new BuiltinContext(words[0], [.. words.Skip(1)], State, FileSystem, Budget, stdin, Hooks);
+        return await builtin.ExecuteAsync(context, cancellationToken);
     }
 
     /// <summary>True when <paramref name="name"/> resolves to a registered builtin.</summary>

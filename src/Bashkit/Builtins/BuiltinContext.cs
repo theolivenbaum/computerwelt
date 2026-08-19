@@ -19,7 +19,8 @@ public sealed class BuiltinContext
         ShellState state,
         IFileSystem fileSystem,
         ExecutionBudget budget,
-        StreamData? stdin = null)
+        StreamData? stdin = null,
+        ShellHooks? hooks = null)
     {
         Name = name;
         Arguments = arguments;
@@ -27,7 +28,23 @@ public sealed class BuiltinContext
         FileSystem = fileSystem;
         Budget = budget;
         Stdin = stdin;
+        _hooks = hooks;
     }
+
+    private readonly ShellHooks? _hooks;
+
+    /// <summary>
+    /// The shell capabilities a builtin may call back into — running a script fragment,
+    /// invoking another command, querying the registry.
+    /// </summary>
+    /// <remarks>
+    /// Supplied per invocation by the dispatching interpreter rather than injected at
+    /// registration, because a builtin must reach the interpreter that is <i>currently</i>
+    /// running it: a subshell has its own state, and a callback captured at build time
+    /// would silently address the wrong one.
+    /// </remarks>
+    public ShellHooks Hooks => _hooks
+        ?? throw new InvalidOperationException($"{Name}: shell hooks are not available in this context");
 
     /// <summary>The name the command was invoked as.</summary>
     public string Name { get; }

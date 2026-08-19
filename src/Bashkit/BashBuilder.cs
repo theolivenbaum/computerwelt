@@ -210,6 +210,46 @@ public sealed class BashBuilder
         Register(new ExprBuiltin());
         Register(new AliasBuiltin());
         Register(new UnaliasBuiltin());
-        Register(new TypeBuiltin(registry.ContainsKey));
+        Register(new TypeBuiltin());
+        Register(new EvalBuiltin());
+
+        Register(new GrepBuiltin());
+        Register(new GrepBuiltin("egrep"));
+        Register(new GrepBuiltin("fgrep"));
+        Register(new SedBuiltin());
+        Register(new CutBuiltin());
+        Register(new TrBuiltin());
+        Register(new NlBuiltin());
+        Register(new PasteBuiltin());
+        Register(new TeeBuiltin());
+        Register(new XargsBuiltin());
+        Register(new FindBuiltin());
+
+        Register(new RealpathBuiltin());
+        Register(new ReadlinkBuiltin());
+        Register(new LnBuiltin());
+        Register(new ChmodBuiltin());
+        Register(new StatBuiltin());
+        Register(new TruncateBuiltin());
+        Register(new MktempBuiltin());
+        Register(new RmdirBuiltin());
+
+        Register(new IdentityBuiltin("whoami"));
+        Register(new IdentityBuiltin("id"));
+        Register(new IdentityBuiltin("hostname"));
+        Register(new IdentityBuiltin("uname"));
+        Register(new SleepBuiltin());
+        Register(new DirectoryStackBuiltin("pushd"));
+        Register(new DirectoryStackBuiltin("popd"));
+        Register(new DirectoryStackBuiltin("dirs"));
+
+        Register(new SourceBuiltin());
+        Register(new SourceBuiltin("."));
+        Register(new CommandBuiltin());
+        Register(new WhichBuiltin());
+        Register(new HashBuiltin());
+        Register(new GetoptsBuiltin());
+        Register(new LetBuiltin());
+        Register(new TrapBuiltin());
     }
 }

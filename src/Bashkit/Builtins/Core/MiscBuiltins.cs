@@ -309,11 +309,6 @@ public sealed class ReadBuiltin : IBuiltin
 /// <summary><c>eval</c> — runs its arguments as a script in the current shell.</summary>
 public sealed class EvalBuiltin : IBuiltin
 {
-    private readonly Func<string, StreamData?, CancellationToken, ValueTask<ExecResult>> _run;
-
-    /// <summary>Creates the builtin bound to the interpreter that will run the fragment.</summary>
-    public EvalBuiltin(Func<string, StreamData?, CancellationToken, ValueTask<ExecResult>> run) => _run = run;
-
     /// <inheritdoc />
     public string Name => "eval";
 
@@ -325,7 +320,10 @@ public sealed class EvalBuiltin : IBuiltin
             return ValueTask.FromResult(ExecResult.Success);
         }
 
-        return _run(string.Join(' ', context.Arguments), context.Stdin, cancellationToken);
+        // The arguments are joined with spaces and re-parsed. They have already been
+        // expanded once, so `eval` performs a deliberate second round — which is the whole
+        // point of it, and the reason it is dangerous outside a sandbox.
+        return context.Hooks.RunFragment(string.Join(' ', context.Arguments), context.Stdin, cancellationToken);
     }
 }
 
@@ -414,11 +412,6 @@ public sealed class UnaliasBuiltin : IBuiltin
 /// <summary><c>type</c> — reports how a name would be interpreted.</summary>
 public sealed class TypeBuiltin : IBuiltin
 {
-    private readonly Func<string, bool> _isBuiltin;
-
-    /// <summary>Creates the builtin bound to the registry it should consult.</summary>
-    public TypeBuiltin(Func<string, bool> isBuiltin) => _isBuiltin = isBuiltin;
-
     /// <inheritdoc />
     public string Name => "type";
 
@@ -463,7 +456,7 @@ public sealed class TypeBuiltin : IBuiltin
         });
     }
 
-    private string? Classify(BuiltinContext context, string name)
+    private static string? Classify(BuiltinContext context, string name)
     {
         if (context.State.Aliases.ContainsKey(name))
         {
@@ -475,7 +468,7 @@ public sealed class TypeBuiltin : IBuiltin
             return "function";
         }
 
-        if (_isBuiltin(name))
+        if (context.Hooks.IsBuiltin(name))
         {
             return "builtin";
         }
