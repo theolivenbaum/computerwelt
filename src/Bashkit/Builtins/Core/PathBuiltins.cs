@@ -13,7 +13,10 @@ public sealed class RealpathBuiltin : IBuiltin
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
         var cursor = new ArgCursor(context.Arguments);
-        var mustExist = true;
+
+        // Canonicalising a path is a question about the name, not about the filesystem, so
+        // a missing target is not an error unless `-e` asks for one.
+        var mustExist = false;
         var quiet = false;
 
         while (cursor.NextOption() is { } option)
@@ -32,7 +35,7 @@ public sealed class RealpathBuiltin : IBuiltin
 
         if (cursor.Operands.Count == 0)
         {
-            return ExecResult.Usage("realpath", "missing operand", ExitCodes.Failure);
+            return ExecResult.Usage("realpath", "missing operand", ExitCodes.Usage);
         }
 
         var builder = new StringBuilder();

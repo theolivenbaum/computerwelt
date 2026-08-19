@@ -55,7 +55,11 @@ public sealed class Expander
     public async ValueTask<string> ExpandToStringAsync(Word word, CancellationToken cancellationToken = default)
     {
         var fields = await ExpandToFieldsAsync(word, splitting: false, cancellationToken);
-        return fields.Count == 0 ? string.Empty : Unescape(string.Concat(fields));
+        // A list expansion in a single-field context joins with the first IFS character:
+        // `x=${arr[@]}` is `1 2 3`, not `123`.
+        return fields.Count == 0
+            ? string.Empty
+            : Unescape(string.Join(_state.FirstIfsCharacter(), fields));
     }
 
     /// <summary>
@@ -483,7 +487,19 @@ public sealed class Expander
                 return [string.Empty];
             }
 
-            return [_state.Get(target) ?? string.Empty];
+            // The dereferenced name is then subject to the operator, so `${!name:-x}` tests
+            // the variable `name` points at rather than `name` itself.
+            var referenced = _state.Lookup(target);
+            var referencedValue = referenced?.Value ?? string.Empty;
+            var referencedIsSet = referenced is { IsUnset: false };
+
+            if (parameter.Operation is ParameterOp.AssignDefault or ParameterOp.AssignDefaultUnsetOnly)
+            {
+                var assignTo = parameter with { Name = target, IndirectRef = false };
+                return [await ApplyOperatorAsync(assignTo, referencedValue, referencedIsSet, cancellationToken)];
+            }
+
+            return [await ApplyOperatorAsync(parameter, referencedValue, referencedIsSet, cancellationToken)];
         }
 
         // Array splats are handled by the caller, but `${arr[@]}` reaching here means it

@@ -236,20 +236,20 @@ public sealed class Interpreter
     /// </summary>
     private async ValueTask<ExecResult> ApplyErrTrapAsync(ExecResult result, CancellationToken cancellationToken)
     {
-        if (result.ExitCode == 0 || result.ErrExitSuppressed || State.Traps.Count == 0)
+        if (result.ExitCode == 0 || result.ErrExitSuppressed || result.ErrTrapHandled
+            || !State.Traps.ContainsKey("ERR"))
         {
             return result;
         }
 
         var trap = await RunTrapAsync("ERR", cancellationToken);
 
-        return trap.Stdout.IsEmpty && trap.Stderr.IsEmpty
-            ? result
-            : result with
-            {
-                Stdout = StreamData.Concat(result.Stdout, trap.Stdout),
-                Stderr = StreamData.Concat(result.Stderr, trap.Stderr),
-            };
+        return result with
+        {
+            Stdout = StreamData.Concat(result.Stdout, trap.Stdout),
+            Stderr = StreamData.Concat(result.Stderr, trap.Stderr),
+            ErrTrapHandled = true,
+        };
     }
 
     private ExecResult DefineFunction(FunctionDef definition)
@@ -928,6 +928,10 @@ public sealed class Interpreter
         var name = words[0];
         var arguments = words[1..];
 
+        // The DEBUG trap runs before each command, and is itself a command, so it must not
+        // re-enter — `RunTrapAsync` guards that on the shared state.
+        var debug = await RunTrapAsync("DEBUG", cancellationToken);
+
         // An alias substitutes textually for the command word before dispatch. It is
         // resolved here rather than in the parser because aliases can be defined by the
         // very script being run, so the parser has not seen them yet.
@@ -974,6 +978,18 @@ public sealed class Interpreter
         catch (BashkitException e) when (e.Kind is BashkitErrorKind.Internal or BashkitErrorKind.PermissionDenied)
         {
             result = ExecResult.Error($"bash: {e.Message}\n", ExitCodes.Failure);
+        }
+
+        // `$_` is the last argument of the command that just ran.
+        State.Set("_", words[^1]);
+
+        if (!debug.Stdout.IsEmpty || !debug.Stderr.IsEmpty)
+        {
+            result = result with
+            {
+                Stdout = StreamData.Concat(debug.Stdout, result.Stdout),
+                Stderr = StreamData.Concat(debug.Stderr, result.Stderr),
+            };
         }
 
         return await redirection.ApplyAsync(result, cancellationToken);

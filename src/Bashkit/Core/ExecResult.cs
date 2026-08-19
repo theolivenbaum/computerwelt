@@ -34,6 +34,15 @@ public sealed record ExecResult
     /// </summary>
     public bool ErrExitSuppressed { get; init; }
 
+    /// <summary>
+    /// True once the <c>ERR</c> trap has fired for this failure.
+    /// </summary>
+    /// <remarks>
+    /// A failing result travels up through the list, the loop and the script, each of which
+    /// would otherwise fire the trap again for the same command.
+    /// </remarks>
+    public bool ErrTrapHandled { get; init; }
+
     /// <summary>A successful, silent result.</summary>
     public static ExecResult Success { get; } = new();
 
