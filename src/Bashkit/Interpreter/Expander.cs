@@ -55,11 +55,9 @@ public sealed class Expander
     public async ValueTask<string> ExpandToStringAsync(Word word, CancellationToken cancellationToken = default)
     {
         var fields = await ExpandToFieldsAsync(word, splitting: false, cancellationToken);
-        // A list expansion in a single-field context joins with the first IFS character:
-        // `x=${arr[@]}` is `1 2 3`, not `123`.
-        return fields.Count == 0
-            ? string.Empty
-            : Unescape(string.Join(_state.FirstIfsCharacter(), fields));
+        // A list expansion in a single-field context joins with a space: `x=${arr[@]}` is
+        // `1 2 3`, not `123`. Only `"$*"` uses IFS, and it has already joined itself.
+        return fields.Count == 0 ? string.Empty : Unescape(string.Join(' ', fields));
     }
 
     /// <summary>
@@ -356,8 +354,11 @@ public sealed class Expander
             };
         }
 
-        // `${arr[*]}` joins like `$*`; only the `@` form is one field per element.
-        if (parameter.Name == "*" || parameter.Index == "*")
+        // `${arr[*]}` joins like `$*`; only the `@` form is one field per element. With an
+        // empty IFS there is no separator to join on and no splitting to undo it, so the
+        // unquoted form keeps the elements apart, as bash does.
+        if ((parameter.Name == "*" || parameter.Index == "*")
+            && !(splitting && !parameter.Quoted && _state.Ifs.Length == 0))
         {
             var joined = string.Join(_state.FirstIfsCharacter(), values);
 
@@ -707,7 +708,27 @@ public sealed class Expander
                 }
 
                 var replacement = argument is null ? string.Empty : await ExpandToStringAsync(argument, cancellationToken);
-                _state.Set(parameter.Name, replacement);
+
+                // `${m[k]:=v}` assigns the element, not the array.
+                if (parameter.Index is { } subscript)
+                {
+                    var array = _state.GetOrCreate(parameter.Name);
+                    var key = ResolveSubscript(array, subscript);
+
+                    if (array.IsAssociative)
+                    {
+                        array.SetAssociative(key, replacement);
+                    }
+                    else
+                    {
+                        array.SetIndexed(long.Parse(key, CultureInfo.InvariantCulture), replacement);
+                    }
+                }
+                else
+                {
+                    _state.Set(parameter.Name, replacement);
+                }
+
                 return replacement;
             }
 

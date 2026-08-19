@@ -205,7 +205,12 @@ public sealed class DirectoryStackBuiltin : IBuiltin
                     return ExecResult.Success;
                 }
 
-                return ExecResult.Ok(Render(context, stack, context.Arguments.Contains("-p") || context.Arguments.Contains("-v")));
+                // `-p` is one entry per line; `-v` is the same with the index in front.
+                var layout = context.Arguments.Contains("-v")
+                    ? DirsLayout.Numbered
+                    : context.Arguments.Contains("-p") ? DirsLayout.PerLine : DirsLayout.OneLine;
+
+                return ExecResult.Ok(Render(context, stack, layout));
             }
 
             case "pushd":
@@ -229,7 +234,7 @@ public sealed class DirectoryStackBuiltin : IBuiltin
                     }
 
                     context.State.GetOrCreate(StackVariable).SetArray(stack);
-                    return ExecResult.Ok(Render(context, stack, verbose: false));
+                    return ExecResult.Ok(Render(context, stack, DirsLayout.OneLine));
                 }
 
                 var previous = context.State.WorkingDirectory.Value;
@@ -241,7 +246,7 @@ public sealed class DirectoryStackBuiltin : IBuiltin
 
                 stack.Insert(0, previous);
                 context.State.GetOrCreate(StackVariable).SetArray(stack);
-                return ExecResult.Ok(Render(context, stack, verbose: false));
+                return ExecResult.Ok(Render(context, stack, DirsLayout.OneLine));
             }
 
             case "popd":
@@ -261,7 +266,7 @@ public sealed class DirectoryStackBuiltin : IBuiltin
                 }
 
                 context.State.GetOrCreate(StackVariable).SetArray(stack);
-                return ExecResult.Ok(Render(context, stack, verbose: false));
+                return ExecResult.Ok(Render(context, stack, DirsLayout.OneLine));
             }
 
             default:
@@ -291,12 +296,25 @@ public sealed class DirectoryStackBuiltin : IBuiltin
         return null;
     }
 
-    private static string Render(BuiltinContext context, List<string> stack, bool verbose)
+    /// <summary>How <c>dirs</c> was asked to print the stack.</summary>
+    private enum DirsLayout
+    {
+        /// <summary>Every entry on one line, separated by spaces.</summary>
+        OneLine,
+
+        /// <summary>One entry per line (<c>-p</c>).</summary>
+        PerLine,
+
+        /// <summary>One entry per line with its index (<c>-v</c>).</summary>
+        Numbered,
+    }
+
+    private static string Render(BuiltinContext context, List<string> stack, DirsLayout layout)
     {
         var entries = new List<string> { Abbreviate(context, context.State.WorkingDirectory.Value) };
         entries.AddRange(stack.Select(entry => Abbreviate(context, entry)));
 
-        if (!verbose)
+        if (layout == DirsLayout.OneLine)
         {
             return string.Join(' ', entries) + "\n";
         }
@@ -304,7 +322,12 @@ public sealed class DirectoryStackBuiltin : IBuiltin
         var builder = new StringBuilder();
         for (var i = 0; i < entries.Count; i++)
         {
-            builder.Append(i.ToString(CultureInfo.InvariantCulture)).Append("  ").Append(entries[i]).Append('\n');
+            if (layout == DirsLayout.Numbered)
+            {
+                builder.Append(i.ToString(CultureInfo.InvariantCulture).PadLeft(2)).Append("  ");
+            }
+
+            builder.Append(entries[i]).Append('\n');
         }
 
         return builder.ToString();

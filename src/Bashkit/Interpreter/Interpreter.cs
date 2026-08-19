@@ -1189,7 +1189,10 @@ public sealed class Interpreter
 
                 if (assignment.Index is { } rawIndex)
                 {
-                    var index = Expander.ExpandSubscriptText(rawIndex);
+                    // An assignment's subscript gets the full expansion, including command
+                    // substitution: `m["$(f)"]=v` keys on what `f` printed.
+                    var index = await Expander.ExpandToStringAsync(
+                        Parsing.WordParser.Parse(rawIndex), cancellationToken);
 
                     if (variable.IsAssociative)
                     {

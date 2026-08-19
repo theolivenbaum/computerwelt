@@ -155,6 +155,34 @@ public sealed class ShellState
     public bool IsSet(string name) => Lookup(name) is { IsUnset: false };
 
     /// <summary>
+    /// True when a variable reference is set, where the reference may name one element:
+    /// <c>-v m[foo]</c> asks about the element, not the array.
+    /// </summary>
+    public bool IsSetReference(string reference)
+    {
+        var bracket = reference.IndexOf('[', StringComparison.Ordinal);
+
+        if (bracket <= 0 || !reference.EndsWith(']'))
+        {
+            return IsSet(reference);
+        }
+
+        if (Lookup(reference[..bracket]) is not { } variable)
+        {
+            return false;
+        }
+
+        var key = reference[(bracket + 1)..^1].Trim('\'', '"');
+
+        if (key is "@" or "*")
+        {
+            return variable.Elements.Count > 0;
+        }
+
+        return variable.GetElement(key) is not null;
+    }
+
+    /// <summary>
     /// Assigns a variable in the scope where it is already defined, or in the global scope
     /// when it is new. This is what makes assignment inside a function visible to the
     /// caller unless <c>local</c> was used.

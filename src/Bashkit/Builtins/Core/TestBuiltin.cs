@@ -135,7 +135,12 @@ public sealed class TestBuiltin : IBuiltin
             case "-n":
                 return operand.Length > 0;
             case "-v":
-                return context.State.IsSet(operand);
+                return context.State.IsSetReference(operand);
+
+            // There are no real descriptors, so a host decides which are terminals by
+            // setting `_TTY_<fd>`; unset means not a terminal, which is the safe default.
+            case "-t":
+                return context.State.Get("_TTY_" + operand) == "1";
             case "-o":
                 return context.State.Options.GetByName(operand) ?? false;
         }

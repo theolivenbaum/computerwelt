@@ -66,7 +66,12 @@ public static class ConditionalEvaluator
             case "-n":
                 return operand.Length > 0;
             case "-v":
-                return interpreter.State.IsSet(operand);
+                return interpreter.State.IsSetReference(operand);
+
+            // There are no real descriptors, so a host decides which are terminals by
+            // setting `_TTY_<fd>`; unset means not a terminal, which is the safe default.
+            case "-t":
+                return interpreter.State.Get("_TTY_" + operand) == "1";
             case "-o":
                 return interpreter.State.Options.GetByName(operand) ?? false;
         }
@@ -85,7 +90,7 @@ public static class ConditionalEvaluator
             "-r" => metadata is not null && (metadata.Mode & 0b100_000_000) != 0,
             "-w" => metadata is not null && (metadata.Mode & 0b010_000_000) != 0,
             "-x" => metadata is not null && (metadata.Mode & 0b001_000_000) != 0,
-            "-b" or "-c" or "-S" or "-t" => false,
+            "-b" or "-c" or "-S" => false,
             "-g" or "-u" or "-k" => false,
             "-G" or "-O" => metadata is not null,
             "-N" => metadata is not null,
