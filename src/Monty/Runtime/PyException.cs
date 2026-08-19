@@ -239,8 +239,14 @@ public sealed class PyExceptionType : PyObject
     /// <summary><c>PermissionError</c>.</summary>
     public static PyExceptionType PermissionError { get; } = Define("PermissionError", OSError);
 
+    /// <summary><c>UnicodeError</c>.</summary>
+    public static PyExceptionType UnicodeError { get; } = Define("UnicodeError", ValueError);
+
     /// <summary><c>UnicodeDecodeError</c>.</summary>
-    public static PyExceptionType UnicodeDecodeError { get; } = Define("UnicodeDecodeError", ValueError);
+    public static PyExceptionType UnicodeDecodeError { get; } = Define("UnicodeDecodeError", UnicodeError);
+
+    /// <summary><c>UnicodeEncodeError</c>.</summary>
+    public static PyExceptionType UnicodeEncodeError { get; } = Define("UnicodeEncodeError", UnicodeError);
 
     /// <summary><c>KeyboardInterrupt</c>.</summary>
     public static PyExceptionType KeyboardInterrupt { get; } = Define("KeyboardInterrupt", BaseException);

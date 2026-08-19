@@ -238,9 +238,9 @@ public static class Operators
             return useFloat ? new PyFloat(a - b) : new PyInt(AsInt(left) - AsInt(right));
         }
 
-        if (left is PySet x && right is PySet y)
+        if (AsSet(left) is { } x && AsSet(right) is { } y)
         {
-            return new PySet(x.Items.Where(item => !y.Contains(item)));
+            return MakeSet(left, right, x.Items.Where(item => !y.Contains(item)));
         }
 
         throw new PyRaise(PyErrors.TypeError(
@@ -468,6 +468,14 @@ public static class Operators
             return MakeSet(left, right, x.Items.Where(y.Contains));
         }
 
+        // A set on one side and a non-set on the other is a set operation with a bad
+        // operand, not a bitwise one.
+        if (AsSet(left) is not null || AsSet(right) is not null)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"unsupported operand type(s) for &: '{left.TypeName}' and '{right.TypeName}'"));
+        }
+
         // Two bools give a bool: `True & True` is `True`, not `1`.
         if (left is PyBool && right is PyBool)
         {
@@ -504,9 +512,17 @@ public static class Operators
 
     private static PyObject BitwiseOr(PyObject left, PyObject right)
     {
-        if (left is PySet x && right is PySet y)
+        if (AsSet(left) is { } x && AsSet(right) is { } y)
         {
-            return new PySet(x.Items.Concat(y.Items));
+            return MakeSet(left, right, x.Items.Concat(y.Items));
+        }
+
+        // A set on one side and a non-set on the other is a set operation with a bad
+        // operand, not a bitwise one.
+        if (AsSet(left) is not null || AsSet(right) is not null)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"unsupported operand type(s) for |: '{left.TypeName}' and '{right.TypeName}'"));
         }
 
         if (left is PyDict a && right is PyDict b)
@@ -525,10 +541,18 @@ public static class Operators
 
     private static PyObject BitwiseXor(PyObject left, PyObject right)
     {
-        if (left is PySet x && right is PySet y)
+        if (AsSet(left) is { } x && AsSet(right) is { } y)
         {
-            return new PySet(x.Items.Where(item => !y.Contains(item))
+            return MakeSet(left, right, x.Items.Where(item => !y.Contains(item))
                 .Concat(y.Items.Where(item => !x.Contains(item))));
+        }
+
+        // A set on one side and a non-set on the other is a set operation with a bad
+        // operand, not a bitwise one.
+        if (AsSet(left) is not null || AsSet(right) is not null)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"unsupported operand type(s) for ^: '{left.TypeName}' and '{right.TypeName}'"));
         }
 
         return new PyInt(RequireInt(left, "^") ^ RequireInt(right, "^"));

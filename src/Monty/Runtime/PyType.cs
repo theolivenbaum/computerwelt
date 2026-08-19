@@ -56,6 +56,13 @@ public sealed class PyType : PyCallable
             return new PyStr(Name);
         }
 
+        // `bytes.fromhex(...)` and `dict.fromkeys(...)` are reached through the type, not
+        // an instance.
+        if (Name == "bytes" && name == "fromhex")
+        {
+            return new PyBuiltinFunction("fromhex", static arguments => TypeRegistry.FromHex(arguments[0].Display()));
+        }
+
         // `dict.fromkeys(...)` is reached through the type, not an instance.
         if (Name == "dict" && name == "fromkeys")
         {
@@ -274,6 +281,46 @@ public static class TypeRegistry
             All[name] = type;
             return type;
         }
+    }
+
+    /// <summary>
+    /// Parses <c>bytes.fromhex</c>'s argument: hex digit pairs, optionally separated by
+    /// spaces, but never split across one.
+    /// </summary>
+    internal static PyBytes FromHex(string text)
+    {
+        var bytes = new List<byte>();
+
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (char.IsWhiteSpace(text[i]))
+            {
+                continue;
+            }
+
+            if (!Uri.IsHexDigit(text[i]))
+            {
+                throw new PyRaise(PyErrors.ValueError(
+                    $"non-hexadecimal number found in fromhex() arg at position {i}"));
+            }
+
+            if (i + 1 == text.Length)
+            {
+                throw new PyRaise(PyErrors.ValueError(
+                    "fromhex() arg must contain an even number of hexadecimal digits"));
+            }
+
+            if (!Uri.IsHexDigit(text[i + 1]))
+            {
+                throw new PyRaise(PyErrors.ValueError(
+                    $"non-hexadecimal number found in fromhex() arg at position {i + 1}"));
+            }
+
+            bytes.Add(Convert.ToByte(text.Substring(i, 2), 16));
+            i++;
+        }
+
+        return new PyBytes([.. bytes]);
     }
 
     /// <summary>True when <paramref name="value"/> is an instance of <paramref name="type"/>.</summary>

@@ -62,6 +62,29 @@ public static class BuiltinMethods
             return implementation(self, arguments, keywords);
         });
 
+    /// <summary>
+    /// Reads one named keyword, rejecting any other. A method that takes keywords must
+    /// still refuse the ones it does not know.
+    /// </summary>
+    private static PyObject? Keyword(PyDict? keywords, string method, string name)
+    {
+        PyObject? found = null;
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            if (key is PyStr text && string.Equals(text.Value, name, StringComparison.Ordinal))
+            {
+                found = value;
+                continue;
+            }
+
+            throw new PyRaise(PyErrors.TypeError(
+                $"{method}() got an unexpected keyword argument '{key.Display()}'"));
+        }
+
+        return found;
+    }
+
     private static string Text(PyObject value, string method, int position) =>
         value is PyStr text
             ? text.Value
@@ -123,28 +146,28 @@ public static class BuiltinMethods
                     Split(((PyStr)self).Value, arguments, keywords, fromRight: name == "rsplit"));
 
             case "splitlines":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 0, 1, (self, arguments, keywords) =>
                 {
-                    var keepEnds = arguments.Length > 0 && arguments[0].IsTruthy();
+                    var keepEnds = arguments.Length > 0
+                        ? arguments[0].IsTruthy()
+                        : Keyword(keywords, name, "keepends")?.IsTruthy() ?? false;
+
                     var text = ((PyStr)self).Value;
-
-                    if (text.Length == 0)
-                    {
-                        return new PyList();
-                    }
-
                     var lines = new List<PyObject>();
                     var start = 0;
 
                     for (var i = 0; i < text.Length; i++)
                     {
-                        if (text[i] != '\n')
+                        if (text[i] is not ('\n' or '\r' or '\v' or '\f' or '\x1c' or '\x1d' or '\x1e'))
                         {
                             continue;
                         }
 
-                        lines.Add(new PyStr(keepEnds ? text[start..(i + 1)] : text[start..i].TrimEnd('\r')));
-                        start = i + 1;
+                        // A CR immediately followed by an LF is one line ending, not two.
+                        var end = text[i] == '\r' && i + 1 < text.Length && text[i + 1] == '\n' ? i + 2 : i + 1;
+                        lines.Add(new PyStr(keepEnds ? text[start..end] : text[start..i]));
+                        start = end;
+                        i = end - 1;
                     }
 
                     if (start < text.Length)
@@ -183,12 +206,14 @@ public static class BuiltinMethods
                 });
 
             case "replace":
-                return Method(name, receiver, 2, (self, arguments, _) =>
+                return Method(name, receiver, 2, (self, arguments, keywords) =>
                 {
                     var text = ((PyStr)self).Value;
                     var from = Text(arguments[0], name, 1);
                     var to = Text(arguments[1], name, 2);
-                    var count = arguments.Length > 2 ? Int(arguments[2], "count") : -1;
+                    var count = arguments.Length > 2 ? Int(arguments[2], "count")
+                        : keywords?.TryGetValue(new PyStr("count"), out var limit) == true ? Int(limit, "count")
+                        : -1;
 
                     if (count < 0)
                     {
@@ -219,17 +244,23 @@ public static class BuiltinMethods
                 return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
-                    var prefixes = arguments[0] is PyTuple tuple
-                        ? tuple.Items.Select(item => Text(item, name, 1))
-                        : [Text(arguments[0], name, 1)];
 
-                    // The optional start and end bounds narrow the region tested.
-                    var start = arguments.Length > 1 && arguments[1] is not PyNone ? Int(arguments[1], "start") : 0;
-                    var end = arguments.Length > 2 && arguments[2] is not PyNone ? Int(arguments[2], "end") : text.Length;
-
-                    start = Math.Clamp(start < 0 ? text.Length + start : start, 0, text.Length);
-                    end = Math.Clamp(end < 0 ? text.Length + end : end, start, text.Length);
+                    // The optional start and end bounds are validated before the affix is
+                    // inspected, which is the order CPython reports errors in.
+                    var (start, end) = Bounds(arguments, text.Length);
                     var region = text[start..end];
+
+                    // A tuple of candidates is allowed, but every element must be a string;
+                    // the error names the method rather than the argument position.
+                    var prefixes = arguments[0] is PyTuple tuple
+                        ? tuple.Items.Select(item => item is PyStr candidate
+                            ? candidate.Value
+                            : throw new PyRaise(PyErrors.TypeError(
+                                $"tuple for {name} must only contain str, not {item.TypeName}")))
+                        : [arguments[0] is PyStr only
+                            ? only.Value
+                            : throw new PyRaise(PyErrors.TypeError(
+                                $"{name} first arg must be str or a tuple of str, not {arguments[0].TypeName}"))];
 
                     return PyBool.Of(prefixes.Any(prefix => name == "startswith"
                         ? region.StartsWith(prefix, StringComparison.Ordinal)
@@ -241,12 +272,7 @@ public static class BuiltinMethods
                 {
                     var text = ((PyStr)self).Value;
                     var needle = Text(arguments[0], name, 1);
-                    var start = arguments.Length > 1 && arguments[1] is not PyNone ? Int(arguments[1], "start") : 0;
-                    var end = arguments.Length > 2 && arguments[2] is not PyNone ? Int(arguments[2], "end") : text.Length;
-
-                    start = Math.Clamp(start < 0 ? text.Length + start : start, 0, text.Length);
-                    end = Math.Clamp(end < 0 ? text.Length + end : end, start, text.Length);
-
+                    var (start, end) = Bounds(arguments, text.Length);
                     var region = text[start..end];
                     var found = name is "rfind" or "rindex"
                         ? region.LastIndexOf(needle, StringComparison.Ordinal)
@@ -263,10 +289,12 @@ public static class BuiltinMethods
                 });
 
             case "count":
-                return Method(name, receiver, 1, (self, arguments, _) =>
+                return Method(name, receiver, 1, 3, (self, arguments, _) =>
                 {
-                    var text = ((PyStr)self).Value;
+                    var whole = ((PyStr)self).Value;
                     var needle = Text(arguments[0], name, 1);
+                    var (from, to) = Bounds(arguments, whole.Length);
+                    var text = whole[from..to];
 
                     if (needle.Length == 0)
                     {
@@ -309,6 +337,9 @@ public static class BuiltinMethods
 
             case "isnumeric" or "isdecimal":
                 return Predicate(receiver, name, static text => text.Length > 0 && text.All(char.IsDigit));
+
+            case "isascii":
+                return Predicate(receiver, name, static text => text.All(char.IsAscii));
 
             case "isidentifier":
                 return Predicate(receiver, name, Identifiers.IsIdentifier);
@@ -407,8 +438,11 @@ public static class BuiltinMethods
                 });
 
             case "encode":
-                return Method(name, receiver, static (self, _, _) =>
-                    new PyBytes(Encoding.UTF8.GetBytes(((PyStr)self).Value)));
+                return Method(name, receiver, 0, 2, static (self, arguments, keywords) =>
+                    new PyBytes(Codecs.Encode(
+                        ((PyStr)self).Value,
+                        CodecArgument("encode", arguments, keywords, 0, "encoding", "utf-8"),
+                        CodecArgument("encode", arguments, keywords, 1, "errors", "strict"))));
 
             case "casefold":
                 return Method(name, receiver, static (self, _, _) =>
@@ -465,7 +499,11 @@ public static class BuiltinMethods
 
     private static PyObject Split(string text, PyObject[] arguments, PyDict? keywords, bool fromRight)
     {
-        var separator = arguments.Length > 0 && arguments[0] is not PyNone ? arguments[0].Display() : null;
+        var given = arguments.Length > 0 ? arguments[0]
+            : keywords?.TryGetValue(new PyStr("sep"), out var named) == true ? named
+            : null;
+
+        var separator = given is not (null or PyNone) ? given.Display() : null;
         var limit = arguments.Length > 1 ? Int(arguments[1], "maxsplit") : -1;
 
         if (keywords?.TryGetValue(new PyStr("maxsplit"), out var maxSplit) == true)
@@ -476,11 +514,7 @@ public static class BuiltinMethods
         if (separator is null)
         {
             // Splitting on whitespace collapses runs and ignores leading and trailing ones.
-            var pieces = limit < 0
-                ? text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).ToList()
-                : SplitWhitespaceLimited(text, limit, fromRight);
-
-            return new PyList([.. pieces.Select(static p => (PyObject)new PyStr(p))]);
+            return new PyList([.. SplitWhitespace(text, limit, fromRight).Select(static p => (PyObject)new PyStr(p))]);
         }
 
         if (separator.Length == 0)
@@ -500,18 +534,84 @@ public static class BuiltinMethods
         return new PyList([.. parts.Select(static p => (PyObject)new PyStr(p))]);
     }
 
-    private static List<string> SplitWhitespaceLimited(string text, int limit, bool fromRight)
+    /// <summary>
+    /// Splits on runs of whitespace, honouring <c>maxsplit</c>.
+    /// </summary>
+    /// <remarks>
+    /// The remainder past the split limit keeps its original whitespace — <c>rsplit</c> of
+    /// <c>'  a  b  '</c> at one split is <c>['  a', 'b']</c> — so this scans positions
+    /// rather than splitting and rejoining.
+    /// </remarks>
+    private static List<string> SplitWhitespace(string text, int limit, bool fromRight)
     {
-        var all = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).ToList();
+        var pieces = new List<string>();
 
-        if (all.Count <= limit + 1)
+        if (fromRight)
         {
-            return all;
+            var end = text.Length;
+
+            while (true)
+            {
+                while (end > 0 && char.IsWhiteSpace(text[end - 1]))
+                {
+                    end--;
+                }
+
+                if (end == 0)
+                {
+                    break;
+                }
+
+                if (limit >= 0 && pieces.Count == limit)
+                {
+                    pieces.Insert(0, text[..end]);
+                    break;
+                }
+
+                var last = end;
+
+                while (end > 0 && !char.IsWhiteSpace(text[end - 1]))
+                {
+                    end--;
+                }
+
+                pieces.Insert(0, text[end..last]);
+            }
+
+            return pieces;
         }
 
-        return fromRight
-            ? [string.Join(' ', all[..^limit]), .. all[^limit..]]
-            : [.. all[..limit], string.Join(' ', all[limit..])];
+        var start = 0;
+
+        while (true)
+        {
+            while (start < text.Length && char.IsWhiteSpace(text[start]))
+            {
+                start++;
+            }
+
+            if (start == text.Length)
+            {
+                break;
+            }
+
+            if (limit >= 0 && pieces.Count == limit)
+            {
+                pieces.Add(text[start..]);
+                break;
+            }
+
+            var first = start;
+
+            while (start < text.Length && !char.IsWhiteSpace(text[start]))
+            {
+                start++;
+            }
+
+            pieces.Add(text[first..start]);
+        }
+
+        return pieces;
     }
 
     // ---- list ----
@@ -973,15 +1073,187 @@ public static class BuiltinMethods
         _ => null,
     };
 
-    private static PyObject? BindBytes(PyObject receiver, string name) => name switch
+    private static PyObject? BindBytes(PyObject receiver, string name)
     {
-        "decode" => Method(name, receiver, static (self, _, _) =>
-            new PyStr(Encoding.UTF8.GetString(((PyBytes)self).Value))),
+        switch (name)
+        {
+            case "decode":
+                return Method(name, receiver, 0, 2, static (self, arguments, keywords) =>
+                    new PyStr(Codecs.Decode(
+                        ((PyBytes)self).Value,
+                        CodecArgument("decode", arguments, keywords, 0, "encoding", "utf-8"),
+                        CodecArgument("decode", arguments, keywords, 1, "errors", "strict"))));
 
-        "hex" => Method(name, receiver, static (self, _, _) =>
-            new PyStr(Convert.ToHexStringLower(((PyBytes)self).Value))),
+            case "fromhex":
+                // A classmethod, so it also answers on an instance and ignores its value.
+                return Method(name, receiver, 1, 1, static (_, arguments, _) =>
+                    TypeRegistry.FromHex(arguments[0].Display()));
 
-        _ => null,
+            case "hex":
+                return Method(name, receiver, 0, 2, static (self, arguments, _) =>
+                    new PyStr(Hex(((PyBytes)self).Value, arguments)));
+        }
+
+        // Every remaining bytes method is its str namesake applied to the bytes one at a
+        // time. Latin-1 maps 0-255 onto the first 256 code points and back without loss,
+        // so viewing the bytes as text lets one implementation serve both types.
+        if (BindString(Latin1(receiver), name) is null)
+        {
+            return null;
+        }
+
+        return Method(name, receiver, (self, arguments, keywords) =>
+            FromLatin1(((PyBoundMethod)BindString(Latin1(self), name)!).Invoke(
+                [.. arguments.Select(Latin1)], keywords)));
+    }
+
+    /// <summary>
+    /// Resolves the optional <c>start</c> and <c>end</c> arguments the search methods take,
+    /// clamping them to the string the way Python does rather than raising.
+    /// </summary>
+    private static (int Start, int End) Bounds(PyObject[] arguments, int length)
+    {
+        var start = arguments.Length > 1 && arguments[1] is not PyNone ? Bound(arguments[1], "start") : 0;
+        var end = arguments.Length > 2 && arguments[2] is not PyNone ? Bound(arguments[2], "end") : length;
+
+        return (start, Math.Max(start, end));
+
+        // A bound far outside the string clamps to its nearest end rather than raising, so
+        // a bound of -2**63 must not be narrowed to an int first.
+        int Bound(PyObject value, string what)
+        {
+            if (value is not PyInt integer)
+            {
+                _ = what;
+                throw new PyRaise(PyErrors.TypeError(
+                    "slice indices must be integers or None or have an __index__ method"));
+            }
+
+            var index = integer.Value;
+
+            return index >= length ? length
+                : index <= -length ? 0
+                : (int)(index < 0 ? length + index : index);
+        }
+    }
+
+    /// <summary>
+    /// Reads <c>encode</c>/<c>decode</c>'s encoding or errors argument, given positionally
+    /// or by name. A wrong type is reported the way CPython's argument clinic does, which
+    /// spells a lone <c>None</c> as "None" rather than "NoneType".
+    /// </summary>
+    private static string CodecArgument(
+        string method, PyObject[] arguments, PyDict? keywords, int position, string name, string fallback)
+    {
+        var given = arguments.Length > position ? arguments[position]
+            : keywords?.TryGetValue(new PyStr(name), out var named) == true ? named
+            : null;
+
+        return given switch
+        {
+            null => fallback,
+            PyStr text => text.Value,
+            PyNone => throw new PyRaise(PyErrors.TypeError(
+                $"{method}() argument '{name}' must be str, not None")),
+            _ => throw new PyRaise(PyErrors.TypeError(
+                $"{method}() argument '{name}' must be str, not {given.TypeName}")),
+        };
+    }
+
+    /// <summary>
+    /// Renders bytes as hex, optionally separated into groups.
+    /// </summary>
+    /// <remarks>
+    /// A positive group size counts from the right, so an odd tail lands at the front;
+    /// a negative one counts from the left. CPython parses the size as a C int, so a value
+    /// outside that range overflows rather than saturating.
+    /// </remarks>
+    private static string Hex(byte[] value, PyObject[] arguments)
+    {
+        var text = Convert.ToHexStringLower(value);
+
+        if (arguments.Length == 0)
+        {
+            return text;
+        }
+
+        var separator = Text(arguments[0], "hex", 1);
+
+        if (!separator.All(char.IsAscii))
+        {
+            throw new PyRaise(PyErrors.ValueError("sep must be ASCII."));
+        }
+
+        var group = 1;
+
+        if (arguments.Length > 1)
+        {
+            if (arguments[1] is not PyInt size)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"hex() argument 2 must be int, not {arguments[1].TypeName}"));
+            }
+
+            if (size.Value > int.MaxValue || size.Value < int.MinValue)
+            {
+                throw new PyRaise(new PyException(
+                    PyExceptionType.OverflowError, "Python int too large to convert to C int"));
+            }
+
+            group = (int)size.Value;
+        }
+
+        if (group == 0 || value.Length == 0)
+        {
+            return text;
+        }
+
+        var pieces = new List<string>();
+
+        // A group wider than the value is one group, so the width is capped before it can
+        // overflow an int.
+        var width = (int)Math.Min(Math.Abs((long)group) * 2, text.Length);
+
+        if (group > 0)
+        {
+            for (var end = text.Length; end > 0;)
+            {
+                var start = Math.Max(0, end - width);
+                pieces.Insert(0, text[start..end]);
+                end = start;
+            }
+        }
+        else
+        {
+            for (var start = 0; start < text.Length; start += width)
+            {
+                pieces.Add(text[start..Math.Min(start + width, text.Length)]);
+            }
+        }
+
+        return string.Join(separator, pieces);
+    }
+
+    /// <summary>
+    /// Views bytes as text, one code point per byte, recursing into a sequence argument so
+    /// that <c>b','.join([b'a'])</c> reaches the str implementation as strings. Anything
+    /// else passes through.
+    /// </summary>
+    private static PyObject Latin1(PyObject value) => value switch
+    {
+        PyBytes bytes => new PyStr(Encoding.Latin1.GetString(bytes.Value)),
+        PyList items => new PyList([.. items.Items.Select(Latin1)]),
+        PyTuple items => new PyTuple([.. items.Items.Select(Latin1)]),
+        _ => value,
+    };
+
+    /// <summary>Converts a str result — or a container of them — back to bytes.</summary>
+    private static PyObject FromLatin1(PyObject value) => value switch
+    {
+        PyStr text => new PyBytes(Encoding.Latin1.GetBytes(text.Value)),
+        PyList items => new PyList([.. items.Items.Select(FromLatin1)]),
+        PyTuple items => new PyTuple([.. items.Items.Select(FromLatin1)]),
+        _ => value,
     };
 
     private static PyObject? BindInt(PyObject receiver, string name) => name switch

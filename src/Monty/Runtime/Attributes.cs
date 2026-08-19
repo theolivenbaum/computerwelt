@@ -25,7 +25,13 @@ public static class Attributes
             return method;
         }
 
-        throw new PyRaise(PyErrors.AttributeError(target.TypeName, name));
+        // A class reports itself by name — `type object 'bytes'` — rather than as an
+        // instance of `type`, which would name every class the same way.
+        throw new PyRaise(target is PyCallable { TypeName: "type" } type
+            ? new PyException(
+                PyExceptionType.AttributeError,
+                $"type object '{type.Name}' has no attribute '{name}'")
+            : PyErrors.AttributeError(target.TypeName, name));
     }
 
     /// <summary>Reads an attribute, returning null instead of raising.</summary>

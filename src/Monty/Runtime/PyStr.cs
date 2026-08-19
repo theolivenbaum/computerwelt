@@ -258,6 +258,20 @@ public sealed class PyBytes : PyObject
     public override IEnumerable<PyObject>? Iterate() => Value.Select(static b => new PyInt(b));
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Iterating bytes yields ints, but <c>in</c> also accepts a bytes operand and looks
+    /// for it as a subsequence — the one place the two views meet.
+    /// </remarks>
+    public override bool Contains(PyObject item) => item switch
+    {
+        PyBytes needle => Value.AsSpan().IndexOf(needle.Value) >= 0,
+        PyInt b when b.Value >= 0 && b.Value <= 255 => Value.Contains((byte)b.Value),
+        PyInt => throw new PyRaise(PyErrors.ValueError("byte must be in range(0, 256)")),
+        _ => throw new PyRaise(PyErrors.TypeError(
+            $"a bytes-like object is required, not '{item.TypeName}'")),
+    };
+
+    /// <inheritdoc />
     public override PyObject GetItem(PyObject index)
     {
         if (index is PySlice slice)
