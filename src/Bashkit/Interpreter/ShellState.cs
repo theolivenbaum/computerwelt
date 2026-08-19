@@ -70,6 +70,17 @@ public sealed class ShellState
     public bool InTrap { get; set; }
 
     /// <summary>
+    /// Aliases currently being expanded.
+    /// </summary>
+    /// <remarks>
+    /// An alias may name the command it expands to — <c>alias echo='echo foo'</c> is the
+    /// usual way to add a default flag — so an alias is not re-expanded inside its own
+    /// expansion. The set lives on the state because the expansion runs in a fresh
+    /// interpreter over the same shell.
+    /// </remarks>
+    public HashSet<string> AliasesInProgress { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// Variables the shell seeded at start-up rather than the script exporting them.
     /// </summary>
     /// <remarks>

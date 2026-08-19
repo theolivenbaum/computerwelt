@@ -23,7 +23,6 @@ public sealed class Interpreter
 {
     private readonly IReadOnlyDictionary<string, IBuiltin> _builtins;
     private readonly StringBuilder _stderr = new();
-    private readonly HashSet<string> _aliasesInProgress = new(StringComparer.Ordinal);
     private int _loopDepth;
 
     /// <summary>Creates an interpreter over the given state, filesystem and builtin table.</summary>
@@ -896,6 +895,17 @@ public sealed class Interpreter
         return ExecResult.FromExitCode(matched ? 0 : 1);
     }
 
+    /// <summary>
+    /// True when a word is plain unquoted text in the script.
+    /// </summary>
+    /// <remarks>
+    /// Aliases are matched against the source word, never against the result of an
+    /// expansion: <c>cmd=ll; $cmd</c> runs a command called <c>ll</c>, it does not expand
+    /// the <c>ll</c> alias.
+    /// </remarks>
+    private static bool IsLiteralWord(Word word) =>
+        word.Parts.Count > 0 && word.Parts.All(static part => part is WordPart.Literal { Quoted: false });
+
     private async ValueTask<ExecResult> ExecuteSimpleAsync(SimpleCommand command, StreamData? stdin, CancellationToken cancellationToken)
     {
         try
@@ -977,7 +987,8 @@ public sealed class Interpreter
         // resolved here rather than in the parser because aliases can be defined by the
         // very script being run, so the parser has not seen them yet.
         if (State.Options.ExpandAliases
-            && !_aliasesInProgress.Contains(name)
+            && IsLiteralWord(command.Words[0])
+            && !State.AliasesInProgress.Contains(name)
             && State.Aliases.TryGetValue(name, out var alias))
         {
             var redirected = await Redirection.PrepareAsync(this, command.Redirects, stdin, cancellationToken);
@@ -986,16 +997,32 @@ public sealed class Interpreter
             {
                 return aliasFailure;
             }
-            _aliasesInProgress.Add(name);
+
+            State.AliasesInProgress.Add(name);
             try
             {
-                var expandedLine = alias + (arguments.Count > 0 ? " " + string.Join(' ', arguments.Select(Expander_Quote)) : string.Empty);
-                var aliasResult = await RunFragmentAsync(expandedLine, redirected.Stdin, cancellationToken);
+                var parts = new List<string> { alias.TrimEnd() };
+                var rest = (IReadOnlyList<string>)arguments;
+
+                // An alias whose value ends in a blank asks for the next word to be alias
+                // expanded too, which is how `alias sudo='sudo '` makes `sudo ll` work.
+                if (alias.Length > 0 && char.IsWhiteSpace(alias[^1])
+                    && rest.Count > 0
+                    && !State.AliasesInProgress.Contains(rest[0])
+                    && State.Aliases.TryGetValue(rest[0], out var chained))
+                {
+                    parts.Add(chained.TrimEnd());
+                    rest = [.. rest.Skip(1)];
+                }
+
+                parts.AddRange(rest.Select(Expander_Quote));
+
+                var aliasResult = await RunFragmentAsync(string.Join(' ', parts), redirected.Stdin, cancellationToken);
                 return await redirected.ApplyAsync(aliasResult, cancellationToken);
             }
             finally
             {
-                _aliasesInProgress.Remove(name);
+                State.AliasesInProgress.Remove(name);
             }
         }
 

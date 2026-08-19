@@ -134,6 +134,19 @@ public sealed class DateBuiltin : IBuiltin
             return true;
         }
 
+        // A compound spec is a base plus or minus an offset: `2024-01-15 + 30 days`.
+        var compound = FindCompoundOperator(text);
+
+        if (compound > 0)
+        {
+            var basis = text[..compound].Trim();
+            var negative = text[compound] == '-';
+            var offset = text[(compound + 1)..].Trim();
+
+            return TryResolveDateSpec(basis, now, out var start)
+                && TryResolveRelative(negative ? offset + " ago" : offset, start, out resolved);
+        }
+
         if (text.StartsWith('@'))
         {
             if (!long.TryParse(text[1..], CultureInfo.InvariantCulture, out var epoch))
@@ -174,6 +187,26 @@ public sealed class DateBuiltin : IBuiltin
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Finds the <c>+</c> or <c>-</c> joining a base date to a relative offset.
+    /// </summary>
+    /// <remarks>
+    /// Only a sign surrounded by blanks counts, so the hyphens inside <c>2024-01-15</c> are
+    /// not mistaken for one.
+    /// </remarks>
+    private static int FindCompoundOperator(string text)
+    {
+        for (var i = 1; i < text.Length - 1; i++)
+        {
+            if (text[i] is '+' or '-' && char.IsWhiteSpace(text[i - 1]) && char.IsWhiteSpace(text[i + 1]))
+            {
+                return i;
+            }
+        }
+
+        return -1;
     }
 
     private static bool TryResolveRelative(string text, DateTimeOffset now, out DateTimeOffset resolved)
@@ -269,6 +302,20 @@ public sealed class DateBuiltin : IBuiltin
         return builder.ToString();
     }
 
+    /// <summary>
+    /// The week number, counting from the first <paramref name="start"/> of the year.
+    /// </summary>
+    /// <remarks>
+    /// Days before that first week day are week 0, which is what makes <c>%U</c> and
+    /// <c>%W</c> differ from the ISO week number.
+    /// </remarks>
+    private static int WeekOfYear(DateTime time, DayOfWeek start)
+    {
+        var january1 = new DateTime(time.Year, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var offset = ((int)january1.DayOfWeek - (int)start + 7) % 7;
+        return (time.DayOfYear + offset - 1) / 7;
+    }
+
     private static string Expand(char specifier, DateTime time, DateTimeOffset moment) => specifier switch
     {
         'Y' => time.Year.ToString("D4", CultureInfo.InvariantCulture),
@@ -292,6 +339,8 @@ public sealed class DateBuiltin : IBuiltin
         'B' => MonthName(time.Month),
         'u' => ((int)time.DayOfWeek == 0 ? 7 : (int)time.DayOfWeek).ToString(CultureInfo.InvariantCulture),
         'w' => ((int)time.DayOfWeek).ToString(CultureInfo.InvariantCulture),
+        'U' => WeekOfYear(time, DayOfWeek.Sunday).ToString("D2", CultureInfo.InvariantCulture),
+        'W' => WeekOfYear(time, DayOfWeek.Monday).ToString("D2", CultureInfo.InvariantCulture),
         'Z' => "UTC",
         'z' => "+0000",
         'F' => time.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
