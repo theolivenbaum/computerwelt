@@ -260,16 +260,57 @@ public static class BuiltinNamespace
             };
         });
 
-        DefineArity("divmod", 2, 2, static arguments => new PyTuple([
-            Operators.Binary("//", arguments[0], arguments[1]),
-            Operators.Binary("%", arguments[0], arguments[1]),
-        ]));
+        DefineArity("divmod", 2, 2, static arguments =>
+        {
+            // The pair is `//` and `%`, but a bad operand names `divmod()` rather than the
+            // operator it happened to try first.
+            if (arguments[0] is not (PyInt or PyFloat) || arguments[1] is not (PyInt or PyFloat))
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    "unsupported operand type(s) for divmod(): "
+                    + $"'{arguments[0].TypeName}' and '{arguments[1].TypeName}'"));
+            }
+
+            return new PyTuple([
+                Operators.Binary("//", arguments[0], arguments[1]),
+                Operators.Binary("%", arguments[0], arguments[1]),
+            ]);
+        });
 
         DefineArity("pow", 2, 3, static arguments =>
         {
-            var result = Operators.Binary("**", arguments[0], arguments[1]);
+            if (arguments.Length <= 2)
+            {
+                return Operators.Binary("**", arguments[0], arguments[1]);
+            }
 
-            return arguments.Length > 2 ? Operators.Binary("%", result, arguments[2]) : result;
+            // The three-argument form is modular exponentiation, which is defined for
+            // integers only.
+            if (arguments.Any(static a => a is not PyInt))
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    "pow() 3rd argument not allowed unless all arguments are integers"));
+            }
+
+            var modulus = ((PyInt)arguments[2]).Value;
+
+            if (modulus.IsZero)
+            {
+                throw new PyRaise(PyErrors.ValueError("pow() 3rd argument cannot be 0"));
+            }
+
+            var exponent = ((PyInt)arguments[1]).Value;
+
+            if (exponent.Sign < 0)
+            {
+                throw new PyRaise(PyErrors.ValueError(
+                    "pow() 2nd argument cannot be negative when 3rd argument specified"));
+            }
+
+            var power = BigInteger.ModPow(((PyInt)arguments[0]).Value, exponent, modulus);
+
+            // The result takes the modulus's sign, as `%` does.
+            return new PyInt(power.Sign != 0 && power.Sign != modulus.Sign ? power + modulus : power);
         });
 
         DefineArity("hash", 1, 1, static arguments => new PyInt(arguments[0].PyHash()));

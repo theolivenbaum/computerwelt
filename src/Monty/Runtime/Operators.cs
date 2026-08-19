@@ -376,7 +376,7 @@ public static class Operators
         if (b == 0)
         {
             throw new PyRaise(PyErrors.ZeroDivisionError(
-                useFloat ? "float floor division by zero" : "integer division or modulo by zero"));
+                "division by zero"));
         }
 
         if (useFloat)
@@ -414,11 +414,18 @@ public static class Operators
         if (b == 0)
         {
             throw new PyRaise(PyErrors.ZeroDivisionError(
-                useFloat ? "float modulo" : "integer division or modulo by zero"));
+                "division by zero"));
         }
 
         if (useFloat)
         {
+            // An infinite divisor leaves the dividend as the remainder when the two agree
+            // in sign, and the divisor itself when they do not.
+            if (double.IsInfinity(b) && double.IsFinite(a))
+            {
+                return new PyFloat(a == 0 || double.IsNegative(a) == double.IsNegative(b) ? a : b);
+            }
+
             var result = a - (Math.Floor(a / b) * b);
 
             // A zero result takes the divisor's sign, so `6.0 % -3.0` is `-0.0`.
@@ -448,10 +455,7 @@ public static class Operators
 
         if (b < 0 && a == 0)
         {
-            throw new PyRaise(PyErrors.ZeroDivisionError(
-                useFloat
-                    ? "0.0 cannot be raised to a negative power"
-                    : "0 cannot be raised to a negative power"));
+            throw new PyRaise(PyErrors.ZeroDivisionError("zero to a negative power"));
         }
 
         if (!useFloat)
@@ -632,6 +636,12 @@ public static class Operators
             return merged;
         }
 
+        // Two bools give a bool: `True | False` is `True`, not `1`.
+        if (left is PyBool && right is PyBool)
+        {
+            return PyBool.Of(left.IsTruthy() || right.IsTruthy());
+        }
+
         return new PyInt(RequireInt(left, "|") | RequireInt(right, "|"));
     }
 
@@ -649,6 +659,11 @@ public static class Operators
         {
             throw new PyRaise(PyErrors.TypeError(
                 $"unsupported operand type(s) for ^: '{left.TypeName}' and '{right.TypeName}'"));
+        }
+
+        if (left is PyBool && right is PyBool)
+        {
+            return PyBool.Of(left.IsTruthy() ^ right.IsTruthy());
         }
 
         return new PyInt(RequireInt(left, "^") ^ RequireInt(right, "^"));

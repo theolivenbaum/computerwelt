@@ -630,7 +630,10 @@ public static class BuiltinMethods
             case "extend":
                 return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
-                    ((PyList)self).Items.AddRange(VirtualMachine.RequireIterable(arguments[0]));
+                    // `x.extend(x)` appends what the list held, not what it grows to, so
+                    // the source is read out before the target is touched.
+                    var extra = VirtualMachine.RequireIterable(arguments[0]).ToList();
+                    ((PyList)self).Items.AddRange(extra);
                     return PyNone.Instance;
                 });
 
@@ -1103,8 +1106,19 @@ public static class BuiltinMethods
         }
 
         return Method(name, receiver, (self, arguments, keywords) =>
-            FromLatin1(((PyBoundMethod)BindString(Latin1(self), name)!).Invoke(
-                [.. arguments.Select(Latin1)], keywords)));
+        {
+            // Text arguments are the one thing the shared implementation must not accept:
+            // `b'x'.startswith('x')` is a type error, not a match.
+            if (arguments.Length > 0 && Text(arguments[0]) is { } wrong)
+            {
+                throw new PyRaise(PyErrors.TypeError(name is "startswith" or "endswith"
+                    ? $"{name} first arg must be bytes or a tuple of bytes, not {wrong}"
+                    : $"argument should be integer or bytes-like object, not '{wrong}'"));
+            }
+
+            return FromLatin1(((PyBoundMethod)BindString(Latin1(self), name)!).Invoke(
+                [.. arguments.Select(Latin1)], keywords));
+        });
     }
 
     /// <summary>
@@ -1233,6 +1247,14 @@ public static class BuiltinMethods
 
         return string.Join(separator, pieces);
     }
+
+    /// <summary>The type name of a text argument a bytes method must reject, else null.</summary>
+    private static string? Text(PyObject value) => value switch
+    {
+        PyStr => "str",
+        PyTuple items when items.Items.Any(static item => item is PyStr) => "str",
+        _ => null,
+    };
 
     /// <summary>
     /// Views bytes as text, one code point per byte, recursing into a sequence argument so
