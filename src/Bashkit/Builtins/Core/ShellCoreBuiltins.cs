@@ -216,11 +216,11 @@ public sealed class WhichBuiltin : IBuiltin
 
         foreach (var name in cursor.Operands)
         {
-            // There are no real executables, so a registered builtin reports the
-            // conventional location a script would expect to see.
+            // There are no real executables to point at, so a name that resolves reports
+            // itself rather than inventing a path that nothing could run.
             if (context.Hooks.IsBuiltin(name) || context.State.Functions.ContainsKey(name))
             {
-                builder.Append("/usr/bin/").Append(name).Append('\n');
+                builder.Append(name).Append('\n');
             }
             else
             {

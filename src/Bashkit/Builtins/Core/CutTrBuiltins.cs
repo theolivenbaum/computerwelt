@@ -414,6 +414,7 @@ public sealed class NlBuiltin : IBuiltin
         var width = 6;
         var increment = 1;
         var start = 1;
+        var format = "rn";
 
         while (cursor.NextOption() is { } option)
         {
@@ -433,7 +434,7 @@ public sealed class NlBuiltin : IBuiltin
                     int.TryParse(cursor.TakeValue(), CultureInfo.InvariantCulture, out start);
                     break;
 
-                case "-n" or "--number-format": cursor.TakeValue(); break;
+                case "-n" or "--number-format": format = cursor.TakeValue() ?? "rn"; break;
                 case "-p" or "-l" or "-d" or "-f" or "-h": break;
                 default:
                     return ExecResult.Usage("nl", $"invalid option -- '{option.TrimStart('-')}'");
@@ -460,18 +461,33 @@ public sealed class NlBuiltin : IBuiltin
 
                 if (numbered)
                 {
-                    builder.Append(number.ToString(CultureInfo.InvariantCulture).PadLeft(width))
+                    builder.Append(Format(number, width, format))
                         .Append(separator).Append(line).Append('\n');
                     number += increment;
                 }
                 else
                 {
-                    builder.Append(new string(' ', width)).Append(separator).Append(line).Append('\n');
+                    // An unnumbered line is indented to where the text of a numbered one
+                    // would start — the number field plus the separator.
+                    builder.Append(new string(' ', width + separator.Length)).Append(line).Append('\n');
                 }
             }
         }
 
         return ExecResult.Ok(builder.ToString());
+    }
+
+    /// <summary>Renders a line number in one of nl's three field formats.</summary>
+    private static string Format(int number, int width, string format)
+    {
+        var text = number.ToString(CultureInfo.InvariantCulture);
+
+        return format switch
+        {
+            "ln" => text.PadRight(width),
+            "rz" => text.PadLeft(width, '0'),
+            _ => text.PadLeft(width),
+        };
     }
 }
 

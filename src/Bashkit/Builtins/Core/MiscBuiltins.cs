@@ -633,19 +633,39 @@ public sealed class TypeBuiltin : IBuiltin
             builder.Append(typeOnly ? kind + "\n" : Describe(name, kind));
         }
 
+        if (!allFound)
+        {
+            foreach (var name in cursor.Operands.Where(operand => Classify(context, operand) is null))
+            {
+                builder.Append(typeOnly ? string.Empty : $"bash: type: {name}: not found\n");
+            }
+        }
+
         return ValueTask.FromResult(new ExecResult
         {
             Stdout = StreamData.FromText(builder.ToString()),
-            Stderr = allFound ? StreamData.Empty : StreamData.FromText("bash: type: not found\n"),
             ExitCode = allFound ? 0 : 1,
         });
     }
+
+    /// <summary>The words the parser treats as syntax rather than as command names.</summary>
+    private static readonly HashSet<string> Keywords = new(StringComparer.Ordinal)
+    {
+        "if", "then", "elif", "else", "fi", "case", "esac", "for", "select", "while",
+        "until", "do", "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc",
+    };
 
     private static string? Classify(BuiltinContext context, string name)
     {
         if (context.State.Aliases.ContainsKey(name))
         {
             return "alias";
+        }
+
+        // A keyword outranks everything: `type if` reports syntax, not a command.
+        if (Keywords.Contains(name))
+        {
+            return "keyword";
         }
 
         if (context.State.Functions.ContainsKey(name))
@@ -664,6 +684,7 @@ public sealed class TypeBuiltin : IBuiltin
     private static string Describe(string name, string kind) => kind switch
     {
         "alias" => $"{name} is aliased\n",
+        "keyword" => $"{name} is a shell keyword\n",
         "function" => $"{name} is a function\n",
         _ => $"{name} is a shell builtin\n",
     };

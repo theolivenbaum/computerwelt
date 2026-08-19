@@ -55,7 +55,7 @@ public sealed class Expander
     public async ValueTask<string> ExpandToStringAsync(Word word, CancellationToken cancellationToken = default)
     {
         var fields = await ExpandToFieldsAsync(word, splitting: false, cancellationToken);
-        return fields.Count == 0 ? string.Empty : string.Concat(fields);
+        return fields.Count == 0 ? string.Empty : Unescape(string.Concat(fields));
     }
 
     /// <summary>
@@ -1027,7 +1027,7 @@ public sealed class Expander
     {
         if (_state.Options.NoGlob)
         {
-            return fields;
+            return [.. fields.Select(Unescape)];
         }
 
         var result = new List<string>(fields.Count);
@@ -1036,7 +1036,7 @@ public sealed class Expander
         {
             if (!PatternMatcher.HasMetacharacters(field, _state.Options.ExtGlob))
             {
-                result.Add(field);
+                result.Add(Unescape(field));
                 continue;
             }
 
@@ -1051,7 +1051,7 @@ public sealed class Expander
 
                 if (!_state.Options.NullGlob)
                 {
-                    result.Add(field);
+                    result.Add(Unescape(field));
                 }
 
                 continue;
@@ -1083,6 +1083,16 @@ public sealed class Expander
     /// One field under construction. It tracks whether any quoted content contributed,
     /// which decides whether an empty result survives as an empty field or disappears.
     /// </summary>
+    /// <summary>
+    /// One field under construction.
+    /// </summary>
+    /// <remarks>
+    /// The text is accumulated in escaped form: a glob metacharacter that came from quoted
+    /// content is written with a backslash before it. That is what lets a later pathname
+    /// expansion tell <c>echo *</c> from <c>echo "*"</c>, which is information the plain
+    /// text no longer carries. <see cref="Unescape"/> undoes it for every consumer that
+    /// wants the value rather than the pattern.
+    /// </remarks>
     private sealed class FieldBuilder
     {
         private readonly StringBuilder _text = new();
@@ -1093,15 +1103,50 @@ public sealed class Expander
 
         public void Append(string value, bool quoted)
         {
-            _text.Append(value);
-            if (quoted)
+            if (!quoted)
             {
-                HasQuotedContent = true;
+                _text.Append(value);
+                return;
+            }
+
+            HasQuotedContent = true;
+
+            foreach (var c in value)
+            {
+                if (c is '*' or '?' or '[' or ']' or '\\' or '(' or ')')
+                {
+                    _text.Append('\\');
+                }
+
+                _text.Append(c);
             }
         }
 
         public void MarkQuoted() => HasQuotedContent = true;
 
         public override string ToString() => _text.ToString();
+    }
+
+    /// <summary>Removes the escaping <see cref="FieldBuilder"/> added.</summary>
+    private static string Unescape(string field)
+    {
+        if (!field.Contains('\\', StringComparison.Ordinal))
+        {
+            return field;
+        }
+
+        var builder = new StringBuilder(field.Length);
+
+        for (var i = 0; i < field.Length; i++)
+        {
+            if (field[i] == '\\' && i + 1 < field.Length)
+            {
+                i++;
+            }
+
+            builder.Append(field[i]);
+        }
+
+        return builder.ToString();
     }
 }
