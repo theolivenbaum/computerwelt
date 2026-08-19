@@ -228,6 +228,9 @@ public sealed class BashBuilder
         Register(new GrepBuiltin("egrep"));
         Register(new GrepBuiltin("fgrep"));
         Register(new SedBuiltin());
+        Register(new AwkBuiltin());
+        Register(new AwkBuiltin("gawk"));
+        Register(new AwkBuiltin("mawk"));
         Register(new CutBuiltin());
         Register(new TrBuiltin());
         Register(new NlBuiltin());
