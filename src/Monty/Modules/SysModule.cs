@@ -32,11 +32,19 @@ public static class SysModule
             throw new PyRaise(new PyException(PyExceptionType.SystemExit, code.Display(), [code]));
         });
 
-        module.Add("getrecursionlimit", _ => new PyInt(machine.Limits.MaxRecursionDepth));
+        module.Add("getrecursionlimit", _ => new PyInt(machine.RecursionLimit));
 
-        // The limit is fixed for the run; accepting the call and ignoring it lets fixtures
-        // that set it defensively still run.
-        module.Add("setrecursionlimit", static _ => PyNone.Instance);
+        // A script may lower the limit but not raise it past the sandbox's own cap.
+        module.Add("setrecursionlimit", arguments =>
+        {
+            Arity.Exact("setrecursionlimit", arguments, 1);
+            machine.RecursionLimit = arguments[0] is PyInt limit
+                ? limit.ToIndex()
+                : throw new PyRaise(PyErrors.TypeError(
+                    $"'{arguments[0].TypeName}' object cannot be interpreted as an integer"));
+
+            return PyNone.Instance;
+        });
 
         module.Add("intern", static arguments => arguments[0]);
 

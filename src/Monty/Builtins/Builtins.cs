@@ -60,6 +60,12 @@ public static class BuiltinNamespace
 
         foreach (var (name, type) in PyExceptionType.Registry)
         {
+            // `JSONDecodeError` is defined by the json module, not by the language.
+            if (name == "JSONDecodeError")
+            {
+                continue;
+            }
+
             builtins.Set(new PyStr(name), type);
         }
 

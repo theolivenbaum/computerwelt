@@ -44,6 +44,21 @@ public sealed class VirtualMachine
     /// <summary>The resource caps this machine enforces.</summary>
     public ExecutionLimits Limits => _limits;
 
+    /// <summary>
+    /// The call depth a program may reach, which <c>sys.setrecursionlimit</c> may lower.
+    /// </summary>
+    /// <remarks>
+    /// It can be lowered but never raised past the configured cap: the limit is a safety
+    /// bound on the host stack, and a script must not be able to lift it.
+    /// </remarks>
+    public int RecursionLimit
+    {
+        get => _recursionLimit ?? _limits.MaxRecursionDepth;
+        set => _recursionLimit = Math.Clamp(value, 1, _limits.MaxRecursionDepth);
+    }
+
+    private int? _recursionLimit;
+
     /// <summary>Everything the program wrote to standard output.</summary>
     public string Stdout => _stdout.ToString();
 
@@ -142,7 +157,7 @@ public sealed class VirtualMachine
 
     private PyObject CallFunction(PyFunction function, PyObject[] arguments, PyDict? keywords)
     {
-        if (++_depth > _limits.MaxRecursionDepth)
+        if (++_depth > RecursionLimit)
         {
             _depth--;
             throw new PyRaise(new PyException(

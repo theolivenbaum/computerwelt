@@ -270,6 +270,12 @@ public sealed class PyFloat : PyObject
     /// Formats a float the way Python's <c>repr</c> does: the shortest text that round
     /// trips, always with a decimal point or exponent so it cannot be mistaken for an int.
     /// </summary>
+    /// <remarks>
+    /// .NET and Python disagree on when to switch to exponent notation — .NET writes
+    /// <c>10000000000000000</c> where Python writes <c>1e+16</c> — so the shortest digits
+    /// are taken from .NET and then laid out by Python's rule: exponent notation when the
+    /// leading digit's decimal exponent is below -4 or at least 16.
+    /// </remarks>
     internal static string Format(double value)
     {
         if (double.IsNaN(value))
@@ -287,24 +293,53 @@ public sealed class PyFloat : PyObject
             return "-inf";
         }
 
-        // .NET prints negative zero as "-0", and Python keeps the sign too.
         var text = value.ToString("R", CultureInfo.InvariantCulture);
 
-        if (text.Contains('E', StringComparison.Ordinal))
+        // .NET prints negative zero as "-0", and Python keeps the sign too.
+        var sign = text.StartsWith('-') ? "-" : string.Empty;
+
+        if (sign.Length > 0)
         {
-            // Python writes `1e+20`, not `1E+20`.
-            var mantissaEnd = text.IndexOf('E', StringComparison.Ordinal);
-            var mantissa = text[..mantissaEnd];
-            var exponent = int.Parse(text[(mantissaEnd + 1)..], CultureInfo.InvariantCulture);
-
-            if (!mantissa.Contains('.', StringComparison.Ordinal))
-            {
-                mantissa += ".0";
-            }
-
-            return $"{mantissa}e{(exponent < 0 ? "-" : "+")}{Math.Abs(exponent):00}";
+            text = text[1..];
         }
 
-        return text.Contains('.', StringComparison.Ordinal) ? text : text + ".0";
+        var exponent = 0;
+        var e = text.IndexOf('E', StringComparison.Ordinal);
+
+        if (e >= 0)
+        {
+            exponent = int.Parse(text[(e + 1)..], CultureInfo.InvariantCulture);
+            text = text[..e];
+        }
+
+        var point = text.IndexOf('.', StringComparison.Ordinal);
+        var digits = point < 0 ? text : text.Remove(point, 1);
+        var integerLength = point < 0 ? text.Length : point;
+
+        // The decimal exponent of the leading significant digit.
+        var leadingZeros = digits.Length - digits.TrimStart('0').Length;
+        digits = digits.TrimStart('0').TrimEnd('0');
+
+        if (digits.Length == 0)
+        {
+            return sign + "0.0";
+        }
+
+        var decimalExponent = exponent + integerLength - 1 - leadingZeros;
+
+        if (decimalExponent is >= -4 and < 16)
+        {
+            if (decimalExponent < 0)
+            {
+                return sign + "0." + new string('0', -decimalExponent - 1) + digits;
+            }
+
+            var whole = digits.PadRight(decimalExponent + 1, '0');
+            var fraction = whole[(decimalExponent + 1)..];
+            return sign + whole[..(decimalExponent + 1)] + "." + (fraction.Length > 0 ? fraction : "0");
+        }
+
+        var mantissa = digits.Length > 1 ? digits[..1] + "." + digits[1..] : digits;
+        return $"{sign}{mantissa}e{(decimalExponent < 0 ? "-" : "+")}{Math.Abs(decimalExponent):00}";
     }
 }

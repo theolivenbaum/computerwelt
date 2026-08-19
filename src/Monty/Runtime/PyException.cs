@@ -176,6 +176,9 @@ public sealed class PyExceptionType : PyObject
     /// <summary><c>TypeError</c>.</summary>
     public static PyExceptionType TypeError { get; } = Define("TypeError", Exception);
 
+    /// <summary><c>json.JSONDecodeError</c>, which is a <c>ValueError</c>.</summary>
+    public static PyExceptionType JsonDecodeError { get; } = Define("JSONDecodeError", ValueError);
+
     /// <summary><c>NameError</c>.</summary>
     public static PyExceptionType NameError { get; } = Define("NameError", Exception);
 

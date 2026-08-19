@@ -43,7 +43,7 @@ public static class StandardLibrary
         ["datetime"] = DatetimeModule.Create(timeProvider ?? TimeProvider.System),
         ["math"] = MathModule.Create(),
         ["sys"] = SysModule.Create(machine),
-        ["json"] = JsonModule.Create(),
+        ["json"] = JsonModule.Create(machine),
         ["collections"] = SupportModules.CreateCollections(machine),
         ["itertools"] = SupportModules.CreateItertools(machine),
         ["typing"] = SupportModules.CreateTyping(),
