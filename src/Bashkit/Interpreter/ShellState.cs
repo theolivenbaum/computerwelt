@@ -70,6 +70,12 @@ public sealed class ShellState
     /// </remarks>
     public HashSet<string> ShellDefaults { get; private set; } = new(StringComparer.Ordinal);
 
+    /// <summary>When this shell started, which is what <c>$SECONDS</c> counts from.</summary>
+    public DateTimeOffset StartedAt { get; } = TimeProvider.System.GetUtcNow();
+
+    /// <summary>The source line being executed, which <c>$LINENO</c> reports.</summary>
+    public int CurrentLine { get; set; } = 1;
+
     /// <summary>The number of scopes currently pushed beyond the global one.</summary>
     public int ScopeDepth => _scopes.Count - 1;
 
@@ -92,12 +98,36 @@ public sealed class ShellState
         {
             if (_scopes[i].TryGetValue(name, out var variable))
             {
-                // A nameref forwards every read and write to the variable it names.
+                // A nameref forwards every read and write to the variable it names, and
+                // that name may carry a subscript: `typeset -n ref='a[2]'`.
                 if (variable.Attributes.HasFlag(VariableAttributes.NameRef) && variable.Value != name)
                 {
-                    return Lookup(variable.Value);
+                    var target = variable.Value;
+                    var bracket = target.IndexOf('[', StringComparison.Ordinal);
+                    return Lookup(bracket > 0 ? target[..bracket] : target);
                 }
 
+                return variable;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Looks up a variable without following a nameref.
+    /// </summary>
+    /// <remarks>
+    /// <c>typeset +n ref</c> has to clear the attribute on <c>ref</c> itself, and
+    /// <c>${!ref}</c> has to read the name <c>ref</c> holds — both would otherwise operate
+    /// on the variable it points at.
+    /// </remarks>
+    public ShellVariable? LookupRaw(string name)
+    {
+        for (var i = _scopes.Count - 1; i >= 0; i--)
+        {
+            if (_scopes[i].TryGetValue(name, out var variable))
+            {
                 return variable;
             }
         }
@@ -175,8 +205,19 @@ public sealed class ShellState
     }
 
     /// <summary>Removes a variable from whichever scope defines it.</summary>
+    /// <remarks>
+    /// Unsetting a nameref removes the variable it points at, not the reference — which is
+    /// bash's rule and the reason <c>unset ref</c> and <c>unset -n ref</c> differ.
+    /// </remarks>
     public bool Unset(string name)
     {
+        if (LookupRaw(name) is { } reference
+            && reference.Attributes.HasFlag(VariableAttributes.NameRef)
+            && reference.Value != name)
+        {
+            return Unset(reference.Value);
+        }
+
         for (var i = _scopes.Count - 1; i >= 0; i--)
         {
             if (!_scopes[i].TryGetValue(name, out var variable))
@@ -251,6 +292,19 @@ public sealed class ShellState
                 return string.Join(' ', Positional);
             case "-":
                 return CurrentFlags();
+
+            // These are computed on every read rather than stored, which is what makes
+            // `$RANDOM` differ between two expansions in the same command.
+            case "RANDOM":
+                return Random.Shared.Next(0, 32768).ToString(CultureInfo.InvariantCulture);
+
+            case "SECONDS":
+                return ((long)(TimeProvider.System.GetUtcNow() - StartedAt).TotalSeconds)
+                    .ToString(CultureInfo.InvariantCulture);
+
+            case "LINENO":
+                return CurrentLine.ToString(CultureInfo.InvariantCulture);
+
         }
 
         if (name.Length > 0 && name.All(char.IsAsciiDigit))

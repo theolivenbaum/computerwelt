@@ -204,8 +204,23 @@ public sealed class LocalBuiltin : IBuiltin
             var name = equals < 0 ? argument : argument[..equals];
             var value = equals < 0 ? null : argument[(equals + 1)..];
 
-            var variable = context.State.SetLocal(name, value);
+            var variable = context.State.SetLocal(name, null);
             variable.Attributes |= attributes;
+
+            if (value is null)
+            {
+                continue;
+            }
+
+            // `local arr=(a b c)` declares a local array; the parenthesised form reaches
+            // here as one already-expanded word.
+            if (value.StartsWith('(') && value.EndsWith(')'))
+            {
+                DeclareBuiltin.AssignArrayLiteral(context, variable, DeclareBuiltin.SplitArrayLiteral(value[1..^1]));
+                continue;
+            }
+
+            variable.SetScalar(value);
         }
 
         return ValueTask.FromResult(ExecResult.Success);
@@ -253,7 +268,10 @@ public sealed class DeclareBuiltin : IBuiltin
             var name = equals < 0 ? argument : argument[..equals];
             var value = equals < 0 ? null : argument[(equals + 1)..];
 
-            var variable = local ? context.State.SetLocal(name, null) : context.State.GetOrCreate(name);
+            // Attribute changes apply to the named variable itself, never to whatever a
+            // nameref of that name points at.
+            var variable = context.State.LookupRaw(name)
+                ?? (local ? context.State.SetLocal(name, null) : context.State.GetOrCreate(name));
 
             if (remove)
             {
@@ -269,10 +287,11 @@ public sealed class DeclareBuiltin : IBuiltin
                 continue;
             }
 
-            // An array literal on the right-hand side is `declare -a x=(1 2 3)`.
+            // An array literal on the right-hand side is `declare -a x=(1 2 3)`, or with
+            // explicit subscripts `declare -A x=([k]=v ...)`.
             if (value.StartsWith('(') && value.EndsWith(')'))
             {
-                variable.SetArray(SplitArrayLiteral(value[1..^1]));
+                AssignArrayLiteral(context, variable, SplitArrayLiteral(value[1..^1]));
                 continue;
             }
 
@@ -359,7 +378,46 @@ public sealed class DeclareBuiltin : IBuiltin
         return $"declare {flags} {name}=\"{variable.Value}\"\n";
     }
 
-    private static List<string> SplitArrayLiteral(string body) =>
+    /// <summary>
+    /// Assigns the elements of an array literal, honouring explicit <c>[key]=value</c>
+    /// subscripts.
+    /// </summary>
+    /// <remarks>
+    /// An associative array can only be filled this way — <c>declare -A x=([a]=1)</c> has
+    /// no positional reading — so treating every element as positional would silently turn
+    /// the keys into the values.
+    /// </remarks>
+    internal static void AssignArrayLiteral(BuiltinContext context, ShellVariable variable, List<string> items)
+    {
+        var positional = new List<string>();
+
+        foreach (var item in items)
+        {
+            if (!item.StartsWith('[') || item.IndexOf("]=", StringComparison.Ordinal) is not (> 0 and var close))
+            {
+                positional.Add(item);
+                continue;
+            }
+
+            var key = item[1..close];
+            var element = item[(close + 2)..].Trim('"', '\'');
+
+            if (variable.IsAssociative)
+            {
+                variable.SetAssociative(key.Trim('"', '\''), element);
+                continue;
+            }
+
+            variable.SetIndexed(ArithmeticEvaluator.Evaluate(context.State, key), element);
+        }
+
+        if (positional.Count > 0 || items.Count == 0)
+        {
+            variable.SetArray(positional);
+        }
+    }
+
+    internal static List<string> SplitArrayLiteral(string body) =>
         [.. body.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(static piece => piece.Trim('"', '\''))];
 }
@@ -431,30 +489,36 @@ public sealed class SetBuiltin : IBuiltin
 
             var enable = argument[0] == '-';
 
-            if (argument[1] == 'o')
+            var bundle = argument[1..];
+
+            for (var c = 0; c < bundle.Length; c++)
             {
-                index++;
-                if (index >= context.Arguments.Count)
+                // `-o name` takes the rest of the bundle's argument or the next one, which
+                // is what makes `set -euo pipefail` work.
+                if (bundle[c] == 'o')
                 {
-                    return ValueTask.FromResult(ExecResult.Ok(DescribeOptions(options)));
+                    var name = c + 1 < bundle.Length ? bundle[(c + 1)..]
+                        : index + 1 < context.Arguments.Count ? context.Arguments[++index] : null;
+
+                    if (name is null)
+                    {
+                        return ValueTask.FromResult(ExecResult.Ok(DescribeOptions(options, enable)));
+                    }
+
+                    if (!options.SetByName(name, enable))
+                    {
+                        return ValueTask.FromResult(ExecResult.Usage("set", $"{name}: invalid option name"));
+                    }
+
+                    c = bundle.Length;
+                    continue;
                 }
 
-                if (!options.SetByName(context.Arguments[index], enable))
-                {
-                    return ValueTask.FromResult(
-                        ExecResult.Usage("set", $"{context.Arguments[index]}: invalid option name"));
-                }
+                var longName = ShellOptions.LongNameForFlag(bundle[c]);
 
-                index++;
-                continue;
-            }
-
-            foreach (var flag in argument[1..])
-            {
-                var longName = ShellOptions.LongNameForFlag(flag);
                 if (longName is null)
                 {
-                    return ValueTask.FromResult(ExecResult.Usage("set", $"-{flag}: invalid option"));
+                    return ValueTask.FromResult(ExecResult.Usage("set", $"-{bundle[c]}: invalid option"));
                 }
 
                 options.SetByName(longName, enable);
@@ -472,7 +536,15 @@ public sealed class SetBuiltin : IBuiltin
         return ValueTask.FromResult(ExecResult.Success);
     }
 
-    private static string DescribeOptions(ShellOptions options)
+    /// <summary>
+    /// Lists the options, in the two shapes bash uses.
+    /// </summary>
+    /// <remarks>
+    /// <c>set -o</c> prints a readable table; <c>set +o</c> prints commands that restore
+    /// the current settings, which is the whole point of the form — <c>eval "$(set +o)"</c>
+    /// puts the shell back the way it was.
+    /// </remarks>
+    private static string DescribeOptions(ShellOptions options, bool readable)
     {
         var names = new[]
         {
@@ -480,9 +552,15 @@ public sealed class SetBuiltin : IBuiltin
         };
 
         var builder = new StringBuilder();
+
         foreach (var name in names)
         {
-            builder.Append(name.PadRight(16)).Append(options.GetByName(name) == true ? "on" : "off").Append('\n');
+            var on = options.GetByName(name) == true;
+
+            builder.Append(readable
+                ? name.PadRight(15) + "\t" + (on ? "on" : "off")
+                : "set " + (on ? "-o " : "+o ") + name)
+                .Append('\n');
         }
 
         return builder.ToString();
@@ -501,6 +579,7 @@ public sealed class ShoptBuiltin : IBuiltin
         var enable = false;
         var disable = false;
         var query = false;
+        var print = false;
         var names = new List<string>();
 
         foreach (var argument in context.Arguments)
@@ -510,11 +589,31 @@ public sealed class ShoptBuiltin : IBuiltin
                 case "-s": enable = true; continue;
                 case "-u": disable = true; continue;
                 case "-q": query = true; continue;
-                case "-o" or "-p": continue;
+                case "-p": print = true; continue;
+                case "-o": continue;
                 default:
                     names.Add(argument);
                     continue;
             }
+        }
+
+        // `-p` reports settings as the commands that would restore them.
+        if (print)
+        {
+            var restore = new StringBuilder();
+
+            foreach (var name in names.Count > 0 ? names : KnownOptions.ToList())
+            {
+                if (context.State.Options.GetByName(name) is not { } value)
+                {
+                    return ValueTask.FromResult(
+                        ExecResult.Error($"shopt: {name}: invalid shell option name\n", ExitCodes.Failure));
+                }
+
+                restore.Append("shopt ").Append(value ? "-s " : "-u ").Append(name).Append('\n');
+            }
+
+            return ValueTask.FromResult(ExecResult.Ok(restore.ToString()));
         }
 
         var options = context.State.Options;
@@ -530,7 +629,7 @@ public sealed class ShoptBuiltin : IBuiltin
                     continue;
                 }
 
-                builder.Append(name.PadRight(20)).Append(value ? "on" : "off").Append('\n');
+                builder.Append(name.PadRight(32)).Append(value ? "on" : "off").Append('\n');
             }
 
             return ValueTask.FromResult(ExecResult.Ok(builder.ToString()));
@@ -545,23 +644,26 @@ public sealed class ShoptBuiltin : IBuiltin
             {
                 if (!options.SetByName(name, enable))
                 {
-                    return ValueTask.FromResult(ExecResult.Usage("shopt", $"{name}: invalid shell option name"));
+                    return ValueTask.FromResult(
+                        ExecResult.Error($"shopt: {name}: invalid shell option name\n", ExitCodes.Failure));
                 }
 
                 continue;
             }
 
             var value = options.GetByName(name);
+
             if (value is null)
             {
-                return ValueTask.FromResult(ExecResult.Usage("shopt", $"{name}: invalid shell option name"));
+                return ValueTask.FromResult(
+                    ExecResult.Error($"shopt: {name}: invalid shell option name\n", ExitCodes.Failure));
             }
 
             allSet &= value.Value;
 
             if (!query)
             {
-                output.Append(name.PadRight(20)).Append(value.Value ? "on" : "off").Append('\n');
+                output.Append(name.PadRight(32)).Append(value.Value ? "on" : "off").Append('\n');
             }
         }
 

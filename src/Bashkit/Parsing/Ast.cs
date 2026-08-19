@@ -6,6 +6,28 @@ public sealed record Script(IReadOnlyList<Node> Commands)
 {
     /// <summary>An empty script.</summary>
     public static Script Empty { get; } = new([]);
+
+    /// <summary>
+    /// The text this script was parsed from, kept so a node's offset can be turned into a
+    /// line number for <c>$LINENO</c>.
+    /// </summary>
+    public string Source { get; init; } = string.Empty;
+
+    /// <summary>The 1-based line <paramref name="offset"/> falls on.</summary>
+    public int LineAt(int offset)
+    {
+        var line = 1;
+
+        for (var i = 0; i < offset && i < Source.Length; i++)
+        {
+            if (Source[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
+    }
 }
 
 /// <summary>

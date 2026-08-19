@@ -82,6 +82,10 @@ public sealed class Interpreter
         foreach (var command in script.Commands)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // `$LINENO` reports the line of the command being run.
+            State.CurrentLine = script.LineAt(command.Span.Start);
+
             result = await ExecuteAsync(command, stdin, cancellationToken);
             result = await ApplyErrTrapAsync(result, cancellationToken);
             stdout.Append(result.Stdout.ToString());
@@ -333,6 +337,10 @@ public sealed class Interpreter
         }
 
         State.PipeStatus = statuses;
+
+        // `PIPESTATUS` is a real array so `${PIPESTATUS[1]}` indexes it like any other.
+        State.GetOrCreate("PIPESTATUS")
+            .SetArray(statuses.Select(static status => status.ToString(CultureInfo.InvariantCulture)));
 
         var exitCode = State.Options.PipeFail
             ? statuses.LastOrDefault(static status => status != 0, 0)
@@ -953,13 +961,15 @@ public sealed class Interpreter
                     if (element.Key is { } key)
                     {
                         var elementValue = await Expander.ExpandToStringAsync(element.Value, cancellationToken);
+                        var elementKey = Expander.ExpandSubscriptText(key);
+
                         if (variable.IsAssociative)
                         {
-                            variable.SetAssociative(StripQuotes(key), elementValue);
+                            variable.SetAssociative(StripQuotes(elementKey), elementValue);
                         }
                         else
                         {
-                            variable.SetIndexed(ArithmeticEvaluator.Evaluate(State, key), elementValue);
+                            variable.SetIndexed(ArithmeticEvaluator.Evaluate(State, elementKey), elementValue);
                         }
 
                         continue;
@@ -987,8 +997,10 @@ public sealed class Interpreter
             {
                 var value = await Expander.ExpandToStringAsync(scalar.Word, cancellationToken);
 
-                if (assignment.Index is { } index)
+                if (assignment.Index is { } rawIndex)
                 {
+                    var index = Expander.ExpandSubscriptText(rawIndex);
+
                     if (variable.IsAssociative)
                     {
                         var key = StripQuotes(index);

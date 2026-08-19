@@ -147,6 +147,14 @@ public sealed class BashBuilder
             ["BASH_VERSION"] = "5.2.0(1)-release",
             ["LANG"] = "C.UTF-8",
             ["TERM"] = "dumb",
+            ["UID"] = "1000",
+            ["EUID"] = "1000",
+            ["PPID"] = "1",
+            ["BASHPID"] = "1",
+            ["SHLVL"] = "1",
+            ["OSTYPE"] = "linux-gnu",
+            ["MACHTYPE"] = "x86_64-pc-linux-gnu",
+            ["HOSTTYPE"] = "x86_64",
         };
 
         foreach (var (name, value) in defaults)
@@ -158,6 +166,10 @@ public sealed class BashBuilder
             // shell still inherits these.
             state.ShellDefaults.Add(name);
         }
+
+        // `BASH_VERSINFO` is an array, so it cannot come from the scalar table above.
+        state.GetOrCreate("BASH_VERSINFO").SetArray(["5", "2", "0", "1", "release", "x86_64-pc-linux-gnu"]);
+        state.ShellDefaults.Add("BASH_VERSINFO");
 
         // IFS is deliberately not exported, matching bash.
         state.GetOrCreate("IFS").Attributes &= ~VariableAttributes.Exported;
@@ -196,6 +208,8 @@ public sealed class BashBuilder
         Register(new SetBuiltin());
         Register(new ShoptBuiltin());
         Register(new ReadBuiltin());
+        Register(new MapfileBuiltin());
+        Register(new MapfileBuiltin("readarray"));
 
         Register(new TestBuiltin());
         Register(new TestBuiltin("["));

@@ -119,6 +119,14 @@ public sealed class ShellVariable
     public void SetIndexed(long index, string value)
     {
         Attributes |= VariableAttributes.IndexedArray;
+
+        // A negative subscript counts back from the end, so `a[-1]=x` replaces the last
+        // element rather than creating one at index -1.
+        if (index < 0)
+        {
+            index += _indexed.Count == 0 ? 0 : _indexed.Keys.Max() + 1;
+        }
+
         _indexed[index] = Transform(value);
         IsUnset = false;
     }

@@ -309,7 +309,8 @@ public sealed class Expander
     {
         var values = GetSplatValues(parameter);
 
-        if (parameter.Name == "*")
+        // `${arr[*]}` joins like `$*`; only the `@` form is one field per element.
+        if (parameter.Name == "*" || parameter.Index == "*")
         {
             var joined = string.Join(_state.FirstIfsCharacter(), values);
 
@@ -427,7 +428,15 @@ public sealed class Expander
                 return names;
             }
 
+            // `${!ref}` on a nameref yields the name it points at rather than dereferencing
+            // twice — the nameref has already done one hop.
+            if (_state.LookupRaw(parameter.Name) is { } raw && raw.Attributes.HasFlag(VariableAttributes.NameRef))
+            {
+                return [raw.Value];
+            }
+
             var target = _state.Get(parameter.Name);
+
             if (string.IsNullOrEmpty(target))
             {
                 return [string.Empty];
@@ -490,6 +499,20 @@ public sealed class Expander
 
         var variable = _state.Lookup(parameter.Name);
 
+        // A nameref may point at an array element, in which case reading the reference
+        // reads that element: `typeset -n ref='a[2]'`.
+        if (parameter.Index is null
+            && _state.LookupRaw(parameter.Name) is { } reference
+            && reference.Attributes.HasFlag(VariableAttributes.NameRef)
+            && reference.Value.IndexOf('[', StringComparison.Ordinal) is var bracket and > 0
+            && reference.Value.EndsWith(']')
+            && variable is not null)
+        {
+            var element = variable.GetElement(ResolveSubscript(variable, reference.Value[(bracket + 1)..^1]));
+            isSet = element is not null;
+            return element ?? string.Empty;
+        }
+
         if (parameter.Index is { } subscript)
         {
             if (variable is null)
@@ -498,10 +521,7 @@ public sealed class Expander
                 return string.Empty;
             }
 
-            var key = variable.IsAssociative
-                ? subscript
-                : ArithmeticEvaluator.Evaluate(_state, subscript).ToString(CultureInfo.InvariantCulture);
-
+            var key = ResolveSubscript(variable, subscript);
             var element = variable.GetElement(key);
             isSet = element is not null;
             return element ?? string.Empty;
@@ -515,6 +535,87 @@ public sealed class Expander
 
         isSet = true;
         return variable.Value;
+    }
+
+    /// <summary>
+    /// Resolves an array subscript to the key it names.
+    /// </summary>
+    /// <remarks>
+    /// The subscript is source text, and what it means depends on the array: an associative
+    /// array's subscript is a <i>string</i> after expansion, while an indexed array's is an
+    /// arithmetic expression. Expanding first is what makes <c>${a[$i]}</c> work for both,
+    /// and treating an associative subscript as arithmetic would turn every key into 0.
+    /// </remarks>
+    private string ResolveSubscript(ShellVariable variable, string subscript)
+    {
+        var expanded = ExpandSubscriptText(subscript);
+
+        return variable.IsAssociative
+            ? expanded
+            : ArithmeticEvaluator.Evaluate(_state, expanded).ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Expands the parameter references inside an array subscript, synchronously.
+    /// </summary>
+    /// <remarks>
+    /// Subscripts are resolved deep inside value lookup where there is nothing to await on,
+    /// and they only ever contain simple expansions — so this handles <c>$name</c> and
+    /// <c>${name}</c> and leaves everything else alone.
+    /// </remarks>
+    public string ExpandSubscriptText(string subscript)
+    {
+        if (!subscript.Contains('$', StringComparison.Ordinal))
+        {
+            return subscript;
+        }
+
+        var builder = new StringBuilder(subscript.Length);
+
+        for (var i = 0; i < subscript.Length; i++)
+        {
+            if (subscript[i] != '$' || i + 1 >= subscript.Length)
+            {
+                builder.Append(subscript[i]);
+                continue;
+            }
+
+            var start = i + 1;
+            var braced = subscript[start] == '{';
+
+            if (braced)
+            {
+                var close = subscript.IndexOf('}', start);
+
+                if (close < 0)
+                {
+                    builder.Append(subscript[i]);
+                    continue;
+                }
+
+                builder.Append(_state.Get(subscript[(start + 1)..close]) ?? string.Empty);
+                i = close;
+                continue;
+            }
+
+            var end = start;
+
+            while (end < subscript.Length && (char.IsAsciiLetterOrDigit(subscript[end]) || subscript[end] == '_'))
+            {
+                end++;
+            }
+
+            if (end == start)
+            {
+                builder.Append(subscript[i]);
+                continue;
+            }
+
+            builder.Append(_state.Get(subscript[start..end]) ?? string.Empty);
+            i = end - 1;
+        }
+
+        return builder.ToString();
     }
 
     private async ValueTask<string> ApplyOperatorAsync(WordPart.Parameter parameter, string value, bool isSet, CancellationToken cancellationToken)
@@ -620,7 +721,12 @@ public sealed class Expander
             case ParameterOp.Transform:
             {
                 var spec = argument is null ? string.Empty : await ExpandToStringAsync(argument, cancellationToken);
-                return Transform(value, spec);
+
+                // `${x@A}` prints the assignment that would recreate the variable, so it
+                // needs the name as well as the value.
+                return spec == "A"
+                    ? $"{parameter.Name}='{value.Replace("'", "'\\''", StringComparison.Ordinal)}'"
+                    : Transform(value, spec);
             }
 
             default:
@@ -764,6 +870,7 @@ public sealed class Expander
     private static string Transform(string value, string spec) => spec switch
     {
         "Q" => Quote(value),
+        "a" => string.Empty,
         "E" => WordParser.DecodeAnsiC(value),
         "U" => value.ToUpperInvariant(),
         "L" => value.ToLowerInvariant(),

@@ -98,7 +98,7 @@ public sealed class Parser
             SkipTerminators();
         }
 
-        return new Script(commands);
+        return new Script(commands) { Source = _source };
     }
 
     private void SkipTerminators()
