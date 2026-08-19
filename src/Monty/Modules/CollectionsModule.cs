@@ -297,6 +297,16 @@ public static class SupportModules
             module.Add(name, new TypeAlias(name));
         }
 
+        // `Union` is a class in CPython, not a special form, and its repr shows it.
+        module.Add("Union", new PyType(
+            "typing.Union",
+            static _ => false,
+            static (_, _) => throw new PyRaise(PyErrors.TypeError("cannot instantiate typing.Union"))));
+
+        // Guarded imports are for type checkers only, so this is False at runtime and the
+        // block it guards never runs.
+        module.Add("TYPE_CHECKING", PyBool.False);
+
         return module;
     }
 
@@ -352,7 +362,11 @@ public static class SupportModules
 internal sealed class TypeAlias(string name) : PyObject
 {
     /// <inheritdoc />
-    public override string TypeName => "typing." + name;
+    /// <remarks>
+    /// CPython gives each construct its own internal type; Monty uses one, so
+    /// <c>type(x)</c> reports <c>typing._SpecialForm</c> for all of them.
+    /// </remarks>
+    public override string TypeName => "typing._SpecialForm";
 
     /// <inheritdoc />
     public override string Repr() => "typing." + name;
