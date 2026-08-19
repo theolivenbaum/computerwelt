@@ -46,6 +46,13 @@ public abstract class PyObject
     /// <summary>Ordering, for <c>&lt;</c> and friends. Returns null when the types do not compare.</summary>
     public virtual int? PyCompare(PyObject other) => null;
 
+    /// <summary>
+    /// Formats the value for a format spec, or null to fall back to the format
+    /// mini-language. This is the <c>__format__</c> hook: a type whose specs are its own
+    /// language — <c>datetime</c>'s strftime patterns — implements it.
+    /// </summary>
+    public virtual string? PyFormat(string spec) => null;
+
     /// <summary>Attribute lookup.</summary>
     public virtual PyObject? GetAttribute(string name) => null;
 

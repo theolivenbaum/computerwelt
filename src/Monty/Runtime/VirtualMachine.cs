@@ -816,7 +816,7 @@ public sealed class VirtualMachine
                 {
                     'r' => new PyStr(value.Repr()),
                     's' => new PyStr(value.Display()),
-                    'a' => new PyStr(value.Repr()),
+                    'a' => new PyStr(PyStr.Ascii(value.Repr())),
                     _ => value,
                 };
 

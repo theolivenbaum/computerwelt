@@ -162,6 +162,45 @@ public sealed class PyStr : PyObject
     }
 
     /// <summary>
+    /// Escapes every non-ASCII character of an existing <c>repr</c>, the way <c>ascii()</c>
+    /// and the <c>!a</c> conversion do.
+    /// </summary>
+    internal static string Ascii(string repr)
+    {
+        if (repr.All(char.IsAscii))
+        {
+            return repr;
+        }
+
+        var builder = new StringBuilder(repr.Length);
+
+        for (var i = 0; i < repr.Length; i++)
+        {
+            var c = repr[i];
+
+            if (char.IsAscii(c))
+            {
+                builder.Append(c);
+            }
+            else if (char.IsHighSurrogate(c) && i + 1 < repr.Length && char.IsLowSurrogate(repr[i + 1]))
+            {
+                builder.Append("\\U")
+                    .Append(char.ConvertToUtf32(c, repr[++i]).ToString("x8", CultureInfo.InvariantCulture));
+            }
+            else if (c <= 0xFF)
+            {
+                builder.Append("\\x").Append(((int)c).ToString("x2", CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                builder.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
     /// Whether a character survives <c>repr</c> as itself.
     /// </summary>
     /// <remarks>

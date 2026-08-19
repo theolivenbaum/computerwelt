@@ -118,11 +118,17 @@ public static class FStringParser
     {
         var (expressionText, conversion, specText) = SplitField(field);
 
-        // The `=` debug form prints the source text and then the value.
-        var debug = expressionText.EndsWith('=');
+        // The `=` debug form prints the source text and then the value. The `=` may be
+        // followed by spaces (`{a = }` prints `a = 42`), and a trailing `==`/`!=`/`<=`/`>=`
+        // is a comparison, not the debug marker.
+        var source = expressionText;
+        var trimmed = expressionText.TrimEnd();
+        var debug = trimmed.EndsWith('=')
+            && (trimmed.Length < 2 || trimmed[^2] is not ('=' or '!' or '<' or '>'));
+
         if (debug)
         {
-            expressionText = expressionText[..^1];
+            expressionText = trimmed[..^1];
         }
 
         var expression = ParseExpression(expressionText);
@@ -141,9 +147,13 @@ public static class FStringParser
 
         // `f'{x=}'` is exactly `f'x={x!r}'`, so it becomes two parts — but a FormatPart
         // holds one, so the literal half is folded into the expression by wrapping.
-        return new FormatPart(null, expression, conversion == '\0' ? 'r' : conversion, spec)
+        // An explicit spec — even an empty one — formats the value, so the implicit repr
+        // only applies when the field carries neither a conversion nor a spec.
+        var debugConversion = conversion != '\0' ? conversion : specText is null ? 'r' : '\0';
+
+        return new FormatPart(null, expression, debugConversion, spec)
         {
-            Literal = expressionText + "=",
+            Literal = source,
         };
     }
 

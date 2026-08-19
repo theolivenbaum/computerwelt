@@ -160,6 +160,10 @@ public static class DatetimeModule
         public override System.Numerics.BigInteger PyHash() => value.UtcTicks;
 
         /// <inheritdoc />
+        /// <remarks>A datetime's format spec is a strftime pattern, not the mini-language.</remarks>
+        public override string? PyFormat(string spec) => Strftime(value, spec);
+
+        /// <inheritdoc />
         public override PyObject? GetAttribute(string name) => name switch
         {
             "year" => new PyInt(value.Year),
