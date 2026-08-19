@@ -218,6 +218,59 @@ public sealed class FindBuiltin : IBuiltin
             }
         }
 
+        /// <summary>
+        /// <c>-printf FORMAT</c> — writes a chosen description of each match.
+        /// </summary>
+        /// <remarks>
+        /// The format is find's own, not printf's: <c>%f</c>, <c>%p</c>, <c>%y</c> and the
+        /// rest name fields of the entry, and there are no arguments to consume. Only the
+        /// backslash escapes are shared, and they are expanded once at parse time.
+        /// </remarks>
+        public sealed class PrintFormat(string format) : FindAction
+        {
+            public override ValueTask RunAsync(FindEntry entry, StringBuilder output, CancellationToken cancellationToken)
+            {
+                for (var i = 0; i < format.Length; i++)
+                {
+                    if (format[i] != '%' || i + 1 >= format.Length)
+                    {
+                        output.Append(format[i]);
+                        continue;
+                    }
+
+                    switch (format[++i])
+                    {
+                        case 'f': output.Append(entry.Path.FileName); break;
+                        case 'p': output.Append(entry.Display); break;
+                        case 'h': output.Append(Directory(entry.Display)); break;
+                        case 's': output.Append(entry.Metadata.Size.ToString(CultureInfo.InvariantCulture)); break;
+                        case 'y': output.Append(Kind(entry.Metadata)); break;
+                        case 'd': output.Append(entry.Depth.ToString(CultureInfo.InvariantCulture)); break;
+                        case 'm': output.Append(Convert.ToString(entry.Metadata.Mode & 0xFFF, 8)); break;
+                        case 'n': output.Append('1'); break;
+                        case '%': output.Append('%'); break;
+                        default: output.Append('%').Append(format[i]); break;
+                    }
+                }
+
+                return ValueTask.CompletedTask;
+            }
+
+            private static char Kind(FileMetadata metadata) => metadata switch
+            {
+                { IsDirectory: true } => 'd',
+                { IsSymlink: true } => 'l',
+                { IsFifo: true } => 'p',
+                _ => 'f',
+            };
+
+            private static string Directory(string display)
+            {
+                var slash = display.LastIndexOf('/');
+                return slash <= 0 ? display[..Math.Max(slash, 0)] : display[..slash];
+            }
+        }
+
         public sealed class Delete : FindAction
         {
             public override async ValueTask RunAsync(FindEntry entry, StringBuilder output, CancellationToken cancellationToken)
@@ -428,6 +481,10 @@ public sealed class FindBuiltin : IBuiltin
 
                 case "-print0":
                     expression.Actions.Add(new FindAction.Print('\0'));
+                    return new Predicate.True();
+
+                case "-printf":
+                    expression.Actions.Add(new FindAction.PrintFormat(Parsing.WordParser.DecodeAnsiC(Value())));
                     return new Predicate.True();
 
                 case "-delete":
