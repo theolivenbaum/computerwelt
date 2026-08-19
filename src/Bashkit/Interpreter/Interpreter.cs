@@ -189,6 +189,7 @@ public sealed class Interpreter
             BraceGroup group => await ExecuteAsync(group.Body, stdin, cancellationToken),
             ArithmeticCommand arithmetic => await ExecuteArithmeticAsync(arithmetic, cancellationToken),
             ConditionalCommand conditional => await ExecuteConditionalAsync(conditional, cancellationToken),
+            TimedCommand timed => await ExecuteTimedAsync(timed, stdin, cancellationToken),
             FunctionDef definition => DefineFunction(definition),
             _ => ExecResult.Success,
         };
@@ -264,6 +265,43 @@ public sealed class Interpreter
         {
             return ExecResult.Error($"bash: {e.Message}\n", ExitCodes.Failure);
         }
+    }
+
+    /// <summary>Runs a <c>time</c>-prefixed pipeline and reports how long it took.</summary>
+    /// <remarks>
+    /// The report goes to standard error, and the timed command's own status and output
+    /// pass through untouched — <c>time cmd</c> must be transparent to everything except
+    /// the extra three lines.
+    /// </remarks>
+    private async ValueTask<ExecResult> ExecuteTimedAsync(TimedCommand command, StreamData? stdin, CancellationToken cancellationToken)
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        var result = command.Body is null
+            ? ExecResult.Success
+            : await ExecuteAsync(command.Body, stdin, cancellationToken);
+
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(started);
+
+        return result with
+        {
+            Stderr = StreamData.Concat(result.Stderr, StreamData.FromText(FormatTiming(elapsed, command.Posix))),
+        };
+    }
+
+    private static string FormatTiming(TimeSpan elapsed, bool posix)
+    {
+        if (posix)
+        {
+            var seconds = elapsed.TotalSeconds.ToString("F2", CultureInfo.InvariantCulture);
+            return $"real {seconds}\nuser 0.00\nsys 0.00\n";
+        }
+
+        // There are no separate user and system times to report without processes, and
+        // claiming a number for them would be a fiction; bash's shape is kept, with zeros.
+        var minutes = (int)elapsed.TotalMinutes;
+        var rest = (elapsed.TotalSeconds - (minutes * 60)).ToString("F3", CultureInfo.InvariantCulture);
+        return $"\nreal\t{minutes}m{rest}s\nuser\t0m0.000s\nsys\t0m0.000s\n";
     }
 
     private async ValueTask<ExecResult> ExecuteListAsync(CommandList list, StreamData? stdin, CancellationToken cancellationToken)

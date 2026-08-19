@@ -33,10 +33,22 @@ public sealed class InputStream
     /// Consumes up to and including the next <paramref name="delimiter"/>, returning the
     /// text before it, or <see langword="null"/> at end of input.
     /// </summary>
-    public string? ReadLine(char delimiter)
+    public string? ReadLine(char delimiter) => ReadLine(delimiter, out _);
+
+    /// <summary>
+    /// Consumes up to and including the next <paramref name="delimiter"/>.
+    /// </summary>
+    /// <param name="delimiter">The character that ends a line.</param>
+    /// <param name="terminated">
+    /// Set to false for a final line that ran out of input before the delimiter, which is
+    /// what makes <c>read</c> report failure while still assigning what it found.
+    /// </param>
+    /// <returns>The text before the delimiter, or <see langword="null"/> at end of input.</returns>
+    public string? ReadLine(char delimiter, out bool terminated)
     {
         if (AtEnd)
         {
+            terminated = false;
             return null;
         }
 
@@ -44,14 +56,16 @@ public sealed class InputStream
 
         if (index < 0)
         {
-            // A final line with no delimiter is still a line.
+            // A final line with no delimiter is still a line, but an incomplete one.
             var tail = _text[_position..];
             _position = _text.Length;
+            terminated = false;
             return tail;
         }
 
         var line = _text[_position..index];
         _position = index + 1;
+        terminated = true;
         return line;
     }
 

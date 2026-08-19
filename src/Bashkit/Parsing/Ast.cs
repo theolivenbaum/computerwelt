@@ -168,6 +168,11 @@ public sealed record FunctionDef(string Name, Node Body) : Node
     public string? Source { get; init; }
 }
 
+/// <summary>A pipeline prefixed with the <c>time</c> keyword.</summary>
+/// <param name="Body">What to time, or <see langword="null"/> for a bare <c>time</c>.</param>
+/// <param name="Posix">True for <c>time -p</c>, which uses the plainer POSIX format.</param>
+public sealed record TimedCommand(Node? Body, bool Posix) : Node;
+
 /// <summary>A variable assignment.</summary>
 /// <param name="Name">The variable name.</param>
 /// <param name="Value">The assigned value.</param>

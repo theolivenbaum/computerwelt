@@ -199,6 +199,27 @@ public sealed class Parser
             _index++;
         }
 
+        // `time` is a keyword, not a command: it prefixes a whole pipeline, so it has to be
+        // recognised before the stages are parsed rather than as a command name.
+        if (IsKeyword(Current, "time"))
+        {
+            var timeStart = Current.Start;
+            _index++;
+
+            var posix = IsKeyword(Current, "-p");
+
+            if (posix)
+            {
+                _index++;
+            }
+
+            var timed = AtEnd || Current.Kind is TokenKind.Newline or TokenKind.Semicolon or TokenKind.RightParen
+                ? null
+                : ParsePipeline();
+
+            return new TimedCommand(timed, posix) { Span = new Span(timeStart, Current.Start - timeStart) };
+        }
+
         var stages = new List<Node> { ParseCommand() };
         var pipeStderr = new List<bool>();
 

@@ -288,20 +288,41 @@ public sealed class ReadBuiltin : IBuiltin
 
         // Reading consumes, so a loop over the same input advances rather than repeating.
         string? line;
+        bool terminated;
 
         if (context.Input is { } stream)
         {
-            line = stream.ReadLine(delimiter);
+            line = stream.ReadLine(delimiter, out terminated);
         }
         else
         {
             var input = context.StdinText;
             var newline = input.IndexOf(delimiter, StringComparison.Ordinal);
             line = input.Length == 0 ? null : newline < 0 ? input : input[..newline];
+            terminated = newline >= 0;
         }
+
+        var names = cursor.Operands;
 
         if (line is null)
         {
+            // At end of input the variables are cleared, which is what lets
+            // `while read line || [[ -n "$line" ]]` terminate instead of repeating.
+            foreach (var name in names)
+            {
+                context.State.Set(name, string.Empty);
+            }
+
+            if (arrayName is not null)
+            {
+                context.State.GetOrCreate(arrayName).SetArray([]);
+            }
+
+            if (names.Count == 0)
+            {
+                context.State.Set("REPLY", string.Empty);
+            }
+
             return ValueTask.FromResult(ExecResult.FromExitCode(1));
         }
 
@@ -315,44 +336,136 @@ public sealed class ReadBuiltin : IBuiltin
             line = RemoveBackslashes(line);
         }
 
-        var names = cursor.Operands;
+        // A final line with no delimiter is assigned but still reports failure.
+        var status = terminated ? 0 : 1;
 
         if (arrayName is not null)
         {
             var variable = context.State.GetOrCreate(arrayName);
             variable.SetArray(SplitFields(line, context.State.Ifs));
-            return ValueTask.FromResult(ExecResult.Success);
+            return ValueTask.FromResult(ExecResult.FromExitCode(status));
         }
 
         if (names.Count == 0)
         {
             context.State.Set("REPLY", line);
-            return ValueTask.FromResult(ExecResult.Success);
+            return ValueTask.FromResult(ExecResult.FromExitCode(status));
         }
 
-        var fields = SplitFields(line, context.State.Ifs);
-
-        for (var i = 0; i < names.Count; i++)
+        foreach (var (name, value) in names.Zip(SplitForNames(line, context.State.Ifs, names.Count)))
         {
-            // The last named variable receives every remaining field, joined by a space.
-            var value = i == names.Count - 1
-                ? string.Join(' ', fields.Skip(i))
-                : i < fields.Count ? fields[i] : string.Empty;
-
-            context.State.Set(names[i], value);
+            context.State.Set(name, value);
         }
 
-        return ValueTask.FromResult(ExecResult.Success);
+        return ValueTask.FromResult(ExecResult.FromExitCode(status));
     }
 
+    /// <summary>Splits a line into every field it holds, for <c>read -a</c>.</summary>
     private static List<string> SplitFields(string line, string ifs)
     {
-        if (ifs.Length == 0)
+        if (ifs.Length == 0 || line.Length == 0)
         {
-            return [line];
+            return line.Length == 0 ? [] : [line];
         }
 
-        return [.. line.Split(ifs.ToCharArray(), StringSplitOptions.RemoveEmptyEntries)];
+        // Asking for one more field than the line can hold yields them all, because the
+        // last one then has nothing left to absorb.
+        var fields = SplitForNames(line, ifs, line.Length + 1);
+
+        while (fields.Count > 0 && fields[^1].Length == 0)
+        {
+            fields.RemoveAt(fields.Count - 1);
+        }
+
+        return fields;
+    }
+
+    /// <summary>
+    /// Splits a line into exactly <paramref name="count"/> fields.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is not word splitting. <c>read</c> distinguishes the two kinds of <c>IFS</c>
+    /// character: a run of IFS <i>whitespace</i> is one delimiter, while an IFS
+    /// non-whitespace character always delimits, so <c>IFS=: read a b c d</c> over
+    /// <c>one::three:</c> finds an empty second field rather than collapsing it away.
+    /// </para>
+    /// <para>
+    /// The last variable takes the whole remainder, delimiters included, with only trailing
+    /// IFS whitespace removed — which is why <c>IFS=,: read a b</c> over <c>1,2:3</c>
+    /// leaves <c>b</c> holding <c>2:3</c>.
+    /// </para>
+    /// </remarks>
+    private static List<string> SplitForNames(string line, string ifs, int count)
+    {
+        var fields = new List<string>(count);
+
+        if (ifs.Length == 0)
+        {
+            fields.Add(line);
+
+            while (fields.Count < count)
+            {
+                fields.Add(string.Empty);
+            }
+
+            return fields;
+        }
+
+        bool IsWhitespace(char c) => char.IsWhiteSpace(c) && ifs.Contains(c, StringComparison.Ordinal);
+        bool IsSeparator(char c) => ifs.Contains(c, StringComparison.Ordinal);
+
+        var position = 0;
+
+        while (position < line.Length && IsWhitespace(line[position]))
+        {
+            position++;
+        }
+
+        while (fields.Count < count - 1)
+        {
+            if (position >= line.Length)
+            {
+                fields.Add(string.Empty);
+                continue;
+            }
+
+            var start = position;
+
+            while (position < line.Length && !IsSeparator(line[position]))
+            {
+                position++;
+            }
+
+            fields.Add(line[start..position]);
+
+            // A delimiter is optional IFS whitespace around at most one non-whitespace
+            // IFS character.
+            while (position < line.Length && IsWhitespace(line[position]))
+            {
+                position++;
+            }
+
+            if (position < line.Length && IsSeparator(line[position]))
+            {
+                position++;
+
+                while (position < line.Length && IsWhitespace(line[position]))
+                {
+                    position++;
+                }
+            }
+        }
+
+        var rest = position < line.Length ? line[position..] : string.Empty;
+
+        while (rest.Length > 0 && IsWhitespace(rest[^1]))
+        {
+            rest = rest[..^1];
+        }
+
+        fields.Add(rest);
+        return fields;
     }
 
     private static string RemoveBackslashes(string text)
