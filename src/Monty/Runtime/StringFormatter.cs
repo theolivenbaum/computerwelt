@@ -236,6 +236,8 @@ public static class StringFormatter
         }
 
         var parsed = FormatSpec.Parse(spec);
+        Validate(value, parsed, spec);
+
         var text = parsed.Type switch
         {
             'd' or 'n' => FormatInteger(value, parsed, 10, upper: false),
@@ -254,6 +256,84 @@ public static class StringFormatter
         };
 
         return Align(text, parsed, value);
+    }
+
+    /// <summary>
+    /// Rejects a spec the value cannot be formatted with.
+    /// </summary>
+    /// <remarks>
+    /// The order matters: CPython reports a grouping conflict before an unknown code, so
+    /// <c>{1:,k}</c> complains about the comma rather than about <c>k</c>.
+    /// </remarks>
+    private static void Validate(PyObject value, FormatSpec spec, string source)
+    {
+        var isString = value is PyStr;
+        var presentation = spec.Type == '\0' ? (isString ? 's' : '\0') : spec.Type;
+
+        if (spec.BothSeparators)
+        {
+            throw new PyRaise(PyErrors.ValueError("Cannot specify both ',' and '_'."));
+        }
+
+        // Grouping is only meaningful for the decimal presentations.
+        if (spec.Grouping != '\0' && presentation is not ('\0' or 'd' or 'n' or 'e' or 'E' or 'f' or 'F' or 'g' or 'G' or '%'))
+        {
+            throw new PyRaise(PyErrors.ValueError($"Cannot specify '{spec.Grouping}' with '{presentation}'."));
+        }
+
+        if (spec.Alternate)
+        {
+            if (isString || presentation == 's')
+            {
+                throw new PyRaise(PyErrors.ValueError("Alternate form (#) not allowed in string format specifier"));
+            }
+
+            if (presentation == 'c')
+            {
+                throw new PyRaise(PyErrors.ValueError(
+                    "Alternate form (#) not allowed with integer format specifier 'c'"));
+            }
+        }
+
+        if (isString && spec.Alignment == '=')
+        {
+            throw new PyRaise(PyErrors.ValueError("'=' alignment not allowed in string format specifier"));
+        }
+
+        if (spec.MissingPrecision)
+        {
+            throw new PyRaise(PyErrors.ValueError("Format specifier missing precision"));
+        }
+
+        if (spec.Tail.Length == 1)
+        {
+            throw new PyRaise(PyErrors.ValueError(
+                $"Unknown format code '{spec.Tail}' for object of type '{value.TypeName}'"));
+        }
+
+        if (spec.Tail.Length > 1)
+        {
+            throw new PyRaise(PyErrors.ValueError(
+                $"Invalid format specifier '{source}' for object of type '{value.TypeName}'"));
+        }
+
+        // A presentation the value's type does not offer is an unknown code for that type.
+        var known = value switch
+        {
+            PyStr => spec.Type is '\0' or 's' or 'r' or 'a',
+            PyBool or PyInt => spec.Type is '\0' or 'd' or 'n' or 'b' or 'o' or 'x' or 'X' or 'c'
+                or 'e' or 'E' or 'f' or 'F' or 'g' or 'G' or '%' or 'r' or 's' or 'a',
+            PyFloat => spec.Type is '\0' or 'e' or 'E' or 'f' or 'F' or 'g' or 'G' or 'n' or '%' or 'r' or 'a',
+            _ => true,
+        };
+
+        // `int` accepts `s` in `str.format` but not in an f-string spec; both spell the
+        // rejection the same way when the code does not apply.
+        if (!known || (value is PyInt and not PyBool && spec.Type == 's') || (value is PyStr && spec.Type == 'd'))
+        {
+            throw new PyRaise(PyErrors.ValueError(
+                $"Unknown format code '{spec.Type}' for object of type '{value.TypeName}'"));
+        }
     }
 
     private static string DefaultText(PyObject value, FormatSpec spec)
@@ -428,6 +508,18 @@ public static class StringFormatter
         int? Precision,
         char Type)
     {
+        /// <summary>The grouping applied to the fractional digits, from <c>._f</c>.</summary>
+        public char FractionGrouping { get; init; }
+
+        /// <summary>Whatever the spec had left over after the presentation type.</summary>
+        public string Tail { get; init; } = string.Empty;
+
+        /// <summary>True when a <c>.</c> was given with no precision after it.</summary>
+        public bool MissingPrecision { get; init; }
+
+        /// <summary>True when both separators appear, which is never allowed.</summary>
+        public bool BothSeparators { get; init; }
+
         public static FormatSpec Parse(string spec)
         {
             var i = 0;
@@ -474,25 +566,54 @@ public static class StringFormatter
             }
 
             var grouping = '\0';
+            var both = false;
+
             if (i < spec.Length && spec[i] is ',' or '_')
             {
                 grouping = spec[i++];
-            }
 
-            int? precision = null;
-            if (i < spec.Length && spec[i] == '.')
-            {
-                i++;
-                precision = 0;
-                while (i < spec.Length && char.IsAsciiDigit(spec[i]))
+                // A second, different separator is its own complaint; the same one twice
+                // falls through as an inapplicable presentation type.
+                if (i < spec.Length && spec[i] is ',' or '_' && spec[i] != grouping)
                 {
-                    precision = (precision * 10) + (spec[i++] - '0');
+                    both = true;
+                    i++;
                 }
             }
 
-            var type = i < spec.Length ? spec[i] : '\0';
+            int? precision = null;
+            var fractionGrouping = '\0';
+            var missingPrecision = false;
 
-            return new FormatSpec(fill, alignment, sign, alternate, zeroPad, width, grouping, precision, type);
+            if (i < spec.Length && spec[i] == '.')
+            {
+                i++;
+
+                // `.{_,}` groups the fractional digits and leaves the precision default.
+                if (i < spec.Length && spec[i] is ',' or '_')
+                {
+                    fractionGrouping = spec[i++];
+                }
+
+                var digits = i;
+
+                while (i < spec.Length && char.IsAsciiDigit(spec[i]))
+                {
+                    precision = ((precision ?? 0) * 10) + (spec[i++] - '0');
+                }
+
+                missingPrecision = i == digits && fractionGrouping == '\0';
+            }
+
+            var type = i < spec.Length ? spec[i++] : '\0';
+
+            return new FormatSpec(fill, alignment, sign, alternate, zeroPad, width, grouping, precision, type)
+            {
+                FractionGrouping = fractionGrouping,
+                Tail = spec[i..],
+                MissingPrecision = missingPrecision,
+                BothSeparators = both,
+            };
         }
     }
 }
