@@ -197,6 +197,7 @@ public static class TypeRegistry
         PyBytes => Bytes,
         PyList => List,
         PyTuple => Tuple,
+        PySet { IsFrozen: true } => FrozenSet,
         PySet => Set,
         PyDict => Dict,
         PyRange => Range,

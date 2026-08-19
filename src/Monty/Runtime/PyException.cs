@@ -224,6 +224,18 @@ public sealed class PyExceptionType : PyObject
     /// <summary><c>FileNotFoundError</c>.</summary>
     public static PyExceptionType FileNotFoundError { get; } = Define("FileNotFoundError", OSError);
 
+    /// <summary><c>FileExistsError</c>.</summary>
+    public static PyExceptionType FileExistsError { get; } = Define("FileExistsError", OSError);
+
+    /// <summary><c>IsADirectoryError</c>.</summary>
+    public static PyExceptionType IsADirectoryError { get; } = Define("IsADirectoryError", OSError);
+
+    /// <summary><c>NotADirectoryError</c>.</summary>
+    public static PyExceptionType NotADirectoryError { get; } = Define("NotADirectoryError", OSError);
+
+    /// <summary><c>PermissionError</c>.</summary>
+    public static PyExceptionType PermissionError { get; } = Define("PermissionError", OSError);
+
     /// <summary><c>UnicodeDecodeError</c>.</summary>
     public static PyExceptionType UnicodeDecodeError { get; } = Define("UnicodeDecodeError", ValueError);
 

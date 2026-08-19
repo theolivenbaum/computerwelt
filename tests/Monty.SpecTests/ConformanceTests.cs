@@ -71,7 +71,13 @@ public sealed class ConformanceTests(ITestOutputHelper output)
 
         try
         {
-            var runner = new MontyRunner();
+            var runner = new MontyRunner { FileSystem = new FixtureFileSystem() };
+
+            // A `# mount-fs` fixture expects `root` bound to the mounted tree.
+            if (fixture.Source.Contains("# mount-fs", StringComparison.Ordinal))
+            {
+                runner.Variables["root"] = new Monty.Modules.PyPath("/mnt", runner.FileSystem);
+            }
 
             // Fixtures marked `# call-external` exercise the host boundary, and upstream's
             // harness supplies the same named functions.

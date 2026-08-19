@@ -27,6 +27,7 @@ public sealed class Compiler
     private readonly HashSet<string> _globalDeclarations = new(StringComparer.Ordinal);
     private readonly HashSet<string> _nonlocalDeclarations = new(StringComparer.Ordinal);
     private readonly List<LoopContext> _loops = [];
+    private readonly List<FinallyContext> _finallies = [];
     private readonly bool _isFunctionScope;
 
     private Compiler(string name, string fileName, Compiler? parent, bool isFunctionScope)
@@ -46,9 +47,17 @@ public sealed class Compiler
         return compiler._code;
     }
 
+    /// <summary>A <c>finally</c> whose body a jump out of the block still owes.</summary>
+    /// <param name="Body">The cleanup statements.</param>
+    /// <param name="LoopDepth">How many loops were open when the block was entered.</param>
+    private sealed record FinallyContext(IReadOnlyList<Statement> Body, int LoopDepth);
+
     private sealed record LoopContext(List<int> BreakJumps, List<int> ContinueJumps, int ContinueTarget)
     {
         public int ContinueTarget { get; set; } = ContinueTarget;
+
+        /// <summary>True for a <c>for</c>, which keeps its iterator on the value stack.</summary>
+        public bool HasIterator { get; init; }
     }
 
     private int Emit(OpCode opCode, int operand, int line)
@@ -448,6 +457,15 @@ public sealed class Compiler
                     throw new PythonSyntaxError("'break' outside loop", breakStatement.Line, breakStatement.Column);
                 }
 
+                UnwindFinallies(breakStatement.Line);
+
+                // A `for` leaves its iterator on the stack for the whole loop, and only the
+                // exhaustion path pops it — so a `break` has to pop it itself.
+                if (_loops[^1].HasIterator)
+                {
+                    Emit(OpCode.Pop, 0, breakStatement.Line);
+                }
+
                 _loops[^1].BreakJumps.Add(Emit(OpCode.Jump, 0, breakStatement.Line));
                 break;
 
@@ -457,6 +475,7 @@ public sealed class Compiler
                     throw new PythonSyntaxError("'continue' not properly in loop", continueStatement.Line, continueStatement.Column);
                 }
 
+                UnwindFinallies(continueStatement.Line);
                 _loops[^1].ContinueJumps.Add(Emit(OpCode.Jump, 0, continueStatement.Line));
                 break;
 
@@ -689,7 +708,7 @@ public sealed class Compiler
 
         CompileStoreTarget(loop.Target, loop.Line);
 
-        var context = new LoopContext([], [], top);
+        var context = new LoopContext([], [], top) { HasIterator = true };
         _loops.Add(context);
         CompileStatements(loop.Body);
         _loops.RemoveAt(_loops.Count - 1);
@@ -700,8 +719,8 @@ public sealed class Compiler
 
         CompileStatements(loop.OrElse);
 
-        // `break` skips the `else` and lands after it, with the iterator already popped
-        // by ForIterate's exhaustion path — so break targets must pop it themselves.
+        // `break` skips the `else` and lands after it, having popped the iterator itself —
+        // the exhaustion path through `ForIterate` pops it on the other route.
         var afterElse = Here;
         PatchAll(context.BreakJumps, afterElse);
     }
@@ -717,17 +736,47 @@ public sealed class Compiler
         CompileTryExcept(tryStatement);
     }
 
+    /// <summary>
+    /// Runs the cleanup owed to every <c>finally</c> the jump is leaving.
+    /// </summary>
+    /// <remarks>
+    /// <c>break</c> and <c>continue</c> leave a <c>try</c> block just as <c>return</c>
+    /// does, so their finallys have to run before the jump — otherwise the cleanup a script
+    /// wrote is silently skipped, which is exactly the bug <c>finally</c> exists to prevent.
+    /// </remarks>
+    private void UnwindFinallies(int line)
+    {
+        for (var i = _finallies.Count - 1; i >= 0; i--)
+        {
+            if (_finallies[i].LoopDepth != _loops.Count)
+            {
+                break;
+            }
+
+            Emit(OpCode.PopBlock, 0, line);
+            CompileStatements(_finallies[i].Body);
+        }
+    }
+
     private void CompileTryFinally(Try tryStatement)
     {
         var setup = Emit(OpCode.SetupFinally, 0, tryStatement.Line);
+        _finallies.Add(new FinallyContext(tryStatement.FinallyBody, _loops.Count));
 
-        if (tryStatement.Handlers.Count > 0 || tryStatement.OrElse.Count > 0)
+        try
         {
-            CompileTryExcept(tryStatement);
+            if (tryStatement.Handlers.Count > 0 || tryStatement.OrElse.Count > 0)
+            {
+                CompileTryExcept(tryStatement);
+            }
+            else
+            {
+                CompileStatements(tryStatement.Body);
+            }
         }
-        else
+        finally
         {
-            CompileStatements(tryStatement.Body);
+            _finallies.RemoveAt(_finallies.Count - 1);
         }
 
         Emit(OpCode.PopBlock, 0, tryStatement.Line);

@@ -57,8 +57,12 @@ public sealed class PythonBuiltin : IBuiltin
         });
 
         // The filesystem modules close over the shell's state, so `os.getcwd()` follows a
-        // `cd` that happened earlier in the same script.
-        runner.Modules["os"] = PythonFileSystem.CreateOsModule(context.FileSystem, () => context.State.WorkingDirectory);
+        // `cd` that happened earlier in the same script, and `open` reads the same files
+        // the surrounding shell commands wrote.
+        runner.FileSystem = new ShellFileSystem(
+            context.FileSystem,
+            () => context.State.WorkingDirectory,
+            () => context.State.ExportedEnvironment());
 
         foreach (var (name, module) in _options.AdditionalModules)
         {
@@ -69,8 +73,6 @@ public sealed class PythonBuiltin : IBuiltin
         {
             runner.ExternalFunctions[name] = function;
         }
-
-        runner.ExternalFunctions["open"] = BuildOpen(context);
 
         var result = runner.Run(source!, scriptName);
         _ = arguments;
@@ -90,12 +92,6 @@ public sealed class PythonBuiltin : IBuiltin
             Stderr = StreamData.FromText(result.Stderr + result.Traceback + "\n"),
             ExitCode = ExitCodes.Failure,
         };
-    }
-
-    private static Func<PyObject[], PyObject> BuildOpen(BuiltinContext context)
-    {
-        var open = PythonFileSystem.CreateOpen(context.FileSystem, () => context.State.WorkingDirectory);
-        return arguments => ((PyBuiltinFunction)open).Invoke(arguments);
     }
 
     private static async ValueTask<(string? Source, string ScriptName, List<string> Arguments, ExecResult? Error)>

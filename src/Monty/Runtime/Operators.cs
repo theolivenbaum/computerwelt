@@ -268,6 +268,13 @@ public static class Operators
 
     private static PyObject TrueDivide(PyObject left, PyObject right)
     {
+        // `Path('/usr') / 'local'` is the idiomatic way to build a path, and `str / Path`
+        // works too because Path defines the reflected operator.
+        if (left is Modules.PyPath || right is Modules.PyPath)
+        {
+            return JoinPaths(left, right);
+        }
+
         if (!TryNumbers(left, right, out var a, out var b, out _))
         {
             throw new PyRaise(PyErrors.TypeError(
@@ -281,6 +288,23 @@ public static class Operators
 
         return new PyFloat(a / b);
     }
+
+    private static PyObject JoinPaths(PyObject left, PyObject right)
+    {
+        var names = $"'{left.TypeName}' and '{right.TypeName}'";
+        var head = Segment(left, names);
+        var tail = Segment(right, names);
+
+        var fileSystem = (left as Modules.PyPath)?.FileSystem ?? (right as Modules.PyPath)?.FileSystem;
+        return new Modules.PyPath(Modules.PyPath.Join(head, tail), fileSystem);
+    }
+
+    private static string Segment(PyObject value, string names) => value switch
+    {
+        Modules.PyPath path => path.Value,
+        PyStr text => text.Value,
+        _ => throw new PyRaise(PyErrors.TypeError($"unsupported operand type(s) for /: {names}")),
+    };
 
     private static PyObject FloorDivide(PyObject left, PyObject right)
     {

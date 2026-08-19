@@ -36,6 +36,22 @@ public sealed class MontyRunner
     public Dictionary<string, Func<PyObject[], PyObject>> ExternalFunctions { get; } =
         new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The filesystem the program can reach, or <see langword="null"/> for none.
+    /// </summary>
+    /// <remarks>
+    /// With no filesystem, <c>os</c> and <c>pathlib</c> are not importable and <c>open</c>
+    /// is not defined — the sandbox says there is nothing there rather than offering an
+    /// interface that always fails.
+    /// </remarks>
+    public IPyFileSystem? FileSystem { get; set; }
+
+    /// <summary>The clock the sandbox reads, which a host may fix for reproducibility.</summary>
+    public TimeProvider? TimeProvider { get; set; }
+
+    /// <summary>Values the host defines in the program's global namespace before it runs.</summary>
+    public Dictionary<string, PyObject> Variables { get; } = new(StringComparer.Ordinal);
+
     /// <summary>Runs <paramref name="source"/> and reports what happened.</summary>
     public RunResult Run(string source, string fileName = "<stdin>")
     {
@@ -52,9 +68,15 @@ public sealed class MontyRunner
             builtins.Set(key, value);
         }
 
-        foreach (var (name, module) in Monty.Modules.StandardLibrary.Create(machine))
+        foreach (var (name, module) in Monty.Modules.StandardLibrary.Create(machine, TimeProvider, FileSystem))
         {
             machine.Modules[name] = module;
+        }
+
+        // `open` exists only when there is somewhere to open a file.
+        if (FileSystem is { } fileSystem)
+        {
+            builtins.Set(new PyStr("open"), Monty.Modules.OsModule.CreateOpen(fileSystem));
         }
 
         // Host-supplied modules override the standard set, so an embedder can substitute
@@ -67,6 +89,11 @@ public sealed class MontyRunner
         foreach (var (name, implementation) in ExternalFunctions)
         {
             globals.Set(new PyStr(name), new PyBuiltinFunction(name, implementation));
+        }
+
+        foreach (var (name, value) in Variables)
+        {
+            globals.Set(new PyStr(name), value);
         }
 
         globals.Set(new PyStr("__name__"), new PyStr("__main__"));
