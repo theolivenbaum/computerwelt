@@ -2,13 +2,13 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <RootNamespace>Bashkit.Cli</RootNamespace>
-    <AssemblyName>Bashkit.Cli</AssemblyName>
+    <RootNamespace>Computerwelt.Cli</RootNamespace>
+    <AssemblyName>Computerwelt.Cli</AssemblyName>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../Bashkit/Bashkit.csproj" />
+    <ProjectReference Include="../Computerwelt/Computerwelt.csproj" />
   </ItemGroup>
 
 </Project>

@@ -1197,7 +1197,11 @@ public sealed class VirtualMachine
         return values;
     }
 
-    internal static IEnumerable<PyObject> RequireIterable(PyObject value) =>
+    /// <summary>
+    /// Iterates <paramref name="value"/>, raising a <c>TypeError</c> when it is not
+    /// iterable.
+    /// </summary>
+    public static IEnumerable<PyObject> RequireIterable(PyObject value) =>
         value.Iterate()
         ?? (value as PyGenerator)?.Iterate()
         ?? throw new PyRaise(PyErrors.TypeError($"'{value.TypeName}' object is not iterable"));

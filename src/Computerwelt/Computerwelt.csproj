@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Computerwelt</RootNamespace>
+    <AssemblyName>Computerwelt</AssemblyName>
+    <PackageId>Computerwelt</PackageId>
+    <Description>Sandboxed shell and Python runtime sharing one virtual filesystem.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Bashkit/Bashkit.csproj" />
+    <ProjectReference Include="../Monty/Monty.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Computerwelt.Tests" />
+  </ItemGroup>
+
+</Project>

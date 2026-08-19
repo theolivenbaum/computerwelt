@@ -124,7 +124,7 @@ public static class JsonModule
                 builder.Append(',');
             }
 
-            NewLine(builder, indent, depth + 1);
+            NewLine(builder, indent, depth + 1, afterComma: i > 0);
             Write(builder, items[i], indent, depth + 1, sortKeys);
         }
 
@@ -156,9 +156,9 @@ public static class JsonModule
                 builder.Append(',');
             }
 
-            NewLine(builder, indent, depth + 1);
+            NewLine(builder, indent, depth + 1, afterComma: i > 0);
             WriteString(builder, KeyText(entries[i].Key));
-            builder.Append(indent is null ? ": " : ": ");
+            builder.Append(": ");
             Write(builder, entries[i].Value, indent, depth + 1, sortKeys);
         }
 
@@ -176,10 +176,19 @@ public static class JsonModule
         _ => throw new PyRaise(PyErrors.TypeError($"keys must be str, int, float, bool or None, not {key.TypeName}")),
     };
 
-    private static void NewLine(StringBuilder builder, int? indent, int depth)
+    /// <summary>
+    /// Writes the break between items: a newline and indent when indenting, and a single
+    /// space otherwise — Python's default separator is <c>", "</c>, not <c>","</c>.
+    /// </summary>
+    private static void NewLine(StringBuilder builder, int? indent, int depth, bool afterComma = false)
     {
         if (indent is not { } spaces)
         {
+            if (afterComma)
+            {
+                builder.Append(' ');
+            }
+
             return;
         }
 

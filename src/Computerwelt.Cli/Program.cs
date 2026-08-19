@@ -1,4 +1,5 @@
 using Bashkit;
+using Computerwelt;
 
 // A thin driver over the library: enough to try a script by hand and to smoke-test the
 // runtime without a test host. It deliberately exposes no capability the library does not
@@ -8,19 +9,21 @@ var arguments = args;
 if (arguments.Length > 0 && arguments[0] is "-h" or "--help")
 {
     Console.WriteLine("""
-        bashkit — sandboxed bash
+        computerwelt — sandboxed bash with an embedded Python
 
-          bashkit -c <script> [args...]   run a script given on the command line
-          bashkit <file> [args...]        run a script from the virtual filesystem
-          bashkit                         start a REPL
+          computerwelt -c <script> [args...]   run a script given on the command line
+          computerwelt <file> [args...]        run a script from the virtual filesystem
+          computerwelt                         start a REPL
 
-        The filesystem is virtual and empty at startup. Nothing on the host is reachable.
+        The `python` command runs against the same virtual filesystem as the shell.
+        That filesystem is empty at startup, and nothing on the host is reachable.
         """);
     return 0;
 }
 
 var bash = Bash.CreateBuilder()
     .WithWorkingDirectory("/home/user")
+    .WithPython()
     .Build();
 
 await bash.FileSystem.CreateDirectoryAsync("/home/user", recursive: true);
@@ -37,7 +40,7 @@ if (arguments.Length >= 1)
 
     if (!await bash.FileSystem.ExistsAsync(path))
     {
-        Console.Error.WriteLine($"bashkit: {arguments[0]}: No such file or directory");
+        Console.Error.WriteLine($"computerwelt: {arguments[0]}: No such file or directory");
         return ExitCodes.NotFound;
     }
 
@@ -59,7 +62,7 @@ static async Task<int> RunAsync(Bash bash, string script, ExecOptions options)
 
 static async Task<int> RunReplAsync(Bash bash)
 {
-    Console.WriteLine("bashkit — sandboxed bash. Ctrl-D or `exit` to quit.");
+    Console.WriteLine("computerwelt — sandboxed bash + python. Ctrl-D or `exit` to quit.");
 
     while (true)
     {

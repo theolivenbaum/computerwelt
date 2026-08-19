@@ -1,13 +1,15 @@
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/Bashkit.Cli/Bashkit.Cli.csproj" />
+    <Project Path="src/Computerwelt.Cli/Computerwelt.Cli.csproj" />
     <Project Path="src/Bashkit/Bashkit.csproj" />
+    <Project Path="src/Computerwelt/Computerwelt.csproj" />
     <Project Path="src/Monty.Cli/Monty.Cli.csproj" />
     <Project Path="src/Monty/Monty.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Bashkit.SpecTests/Bashkit.SpecTests.csproj" />
     <Project Path="tests/Bashkit.Tests/Bashkit.Tests.csproj" />
+    <Project Path="tests/Computerwelt.Tests/Computerwelt.Tests.csproj" />
     <Project Path="tests/Monty.SpecTests/Monty.SpecTests.csproj" />
   </Folder>
 </Solution>
