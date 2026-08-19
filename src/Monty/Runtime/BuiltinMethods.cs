@@ -156,7 +156,7 @@ public static class BuiltinMethods
                 });
 
             case "join":
-                return Method(name, receiver, 1, static (self, arguments, _) =>
+                return Method(name, receiver, 1, 1, static (self, arguments, _) =>
                 {
                     var separator = ((PyStr)self).Value;
                     var builder = new StringBuilder();
@@ -383,6 +383,12 @@ public static class BuiltinMethods
                 {
                     var text = ((PyStr)self).Value;
                     var separator = Text(arguments[0], name, 1);
+
+                    if (separator.Length == 0)
+                    {
+                        throw new PyRaise(PyErrors.ValueError("empty separator"));
+                    }
+
                     var found = name == "partition"
                         ? text.IndexOf(separator, StringComparison.Ordinal)
                         : text.LastIndexOf(separator, StringComparison.Ordinal);
@@ -586,14 +592,14 @@ public static class BuiltinMethods
                 return Method(name, receiver, static (self, _, _) => new PyList([.. ((PyList)self).Items]));
 
             case "index":
-                return Method(name, receiver, 1, static (self, arguments, _) =>
+                return Method(name, receiver, 1, 3, static (self, arguments, _) =>
                 {
                     var items = ((PyList)self).Items;
-                    var index = items.FindIndex(item => item.PyEquals(arguments[0]));
+                    var index = IndexOf(items, arguments);
 
                     return index >= 0
                         ? new PyInt(index)
-                        : throw new PyRaise(PyErrors.ValueError($"{arguments[0].Repr()} is not in list"));
+                        : throw new PyRaise(PyErrors.ValueError("list.index(x): x not in list"));
                 });
 
             case "count":
@@ -919,6 +925,38 @@ public static class BuiltinMethods
         }
     }
 
+    /// <summary>
+    /// Finds a value in a sequence, honouring the optional <c>start</c> and <c>end</c>
+    /// bounds, or -1 when it is not there.
+    /// </summary>
+    /// <remarks>
+    /// The bounds are clamped rather than validated: <c>index(x, 5, 2)</c> over a
+    /// three-element list searches an empty range and reports "not in list", where indexing
+    /// the underlying storage with those numbers would fault.
+    /// </remarks>
+    private static int IndexOf(IReadOnlyList<PyObject> items, PyObject[] arguments)
+    {
+        var start = arguments.Length > 1 ? Bound(arguments[1], items.Count) : 0;
+        var end = arguments.Length > 2 ? Bound(arguments[2], items.Count) : items.Count;
+
+        for (var i = start; i < end; i++)
+        {
+            if (items[i].PyEquals(arguments[0]))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>Resolves a sequence bound, counting a negative one from the end.</summary>
+    private static int Bound(PyObject value, int length)
+    {
+        var index = value is PyInt integer ? integer.ToIndex() : 0;
+        return Math.Clamp(index < 0 ? length + index : index, 0, length);
+    }
+
     // ---- tuple, bytes, int, float ----
 
     private static PyObject? BindTuple(PyObject receiver, string name) => name switch
@@ -926,19 +964,13 @@ public static class BuiltinMethods
         "count" => Method(name, receiver, 1, static (self, arguments, _) =>
             new PyInt(((PyTuple)self).Items.Count(item => item.PyEquals(arguments[0])))),
 
-        "index" => Method(name, receiver, 1, static (self, arguments, _) =>
+        "index" => Method(name, receiver, 1, 3, static (self, arguments, _) =>
         {
-            var items = ((PyTuple)self).Items;
+            var index = IndexOf(((PyTuple)self).Items, arguments);
 
-            for (var i = 0; i < items.Count; i++)
-            {
-                if (items[i].PyEquals(arguments[0]))
-                {
-                    return new PyInt(i);
-                }
-            }
-
-            throw new PyRaise(PyErrors.ValueError($"tuple.index(x): x not in tuple"));
+            return index >= 0
+                ? new PyInt(index)
+                : throw new PyRaise(PyErrors.ValueError("tuple.index(x): x not in tuple"));
         }),
 
         _ => null,

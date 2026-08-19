@@ -232,7 +232,10 @@ public static class TypeRegistry
                 return builtin.Matches(value);
 
             default:
-                return false;
+                // Anything else is not a type at all, and asking about it is a mistake in
+                // the call rather than a false answer.
+                throw new PyRaise(PyErrors.TypeError(
+                    "isinstance() arg 2 must be a type, a tuple of types, or a union"));
         }
     }
 
