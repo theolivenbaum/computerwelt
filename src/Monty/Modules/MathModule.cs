@@ -6,6 +6,32 @@ namespace Monty.Modules;
 /// <summary>The <c>math</c> module.</summary>
 public static class MathModule
 {
+    /// <summary>
+    /// Rejects an infinite input, which the trigonometric functions have no answer for.
+    /// </summary>
+    private static double Bounded(double value) =>
+        double.IsInfinity(value)
+            ? throw new PyRaise(PyErrors.ValueError($"expected a finite input, got {Describe(value)}"))
+            : value;
+
+    /// <summary>Rejects an input outside -1..1, which <c>asin</c> and <c>acos</c> require.</summary>
+    private static double InUnitRange(double value) =>
+        value is < -1 or > 1
+            ? throw new PyRaise(PyErrors.ValueError(
+                $"expected a number in range from -1 up to 1, got {Describe(value)}"))
+            : value;
+
+    /// <summary>Reports an overflow when a finite input produced an infinite result.</summary>
+    private static double Finite(double result) =>
+        double.IsInfinity(result)
+            ? throw new PyRaise(new PyException(PyExceptionType.OverflowError, "math range error"))
+            : result;
+
+    private static string Describe(double value) =>
+        double.IsPositiveInfinity(value) ? "inf"
+        : double.IsNegativeInfinity(value) ? "-inf"
+        : PyFloat.Format(value);
+
     /// <summary>Builds the module.</summary>
     public static PyModuleObject Create()
     {
@@ -20,15 +46,17 @@ public static class MathModule
         Unary(module, "sqrt", value =>
             value < 0 ? throw new PyRaise(PyErrors.ValueError("math domain error")) : Math.Sqrt(value));
 
-        Unary(module, "exp", Math.Exp);
-        Unary(module, "sin", Math.Sin);
-        Unary(module, "cos", Math.Cos);
-        Unary(module, "tan", Math.Tan);
-        Unary(module, "asin", Math.Asin);
-        Unary(module, "acos", Math.Acos);
+        // CPython checks the domain before calling libm and reports precisely what was
+        // wrong, so a script sees ValueError rather than a silent nan flowing onward.
+        Unary(module, "exp", value => Finite(Math.Exp(value)));
+        Unary(module, "sin", value => Math.Sin(Bounded(value)));
+        Unary(module, "cos", value => Math.Cos(Bounded(value)));
+        Unary(module, "tan", value => Math.Tan(Bounded(value)));
+        Unary(module, "asin", value => Math.Asin(InUnitRange(value)));
+        Unary(module, "acos", value => Math.Acos(InUnitRange(value)));
         Unary(module, "atan", Math.Atan);
-        Unary(module, "sinh", Math.Sinh);
-        Unary(module, "cosh", Math.Cosh);
+        Unary(module, "sinh", value => Finite(Math.Sinh(value)));
+        Unary(module, "cosh", value => Finite(Math.Cosh(value)));
         Unary(module, "tanh", Math.Tanh);
         Unary(module, "degrees", static value => value * 180 / Math.PI);
         Unary(module, "radians", static value => value * Math.PI / 180);
@@ -48,7 +76,20 @@ public static class MathModule
                 throw new PyRaise(PyErrors.ValueError("math domain error"));
             }
 
-            return new PyFloat(arguments.Length > 1 ? Math.Log(value, ToDouble(arguments[1])) : Math.Log(value));
+            if (arguments.Length <= 1)
+            {
+                return new PyFloat(Math.Log(value));
+            }
+
+            var logarithm = Math.Log(ToDouble(arguments[1]));
+
+            // `log(x, 1)` divides by log(1), which is zero.
+            if (logarithm == 0)
+            {
+                throw new PyRaise(new PyException(PyExceptionType.ZeroDivisionError, "division by zero"));
+            }
+
+            return new PyFloat(Math.Log(value) / logarithm);
         });
 
         module.Add("atan2", static arguments =>
@@ -58,7 +99,14 @@ public static class MathModule
             new PyFloat(Math.Sqrt(arguments.Sum(a => ToDouble(a) * ToDouble(a)))));
 
         module.Add("pow", static arguments =>
-            new PyFloat(Math.Pow(ToDouble(arguments[0]), ToDouble(arguments[1]))));
+        {
+            var result = Math.Pow(ToDouble(arguments[0]), ToDouble(arguments[1]));
+
+            // A negative base with a fractional exponent has no real result.
+            return double.IsNaN(result) && !double.IsNaN(ToDouble(arguments[0]))
+                ? throw new PyRaise(PyErrors.ValueError("math domain error"))
+                : new PyFloat(Finite(result));
+        });
 
         // floor, ceil and trunc return int in Python 3, not float — and an infinite or
         // NaN input is an OverflowError or ValueError, not a host crash.

@@ -139,16 +139,19 @@ public static class TypeRegistry
     /// <summary><c>set</c>.</summary>
     public static PyType Set { get; } = Define(
         "set",
-        static value => value is PySet,
+        static value => value is PySet { IsFrozen: false },
         static (arguments, _) => new PySet(
             arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0])));
 
     /// <summary><c>frozenset</c>.</summary>
     public static PyType FrozenSet { get; } = Define(
         "frozenset",
-        static value => value is PySet,
+        static value => value is PySet { IsFrozen: true },
         static (arguments, _) => new PySet(
-            arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0])));
+            arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0]))
+        {
+            IsFrozen = true,
+        });
 
     /// <summary><c>dict</c>.</summary>
     public static PyType Dict { get; } = Define("dict", static value => value is PyDict, BuildDict);

@@ -512,8 +512,14 @@ public sealed class PySet : PyObject
         }
     }
 
+    /// <summary>
+    /// True for a <c>frozenset</c>, which differs from a set only in being immutable and
+    /// therefore hashable.
+    /// </summary>
+    public bool IsFrozen { get; init; }
+
     /// <inheritdoc />
-    public override string TypeName => "set";
+    public override string TypeName => IsFrozen ? "frozenset" : "set";
 
     /// <summary>The members, in insertion order.</summary>
     public IReadOnlyCollection<PyObject> Items => _items.Values;
@@ -534,9 +540,37 @@ public sealed class PySet : PyObject
     public override bool Contains(PyObject item) => _items.ContainsKey(new PyKey(item));
 
     /// <inheritdoc />
-    public override string Repr() =>
-        // There is no empty-set literal; `set()` is the only way to write one.
-        _items.Count == 0 ? "set()" : "{" + string.Join(", ", _items.Values.Select(static i => i.Repr())) + "}";
+    public override string Repr()
+    {
+        // There is no empty-set literal; `set()` is the only way to write one. A frozenset
+        // always names its type, since `{1, 2}` would read back as a set.
+        if (_items.Count == 0)
+        {
+            return IsFrozen ? "frozenset()" : "set()";
+        }
+
+        var members = "{" + string.Join(", ", _items.Values.Select(static i => i.Repr())) + "}";
+        return IsFrozen ? "frozenset(" + members + ")" : members;
+    }
+
+    /// <inheritdoc />
+    public override BigInteger PyHash()
+    {
+        if (!IsFrozen)
+        {
+            return base.PyHash();
+        }
+
+        // Order must not matter, so the members' hashes are combined commutatively.
+        var hash = BigInteger.Zero;
+
+        foreach (var item in _items.Values)
+        {
+            hash ^= item.PyHash();
+        }
+
+        return hash;
+    }
 
     /// <inheritdoc />
     public override bool PyEquals(PyObject other) =>
@@ -651,4 +685,60 @@ public sealed class PyRange : PyObject
 
         return new PyInt(Start + (position * Step));
     }
+}
+
+/// <summary>
+/// A <c>dict_keys</c>, <c>dict_values</c> or <c>dict_items</c> view.
+/// </summary>
+/// <remarks>
+/// A view is not a list, and the difference is observable: its type name appears in error
+/// messages and <c>repr</c>, and the key and item views take part in the set operators
+/// while the value view does not.
+/// </remarks>
+public sealed class PyView : PyObject
+{
+    private readonly List<PyObject> _items;
+
+    /// <summary>Creates a view.</summary>
+    /// <param name="typeName">The Python type name, such as <c>dict_keys</c>.</param>
+    /// <param name="items">The members.</param>
+    /// <param name="isSetLike">Whether the view supports the set operators.</param>
+    public PyView(string typeName, IEnumerable<PyObject> items, bool isSetLike)
+    {
+        TypeName = typeName;
+        _items = [.. items];
+        IsSetLike = isSetLike;
+    }
+
+    /// <inheritdoc />
+    public override string TypeName { get; }
+
+    /// <summary>Whether this view participates in the set operators.</summary>
+    public bool IsSetLike { get; }
+
+    /// <inheritdoc />
+    public override int? Length() => _items.Count;
+
+    /// <inheritdoc />
+    public override bool IsTruthy() => _items.Count > 0;
+
+    /// <inheritdoc />
+    public override IEnumerable<PyObject>? Iterate() => _items;
+
+    /// <inheritdoc />
+    public override bool Contains(PyObject item) => _items.Any(candidate => candidate.PyEquals(item));
+
+    /// <inheritdoc />
+    public override string Repr() =>
+        TypeName + "([" + string.Join(", ", _items.Select(static i => i.Repr())) + "])";
+
+    /// <inheritdoc />
+    public override bool PyEquals(PyObject other) => other switch
+    {
+        PyView view => _items.Count == view._items.Count
+            && _items.All(item => view._items.Any(item.PyEquals)),
+
+        PySet set => _items.Count == set.Count && _items.All(set.Contains),
+        _ => false,
+    };
 }

@@ -168,9 +168,9 @@ public static class BuiltinNamespace
             return new PyIterator(items);
         });
 
-        DefineArity("sum", 1, 2, static arguments =>
+        Define("sum", static (arguments, keywords) =>
         {
-            PyObject total = arguments.Length > 1 ? arguments[1] : new PyInt(0);
+            var total = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "start") ?? new PyInt(0);
 
             foreach (var item in VirtualMachine.RequireIterable(arguments[0]))
             {
@@ -196,17 +196,22 @@ public static class BuiltinNamespace
         DefineArity("any", 1, 1, static arguments =>
             PyBool.Of(VirtualMachine.RequireIterable(arguments[0]).Any(static item => item.IsTruthy())));
 
-        DefineArity("round", 1, 2, static arguments =>
+        // Both of round's parameters are keyword-capable in CPython.
+        Define("round", static (arguments, keywords) =>
         {
-            var digits = arguments.Length > 1 ? (int)RequireInt(arguments[1], "round") : 0;
+            var number = arguments.Length > 0 ? arguments[0] : Keyword(keywords, "number")
+                ?? throw new PyRaise(PyErrors.TypeError("round() missing required argument 'number'"));
 
-            return arguments[0] switch
+            var given = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "ndigits");
+            var digits = given is null or PyNone ? 0 : (int)RequireInt(given, "round");
+
+            return number switch
             {
                 PyInt integer when digits >= 0 => integer,
                 // Python rounds half to even, unlike the usual half-away-from-zero.
-                PyFloat number => digits == 0 && arguments.Length < 2
-                    ? new PyInt(new BigInteger(Math.Round(number.Value, MidpointRounding.ToEven)))
-                    : new PyFloat(Math.Round(number.Value, digits, MidpointRounding.ToEven)),
+                PyFloat value => given is null or PyNone
+                    ? new PyInt(new BigInteger(Math.Round(value.Value, MidpointRounding.ToEven)))
+                    : new PyFloat(Math.Round(value.Value, digits, MidpointRounding.ToEven)),
                 PyInt integer => new PyInt(integer.Value),
                 var other => throw new PyRaise(PyErrors.TypeError(
                     $"type {other.TypeName} doesn't define __round__ method")),
@@ -267,9 +272,21 @@ public static class BuiltinNamespace
             }));
 
         DefineArity("iter", 1, 2, static arguments =>
-            arguments[0] is PyIterator or PyGenerator
-                ? arguments[0]
-                : new PyIterator(VirtualMachine.RequireIterable(arguments[0])));
+        {
+            if (arguments[0] is PyIterator or PyGenerator)
+            {
+                return arguments[0];
+            }
+
+            // A class whose `__iter__` returns self must come back unwrapped: `iter(c) is c`
+            // is the contract every hand-written iterator relies on.
+            if (arguments[0] is PyInstance instance && instance.Dunder("__iter__") is { } method)
+            {
+                return instance.Invoke(method, []);
+            }
+
+            return new PyIterator(VirtualMachine.RequireIterable(arguments[0]), IteratorName(arguments[0]));
+        });
 
         DefineArity("next", 1, 2, static arguments =>
         {
@@ -322,6 +339,23 @@ public static class BuiltinNamespace
 
         return builtins;
     }
+
+    /// <summary>
+    /// The type name of the iterator a value produces, which CPython derives from the
+    /// container: <c>list_iterator</c>, <c>str_iterator</c>, and so on.
+    /// </summary>
+    private static string IteratorName(PyObject value) => value switch
+    {
+        PyList => "list_iterator",
+        PyTuple => "tuple_iterator",
+        PyStr => "str_iterator",
+        PySet => "set_iterator",
+        PyDict => "dict_keyiterator",
+        PyRange => "range_iterator",
+        PyBytes => "bytes_iterator",
+        PyView view => view.TypeName + "_iterator",
+        _ => "iterator",
+    };
 
     private static PyObject? Keyword(PyDict? keywords, string name) =>
         keywords is not null && keywords.TryGetValue(new PyStr(name), out var value) ? value : null;

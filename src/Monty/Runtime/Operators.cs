@@ -337,7 +337,9 @@ public static class Operators
         if (useFloat)
         {
             var result = a - (Math.Floor(a / b) * b);
-            return new PyFloat(result);
+
+            // A zero result takes the divisor's sign, so `6.0 % -3.0` is `-0.0`.
+            return new PyFloat(result == 0 ? Math.CopySign(0, b) : result);
         }
 
         // The result takes the sign of the divisor, as Python specifies.
@@ -390,12 +392,43 @@ public static class Operators
 
     private static PyObject BitwiseAnd(PyObject left, PyObject right)
     {
-        if (left is PySet x && right is PySet y)
+        if (AsSet(left) is { } x && AsSet(right) is { } y)
         {
-            return new PySet(x.Items.Where(y.Contains));
+            return MakeSet(left, right, x.Items.Where(y.Contains));
+        }
+
+        // Two bools give a bool: `True & True` is `True`, not `1`.
+        if (left is PyBool && right is PyBool)
+        {
+            return PyBool.Of(left.IsTruthy() && right.IsTruthy());
         }
 
         return new PyInt(RequireInt(left, "&") & RequireInt(right, "&"));
+    }
+
+    /// <summary>
+    /// Views a value as a set for the set operators.
+    /// </summary>
+    /// <remarks>
+    /// <c>frozenset</c> and the dict views all take part in <c>&amp;</c>, <c>|</c>,
+    /// <c>-</c> and <c>^</c>, so the operators are defined over anything set-like rather
+    /// than over one class.
+    /// </remarks>
+    private static PySet? AsSet(PyObject value) => value switch
+    {
+        PySet set => set,
+        PyView view when view.IsSetLike => new PySet(view.Iterate() ?? []),
+        _ => null,
+    };
+
+    /// <summary>
+    /// Builds the result of a set operation, which is a frozenset only when the left
+    /// operand was one.
+    /// </summary>
+    private static PyObject MakeSet(PyObject left, PyObject right, IEnumerable<PyObject> items)
+    {
+        _ = right;
+        return new PySet(items) { IsFrozen = left is PySet { IsFrozen: true } };
     }
 
     private static PyObject BitwiseOr(PyObject left, PyObject right)

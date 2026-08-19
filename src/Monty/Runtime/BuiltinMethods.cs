@@ -634,17 +634,22 @@ public static class BuiltinMethods
                         ? value
                         : arguments.Length > 1 ? arguments[1] : PyNone.Instance);
 
+            // The three views are live-looking but materialised here; what matters is that
+            // they are not lists, so their type names and set behaviour are right.
             case "keys":
                 return Method(name, receiver, 0, 0, static (self, _, _) =>
-                    new PyList([.. ((PyDict)self).Entries.Select(static e => e.Key)]));
+                    new PyView("dict_keys", ((PyDict)self).Entries.Select(static e => e.Key), isSetLike: true));
 
             case "values":
                 return Method(name, receiver, 0, 0, static (self, _, _) =>
-                    new PyList([.. ((PyDict)self).Entries.Select(static e => e.Value)]));
+                    new PyView("dict_values", ((PyDict)self).Entries.Select(static e => e.Value), isSetLike: false));
 
             case "items":
                 return Method(name, receiver, 0, 0, static (self, _, _) =>
-                    new PyList([.. ((PyDict)self).Entries.Select(static e => (PyObject)new PyTuple([e.Key, e.Value]))]));
+                    new PyView(
+                        "dict_items",
+                        ((PyDict)self).Entries.Select(static e => (PyObject)new PyTuple([e.Key, e.Value])),
+                        isSetLike: true));
 
             case "pop":
                 return Method(name, receiver, 1, 2, static (self, arguments, _) =>

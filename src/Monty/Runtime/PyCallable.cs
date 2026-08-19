@@ -422,13 +422,22 @@ public sealed class PyIterator : PyObject
     private readonly IEnumerator<PyObject> _enumerator;
 
     /// <summary>Creates an iterator over <paramref name="values"/>.</summary>
-    public PyIterator(IEnumerable<PyObject> values) => _enumerator = values.GetEnumerator();
+    /// <param name="values">What to iterate.</param>
+    /// <param name="typeName">
+    /// The Python type name, which differs per source: <c>iter([])</c> is a
+    /// <c>list_iterator</c> and <c>iter("")</c> a <c>str_iterator</c>. Scripts do check.
+    /// </param>
+    public PyIterator(IEnumerable<PyObject> values, string typeName = "iterator")
+    {
+        _enumerator = values.GetEnumerator();
+        TypeName = typeName;
+    }
 
     /// <inheritdoc />
-    public override string TypeName => "iterator";
+    public override string TypeName { get; }
 
     /// <inheritdoc />
-    public override string Repr() => "<iterator>";
+    public override string Repr() => $"<{TypeName} object>";
 
     /// <summary>Advances the iterator. Returns null when exhausted.</summary>
     public PyObject? Next() => _enumerator.MoveNext() ? _enumerator.Current : null;

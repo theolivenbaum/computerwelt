@@ -237,7 +237,8 @@ public sealed class PyFloat : PyObject
     /// <inheritdoc />
     public override bool PyEquals(PyObject other) => other switch
     {
-        PyFloat number => Value.Equals(number.Value),
+        // `==` rather than `Equals`: NaN is unequal to itself, and -0.0 equals 0.0.
+        PyFloat number => Value == number.Value,
         PyInt integer => Value == (double)integer.Value,
         _ => false,
     };
@@ -249,12 +250,21 @@ public sealed class PyFloat : PyObject
             : new BigInteger(Value.GetHashCode());
 
     /// <inheritdoc />
-    public override int? PyCompare(PyObject other) => other switch
+    public override int? PyCompare(PyObject other)
     {
-        PyFloat number => Value.CompareTo(number.Value),
-        PyInt integer => Value.CompareTo((double)integer.Value),
-        _ => null,
-    };
+        // NaN orders against nothing, so every comparison with it is false.
+        if (double.IsNaN(Value))
+        {
+            return null;
+        }
+
+        return other switch
+        {
+            PyFloat number => double.IsNaN(number.Value) ? null : Value.CompareTo(number.Value),
+            PyInt integer => Value.CompareTo((double)integer.Value),
+            _ => null,
+        };
+    }
 
     /// <summary>
     /// Formats a float the way Python's <c>repr</c> does: the shortest text that round
@@ -277,6 +287,7 @@ public sealed class PyFloat : PyObject
             return "-inf";
         }
 
+        // .NET prints negative zero as "-0", and Python keeps the sign too.
         var text = value.ToString("R", CultureInfo.InvariantCulture);
 
         if (text.Contains('E', StringComparison.Ordinal))

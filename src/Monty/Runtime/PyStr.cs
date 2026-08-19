@@ -200,7 +200,10 @@ public sealed class PyBytes : PyObject
     /// <inheritdoc />
     public override string Repr()
     {
-        var builder = new StringBuilder("b'");
+        // A value containing `'` but not `"` is quoted with `"`, so the apostrophe needs no
+        // escape — the same rule CPython applies to str and bytes alike.
+        var quote = Value.Contains((byte)'\'') && !Value.Contains((byte)'"') ? '"' : '\'';
+        var builder = new StringBuilder("b").Append(quote);
 
         foreach (var b in Value)
         {
@@ -210,7 +213,8 @@ public sealed class PyBytes : PyObject
                 case (byte)'\n': builder.Append("\\n"); break;
                 case (byte)'\r': builder.Append("\\r"); break;
                 case (byte)'\t': builder.Append("\\t"); break;
-                case (byte)'\'': builder.Append("\\'"); break;
+                case (byte)'\'' when quote == '\'': builder.Append("\\'"); break;
+                case (byte)'"' when quote == '"': builder.Append("\\\""); break;
                 default:
                     if (b is >= 0x20 and < 0x7f)
                     {
@@ -225,7 +229,7 @@ public sealed class PyBytes : PyObject
             }
         }
 
-        return builder.Append('\'').ToString();
+        return builder.Append(quote).ToString();
     }
 }
 
@@ -251,6 +255,15 @@ public sealed class PySlice : PyObject
 
     /// <inheritdoc />
     public override string TypeName => "slice";
+
+    /// <inheritdoc />
+    public override PyObject? GetAttribute(string name) => name switch
+    {
+        "start" => Start ?? PyNone.Instance,
+        "stop" => Stop ?? PyNone.Instance,
+        "step" => Step ?? PyNone.Instance,
+        _ => null,
+    };
 
     /// <inheritdoc />
     public override string Repr() =>
