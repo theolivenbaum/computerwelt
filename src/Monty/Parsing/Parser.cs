@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 
 namespace Monty.Parsing;
 
@@ -1171,7 +1172,7 @@ public sealed class Parser
         {
             case TokenKind.Integer:
                 _index++;
-                return At(new Literal(long.Parse(token.Text, CultureInfo.InvariantCulture)), token);
+                return At(new Literal(BigInteger.Parse(token.Text, CultureInfo.InvariantCulture)), token);
 
             case TokenKind.Float:
                 _index++;

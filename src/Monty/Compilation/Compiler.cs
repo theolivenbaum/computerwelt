@@ -866,14 +866,20 @@ public sealed class Compiler
         var code = CompileFunctionBody(
             function.Name, function.Parameters, function.Body, function.Line, isGeneratorHint: null);
 
+        // Decorator *expressions* evaluate top to bottom, but the decorators *apply*
+        // bottom up. Pushing every expression first, then the function, leaves the stack
+        // as [d0 … dn-1, f] — so each Call(1) naturally consumes the innermost pair.
+        foreach (var decorator in function.Decorators)
+        {
+            CompileExpression(decorator);
+        }
+
+        EmitDefaults(function.Parameters, function.Line);
         _code.NestedCode.Add(code);
         Emit(OpCode.MakeFunction, _code.NestedCode.Count - 1, function.Line);
 
-        // Decorators apply innermost first, so they are called in reverse source order.
-        for (var i = function.Decorators.Count - 1; i >= 0; i--)
+        for (var i = 0; i < function.Decorators.Count; i++)
         {
-            CompileExpression(function.Decorators[i]);
-            Emit(OpCode.Swap, 0, function.Line);
             Emit(OpCode.Call, 1, function.Line);
         }
 
@@ -922,36 +928,32 @@ public sealed class Compiler
         compiler.Emit(OpCode.LoadConst, compiler._code.AddConstant(PyNone.Instance), line);
         compiler.Emit(OpCode.Return, 0, line);
 
-        // Defaults are evaluated once, at definition time, in the enclosing scope.
-        foreach (var parameter in parameters.Parameters.Concat(parameters.KeywordOnly))
-        {
-            if (parameter.Default is { } expression)
-            {
-                compiler._code.Defaults[parameter.Name] = ConstantFold(expression)
-                    ?? throw new PythonSyntaxError(
-                        "only constant default values are supported", expression.Line, expression.Column);
-            }
-        }
-
         return compiler._code;
     }
 
     /// <summary>
-    /// Evaluates a default-value expression at compile time. Monty's fixtures use literal
-    /// defaults; anything else is rejected rather than silently mis-evaluated.
+    /// Emits the default-value map a function definition captures.
     /// </summary>
-    private static PyObject? ConstantFold(Expression expression) => expression switch
+    /// <remarks>
+    /// Defaults are evaluated once, at definition time, in the <i>enclosing</i> scope —
+    /// which is why <c>def f(x=[])</c> shares one list across calls. Folding them at
+    /// compile time would both change that and reject every non-literal default.
+    /// </remarks>
+    private void EmitDefaults(ParameterList parameters, int line)
     {
-        Literal literal => Literals.ToPyObject(literal.Value),
-        UnaryOp { Operator: "-" } negation when ConstantFold(negation.Operand) is PyInt integer =>
-            new PyInt(-integer.Value),
-        UnaryOp { Operator: "-" } negation when ConstantFold(negation.Operand) is PyFloat number =>
-            new PyFloat(-number.Value),
-        TupleExpr tuple when tuple.Elements.Count == 0 => PyTuple.Empty,
-        ListExpr list when list.Elements.Count == 0 => new PyList(),
-        DictExpr dict when dict.Keys.Count == 0 => new PyDict(),
-        _ => null,
-    };
+        var withDefaults = parameters.Parameters
+            .Concat(parameters.KeywordOnly)
+            .Where(static parameter => parameter.Default is not null)
+            .ToList();
+
+        foreach (var parameter in withDefaults)
+        {
+            Emit(OpCode.LoadConst, _code.AddConstant(new PyStr(parameter.Name)), line);
+            CompileExpression(parameter.Default!);
+        }
+
+        Emit(OpCode.BuildMap, withDefaults.Count, line);
+    }
 
     private static bool ContainsYield(IReadOnlyList<Statement> body) =>
         body.Any(ContainsYield);
@@ -989,15 +991,19 @@ public sealed class Compiler
     {
         var body = CompileFunctionBody(classDef.Name, ParameterList.Empty, classDef.Body, classDef.Line, isGeneratorHint: false);
 
-        _code.NestedCode.Add(body);
+        foreach (var decorator in classDef.Decorators)
+        {
+            CompileExpression(decorator);
+        }
+
         Emit(OpCode.LoadConst, _code.AddConstant(new PyStr(classDef.Name)), classDef.Line);
+        Emit(OpCode.BuildMap, 0, classDef.Line);
+        _code.NestedCode.Add(body);
         Emit(OpCode.MakeFunction, _code.NestedCode.Count - 1, classDef.Line);
         Emit(OpCode.MakeClass, 0, classDef.Line);
 
-        for (var i = classDef.Decorators.Count - 1; i >= 0; i--)
+        for (var i = 0; i < classDef.Decorators.Count; i++)
         {
-            CompileExpression(classDef.Decorators[i]);
-            Emit(OpCode.Swap, 0, classDef.Line);
             Emit(OpCode.Call, 1, classDef.Line);
         }
 
@@ -1338,6 +1344,7 @@ public sealed class Compiler
         var body = new List<Statement> { new Return(lambda.Body) { Line = lambda.Line } };
         var code = CompileFunctionBody("<lambda>", lambda.Parameters, body, lambda.Line, isGeneratorHint: false);
 
+        EmitDefaults(lambda.Parameters, lambda.Line);
         _code.NestedCode.Add(code);
         Emit(OpCode.MakeFunction, _code.NestedCode.Count - 1, lambda.Line);
     }
@@ -1375,6 +1382,7 @@ public sealed class Compiler
         compiler.CompileComprehensionClauses(comprehension, 0, isOutermost: true);
         compiler.Emit(OpCode.Return, 0, comprehension.Line);
 
+        Emit(OpCode.BuildMap, 0, comprehension.Line);
         _code.NestedCode.Add(compiler._code);
         Emit(OpCode.MakeFunction, _code.NestedCode.Count - 1, comprehension.Line);
 

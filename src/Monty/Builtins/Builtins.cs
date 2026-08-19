@@ -55,6 +55,13 @@ public static class BuiltinNamespace
             builtins.Set(new PyStr(name), type);
         }
 
+        // Built-in types are first-class objects, not constructor functions, so that
+        // `type(x) is int` and `isinstance(x, int)` both hold.
+        foreach (var (name, type) in TypeRegistry.All)
+        {
+            builtins.Set(new PyStr(name), type);
+        }
+
         Define("print", (arguments, keywords) =>
         {
             var separator = Keyword(keywords, "sep")?.Display() ?? " ";
@@ -69,76 +76,15 @@ public static class BuiltinNamespace
 
         DefineArity("repr", 1, 1, static arguments => new PyStr(arguments[0].Repr()));
 
-        DefinePositional("str", static arguments =>
-            new PyStr(arguments.Length == 0 ? string.Empty : arguments[0].Display()));
 
-        DefinePositional("bool", static arguments =>
-            PyBool.Of(arguments.Length > 0 && arguments[0].IsTruthy()));
 
-        DefinePositional("int", Conversions.ToInt);
-        DefinePositional("float", Conversions.ToFloat);
-        DefinePositional("bytes", Conversions.ToBytes);
 
-        DefinePositional("list", static arguments => new PyList(
-            arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0]).ToList()));
 
-        DefinePositional("tuple", static arguments => new PyTuple(
-            arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0]).ToList()));
 
-        DefinePositional("set", static arguments => new PySet(
-            arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0])));
 
-        DefinePositional("frozenset", static arguments => new PySet(
-            arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0])));
 
-        DefineArity("slice", 1, 3, static arguments => arguments.Length switch
-        {
-            1 => new PySlice(null, arguments[0], null),
-            2 => new PySlice(arguments[0], arguments[1], null),
-            _ => new PySlice(arguments[0], arguments[1], arguments[2]),
-        });
 
-        Define("dict", static (arguments, keywords) =>
-        {
-            var dict = new PyDict();
 
-            if (arguments.Length > 0)
-            {
-                if (arguments[0] is PyDict source)
-                {
-                    foreach (var (key, value) in source.Entries)
-                    {
-                        dict.Set(key, value);
-                    }
-                }
-                else
-                {
-                    foreach (var pair in VirtualMachine.RequireIterable(arguments[0]))
-                    {
-                        var items = VirtualMachine.RequireIterable(pair).ToList();
-                        dict.Set(items[0], items[1]);
-                    }
-                }
-            }
-
-            if (keywords is not null)
-            {
-                foreach (var (key, value) in keywords.Entries)
-                {
-                    dict.Set(key, value);
-                }
-            }
-
-            return dict;
-        });
-
-        DefineArity("range", 1, 3, static arguments => arguments.Length switch
-        {
-            1 => new PyRange(0, RequireInt(arguments[0], "range"), 1),
-            2 => new PyRange(RequireInt(arguments[0], "range"), RequireInt(arguments[1], "range"), 1),
-            3 => new PyRange(RequireInt(arguments[0], "range"), RequireInt(arguments[1], "range"), RequireInt(arguments[2], "range")),
-            _ => throw new PyRaise(PyErrors.TypeError($"range expected at most 3 arguments, got {arguments.Length}")),
-        });
 
         DefineArity("enumerate", 1, 2, static arguments =>
         {
@@ -306,12 +252,19 @@ public static class BuiltinNamespace
         DefineArity("oct", 1, 1, static arguments =>
             Prefixed(RequireInt(arguments[0], "oct"), 8, "0o"));
 
-        DefineArity("isinstance", 2, 2, static arguments => PyBool.Of(IsInstance(arguments[0], arguments[1])));
+        DefineArity("isinstance", 2, 2, static arguments =>
+            PyBool.Of(TypeRegistry.IsInstance(arguments[0], arguments[1])));
 
         DefineArity("issubclass", 2, 2, static arguments => PyBool.Of(
-            arguments[0] is PyExceptionType left && arguments[1] is PyExceptionType right && left.IsSubclassOf(right)));
-
-        DefineArity("type", 1, 1, static arguments => new PyStr(arguments[0].TypeName));
+            (arguments[0], arguments[1]) switch
+            {
+                (PyExceptionType left, PyExceptionType right) => left.IsSubclassOf(right),
+                (PyType left, PyType right) => ReferenceEquals(left, right)
+                    || (ReferenceEquals(left, TypeRegistry.Bool) && ReferenceEquals(right, TypeRegistry.Int))
+                    || ReferenceEquals(right, TypeRegistry.Object),
+                (PyClass left, PyClass right) => ReferenceEquals(left, right),
+                _ => false,
+            }));
 
         DefineArity("iter", 1, 2, static arguments =>
             arguments[0] is PyIterator or PyGenerator
@@ -410,45 +363,6 @@ public static class BuiltinNamespace
         return best;
     }
 
-    private static bool IsInstance(PyObject value, PyObject type)
-    {
-        if (type is PyTuple tuple)
-        {
-            return tuple.Items.Any(item => IsInstance(value, item));
-        }
-
-        if (type is PyExceptionType exceptionType)
-        {
-            return value is PyException exception && exception.IsInstanceOf(exceptionType);
-        }
-
-        if (type is PyClass pyClass)
-        {
-            return value is PyInstance instance && ReferenceEquals(instance.Class, pyClass);
-        }
-
-        // A builtin type is identified by the name bound to it, since built-in types are
-        // not first-class objects here.
-        var name = type is PyBuiltinFunction builtin ? builtin.Name : type.Display();
-
-        return name switch
-        {
-            "int" => value is PyInt,
-            "float" => value is PyFloat,
-            "str" => value is PyStr,
-            "bool" => value is PyBool,
-            "list" => value is PyList,
-            "dict" => value is PyDict,
-            "tuple" => value is PyTuple,
-            "set" or "frozenset" => value is PySet,
-            "bytes" => value is PyBytes,
-            "range" => value is PyRange,
-            "slice" => value is PySlice,
-            "object" => true,
-            _ => false,
-        };
-    }
-
     private static PyStr Prefixed(BigInteger value, int radix, string prefix)
     {
         var digits = StringFormatterAccess.FormatRadix(BigInteger.Abs(value), radix);
@@ -504,8 +418,10 @@ internal static class StringFormatterAccess
 }
 
 /// <summary>The <c>int()</c>, <c>float()</c> and <c>bytes()</c> conversions.</summary>
-internal static class Conversions
+/// <remarks>Shared with <see cref="TypeRegistry"/>, which exposes them as type objects.</remarks>
+public static class Conversions
 {
+    /// <summary>Implements <c>int()</c>.</summary>
     public static PyObject ToInt(PyObject[] arguments)
     {
         if (arguments.Length == 0)
@@ -608,6 +524,7 @@ internal static class Conversions
         return true;
     }
 
+    /// <summary>Implements <c>float()</c>.</summary>
     public static PyObject ToFloat(PyObject[] arguments)
     {
         if (arguments.Length == 0)
@@ -657,6 +574,7 @@ internal static class Conversions
         }
     }
 
+    /// <summary>Implements <c>bytes()</c>.</summary>
     public static PyObject ToBytes(PyObject[] arguments)
     {
         if (arguments.Length == 0)
@@ -670,7 +588,19 @@ internal static class Conversions
                 return bytes;
 
             case PyInt size:
-                return new PyBytes(new byte[size.ToIndex()]);
+            {
+                if (size.Value < 0)
+                {
+                    throw new PyRaise(PyErrors.ValueError("negative count"));
+                }
+
+                if (size.Value > 100_000_000)
+                {
+                    throw new PyRaise(new PyException(PyExceptionType.OverflowError, "cannot fit 'int' into a size"));
+                }
+
+                return new PyBytes(new byte[(int)size.Value]);
+            }
 
             case PyStr text when arguments.Length > 1:
                 return new PyBytes(Encoding.UTF8.GetBytes(text.Value));

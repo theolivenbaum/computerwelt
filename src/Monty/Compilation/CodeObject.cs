@@ -45,9 +45,6 @@ public sealed class CodeObject
     /// <summary>The declared parameters.</summary>
     public Parsing.ParameterList Parameters { get; set; } = Parsing.ParameterList.Empty;
 
-    /// <summary>Default values for parameters that have them, keyed by parameter name.</summary>
-    public Dictionary<string, PyObject> Defaults { get; } = new(StringComparer.Ordinal);
-
     /// <summary>True when the body contains a <c>yield</c>, making calls produce a generator.</summary>
     public bool IsGenerator { get; set; }
 

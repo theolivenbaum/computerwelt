@@ -599,7 +599,20 @@ public sealed class PyRange : PyObject
     public override bool IsTruthy() => Count > 0;
 
     /// <inheritdoc />
-    public override int? Length() => (int)Count;
+    public override int? Length()
+    {
+        var count = Count;
+
+        // A range may be longer than an int can hold; `len()` on one is an OverflowError
+        // in CPython too, not a host crash.
+        if (count > int.MaxValue)
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.OverflowError, "cannot fit 'int' into an index-sized integer"));
+        }
+
+        return (int)count;
+    }
 
     /// <inheritdoc />
     public override string Repr() =>

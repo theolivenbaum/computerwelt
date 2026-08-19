@@ -321,6 +321,14 @@ public static class Operators
                 $"unsupported operand type(s) for ** or pow(): '{left.TypeName}' and '{right.TypeName}'"));
         }
 
+        if (b < 0 && a == 0)
+        {
+            throw new PyRaise(PyErrors.ZeroDivisionError(
+                useFloat
+                    ? "0.0 cannot be raised to a negative power"
+                    : "0 cannot be raised to a negative power"));
+        }
+
         if (!useFloat)
         {
             var exponent = AsInt(right);

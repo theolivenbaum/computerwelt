@@ -106,8 +106,8 @@ public static class SupportModules
 
         module.Add("count", static arguments =>
         {
-            var start = arguments.Length > 0 ? ((PyInt)arguments[0]).Value : BigInteger.Zero;
-            var step = arguments.Length > 1 ? ((PyInt)arguments[1]).Value : BigInteger.One;
+            var start = arguments.Length > 0 ? RequireNumber(arguments[0]) : BigInteger.Zero;
+            var step = arguments.Length > 1 ? RequireNumber(arguments[1]) : BigInteger.One;
 
             // Unbounded in Python; bounded here, because an infinite iterator materialized
             // into a list would never terminate. The cap is generous and documented.
@@ -123,14 +123,14 @@ public static class SupportModules
 
         module.Add("repeat", static arguments =>
         {
-            var times = arguments.Length > 1 ? (int)((PyInt)arguments[1]).Value : 10_000;
+            var times = arguments.Length > 1 ? (int)RequireNumber(arguments[1]) : 10_000;
             return new PyIterator(Enumerable.Repeat(arguments[0], Math.Max(0, times)).ToList());
         });
 
         module.Add("product", static (arguments, keywords) =>
         {
             var repeat = keywords is not null && keywords.TryGetValue(new PyStr("repeat"), out var value)
-                ? (int)((PyInt)value).Value
+                ? (int)RequireNumber(value)
                 : 1;
 
             var pools = new List<List<PyObject>>();
@@ -153,14 +153,14 @@ public static class SupportModules
         module.Add("permutations", static arguments =>
         {
             var items = VirtualMachine.RequireIterable(arguments[0]).ToList();
-            var length = arguments.Length > 1 ? (int)((PyInt)arguments[1]).Value : items.Count;
+            var length = arguments.Length > 1 ? (int)RequireNumber(arguments[1]) : items.Count;
             return new PyIterator(Permute(items, length).Select(static row => (PyObject)new PyTuple(row)).ToList());
         });
 
         module.Add("combinations", static arguments =>
         {
             var items = VirtualMachine.RequireIterable(arguments[0]).ToList();
-            var length = (int)((PyInt)arguments[1]).Value;
+            var length = (int)RequireNumber(arguments[1]);
             return new PyIterator(Combine(items, length, 0).Select(static row => (PyObject)new PyTuple(row)).ToList());
         });
 
@@ -223,7 +223,14 @@ public static class SupportModules
     }
 
     private static int Bound(PyObject value, int length) =>
-        value is PyNone ? length : (int)((PyInt)value).Value;
+        value is PyNone ? length : (int)RequireNumber(value);
+
+    private static BigInteger RequireNumber(PyObject value) => value switch
+    {
+        PyInt integer => integer.Value,
+        _ => throw new PyRaise(PyErrors.TypeError(
+            $"'{value.TypeName}' object cannot be interpreted as an integer")),
+    };
 
     private static IEnumerable<List<PyObject>> Permute(List<PyObject> items, int length)
     {

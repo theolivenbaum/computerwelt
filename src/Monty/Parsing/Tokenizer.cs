@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 using System.Text;
 
 namespace Monty.Parsing;
@@ -267,7 +268,23 @@ public sealed class Tokenizer
                 throw new PythonSyntaxError("invalid literal", _line, start - _lineStart);
             }
 
-            Emit(TokenKind.Integer, Convert.ToInt64(digits, radix).ToString(CultureInfo.InvariantCulture), start, _position - start);
+            // Python integers are unbounded, so a radix literal is accumulated in
+            // BigInteger rather than parsed into a machine word.
+            var value = BigInteger.Zero;
+
+            foreach (var digit in digits)
+            {
+                var d = char.IsAsciiDigit(digit) ? digit - '0' : char.ToLowerInvariant(digit) - 'a' + 10;
+
+                if (d < 0 || d >= radix)
+                {
+                    throw new PythonSyntaxError("invalid literal", _line, start - _lineStart);
+                }
+
+                value = (value * radix) + d;
+            }
+
+            Emit(TokenKind.Integer, value.ToString(CultureInfo.InvariantCulture), start, _position - start);
             return;
         }
 

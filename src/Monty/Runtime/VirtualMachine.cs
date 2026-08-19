@@ -83,6 +83,9 @@ public sealed class VirtualMachine
             case PyFunction function:
                 return CallFunction(function, arguments, keywords);
 
+            case PyType builtinType:
+                return builtinType.Construct(arguments, keywords);
+
             case PyClass type:
                 return Instantiate(type, arguments, keywords);
 
@@ -255,7 +258,7 @@ public sealed class VirtualMachine
 
             var slot = code.LocalNames.IndexOf(parameter.Name);
 
-            if (code.Defaults.TryGetValue(parameter.Name, out var defaultValue))
+            if (function.Defaults.TryGetValue(new PyStr(parameter.Name), out var defaultValue))
             {
                 locals[slot] = defaultValue;
                 continue;
@@ -480,14 +483,14 @@ public sealed class VirtualMachine
 
             case OpCode.LoadLocal:
             {
-                var value = frame.Locals[instruction.Operand];
+                var name = code.LocalNames[instruction.Operand];
 
-                if (value is null)
+                // A captured local lives in its cell, which a nested function may have
+                // written since the slot was last set. The cell is therefore always at
+                // least as fresh as the slot, so it wins whenever one exists.
+                if (frame.Cells.TryGetValue(name, out var cell))
                 {
-                    // A cell may hold it when the name is also captured by a closure.
-                    var name = code.LocalNames[instruction.Operand];
-
-                    if (frame.Cells.TryGetValue(name, out var cell) && cell.Value is { } cellValue)
+                    if (cell.Value is { } cellValue)
                     {
                         frame.Push(cellValue);
                         return false;
@@ -495,6 +498,9 @@ public sealed class VirtualMachine
 
                     throw new PyRaise(PyErrors.UnboundLocalError(name));
                 }
+
+                var value = frame.Locals[instruction.Operand]
+                    ?? throw new PyRaise(PyErrors.UnboundLocalError(name));
 
                 frame.Push(value);
                 return false;
@@ -973,8 +979,9 @@ public sealed class VirtualMachine
 
             case OpCode.MakeFunction:
             {
+                var defaults = (PyDict)frame.Pop();
                 var nested = code.NestedCode[instruction.Operand];
-                frame.Push(new PyFunction(nested, frame.Cells, frame.Globals));
+                frame.Push(new PyFunction(nested, frame.Cells, frame.Globals, defaults));
                 return false;
             }
 

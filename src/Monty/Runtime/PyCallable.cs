@@ -16,13 +16,20 @@ public abstract class PyCallable : PyObject
 /// <summary>A function defined in Python.</summary>
 public sealed class PyFunction : PyCallable
 {
-    /// <summary>Creates a function from compiled code and its captured cells.</summary>
-    public PyFunction(CodeObject code, Dictionary<string, PyCell> closure, PyDict globals)
+    /// <summary>Creates a function from compiled code, its captured cells and its defaults.</summary>
+    public PyFunction(CodeObject code, Dictionary<string, PyCell> closure, PyDict globals, PyDict? defaults = null)
     {
         Code = code;
         Closure = closure;
         Globals = globals;
+        Defaults = defaults ?? new PyDict();
     }
+
+    /// <summary>
+    /// Default values, keyed by parameter name, evaluated once when the function was
+    /// defined — which is why a mutable default is shared across calls.
+    /// </summary>
+    public PyDict Defaults { get; }
 
     /// <summary>The compiled body.</summary>
     public CodeObject Code { get; }
@@ -47,7 +54,7 @@ public sealed class PyFunction : PyCallable
 
     /// <summary>Returns a copy of this function bound to <paramref name="instance"/>.</summary>
     public PyFunction Bind(PyObject instance) =>
-        new(Code, Closure, Globals) { BoundSelf = instance };
+        new(Code, Closure, Globals, Defaults) { BoundSelf = instance };
 }
 
 /// <summary>A function implemented in C#.</summary>

@@ -34,14 +34,29 @@ public static class BuiltinMethods
         PyObject receiver,
         int minimum,
         Func<PyObject, PyObject[], PyDict?, PyObject> implementation) =>
+        Method(name, receiver, minimum, int.MaxValue, implementation);
+
+    /// <summary>
+    /// Wraps a method with an argument-count range, so a missing or surplus argument
+    /// becomes a <c>TypeError</c> rather than a host index error or a silent success.
+    /// </summary>
+    private static PyBoundMethod Method(
+        string name,
+        PyObject receiver,
+        int minimum,
+        int maximum,
+        Func<PyObject, PyObject[], PyDict?, PyObject> implementation) =>
         new(name, receiver, (self, arguments, keywords) =>
         {
-            if (arguments.Length < minimum)
+            if (arguments.Length < minimum || arguments.Length > maximum)
             {
-                // Sequence and mapping methods word this differently, matching CPython.
+                // Sequence methods word this differently from mapping methods, and the
+                // fixtures compare the message.
                 throw new PyRaise(PyErrors.TypeError(self is PyList or PyTuple or PyStr or PySet
                     ? $"{self.TypeName}.{name}() takes exactly {(minimum == 1 ? "one argument" : minimum + " arguments")} ({arguments.Length} given)"
-                    : $"{name} expected at least {minimum} argument{(minimum == 1 ? string.Empty : "s")}, got {arguments.Length}"));
+                    : arguments.Length < minimum
+                        ? $"{name} expected at least {minimum} argument{(minimum == 1 ? string.Empty : "s")}, got {arguments.Length}"
+                        : $"{name} expected at most {maximum} argument{(maximum == 1 ? string.Empty : "s")}, got {arguments.Length}"));
             }
 
             return implementation(self, arguments, keywords);
@@ -496,7 +511,7 @@ public static class BuiltinMethods
         switch (name)
         {
             case "append":
-                return Method(name, receiver, 1, static (self, arguments, _) =>
+                return Method(name, receiver, 1, 1, static (self, arguments, _) =>
                 {
                     ((PyList)self).Items.Add(arguments[0]);
                     return PyNone.Instance;
@@ -510,7 +525,7 @@ public static class BuiltinMethods
                 });
 
             case "insert":
-                return Method(name, receiver, 2, static (self, arguments, _) =>
+                return Method(name, receiver, 2, 2, static (self, arguments, _) =>
                 {
                     var items = ((PyList)self).Items;
                     var index = Int(arguments[0], "index");
@@ -607,25 +622,25 @@ public static class BuiltinMethods
         switch (name)
         {
             case "get":
-                return Method(name, receiver, 1, static (self, arguments, _) =>
+                return Method(name, receiver, 1, 2, static (self, arguments, _) =>
                     ((PyDict)self).TryGetValue(arguments[0], out var value)
                         ? value
                         : arguments.Length > 1 ? arguments[1] : PyNone.Instance);
 
             case "keys":
-                return Method(name, receiver, static (self, _, _) =>
+                return Method(name, receiver, 0, 0, static (self, _, _) =>
                     new PyList([.. ((PyDict)self).Entries.Select(static e => e.Key)]));
 
             case "values":
-                return Method(name, receiver, static (self, _, _) =>
+                return Method(name, receiver, 0, 0, static (self, _, _) =>
                     new PyList([.. ((PyDict)self).Entries.Select(static e => e.Value)]));
 
             case "items":
-                return Method(name, receiver, static (self, _, _) =>
+                return Method(name, receiver, 0, 0, static (self, _, _) =>
                     new PyList([.. ((PyDict)self).Entries.Select(static e => (PyObject)new PyTuple([e.Key, e.Value]))]));
 
             case "pop":
-                return Method(name, receiver, 1, static (self, arguments, _) =>
+                return Method(name, receiver, 1, 2, static (self, arguments, _) =>
                 {
                     var dict = (PyDict)self;
 
@@ -680,7 +695,9 @@ public static class BuiltinMethods
                     {
                         if (arguments[0] is PyDict source)
                         {
-                            foreach (var (key, value) in source.Entries)
+                            // `d.update(d)` is legal, so the entries are snapshotted
+                            // before any of them are written back.
+                            foreach (var (key, value) in source.Entries.ToList())
                             {
                                 dict.Set(key, value);
                             }
@@ -690,6 +707,13 @@ public static class BuiltinMethods
                             foreach (var pair in VirtualMachine.RequireIterable(arguments[0]))
                             {
                                 var items = VirtualMachine.RequireIterable(pair).ToList();
+
+                                if (items.Count != 2)
+                                {
+                                    throw new PyRaise(PyErrors.ValueError(
+                                        $"dictionary update sequence element #0 has length {items.Count}; 2 is required"));
+                                }
+
                                 dict.Set(items[0], items[1]);
                             }
                         }
