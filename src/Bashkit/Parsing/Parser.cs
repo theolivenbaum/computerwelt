@@ -269,6 +269,7 @@ public sealed class Parser
                 case "until": return WithRedirects(ParseUntil());
                 case "for": return WithRedirects(ParseFor());
                 case "select": return WithRedirects(ParseSelect());
+                case "coproc": return WithRedirects(ParseCoprocess());
                 case "case": return WithRedirects(ParseCase());
                 case "function": return ParseFunctionKeyword();
                 case "{": return WithRedirects(ParseBraceGroup());
@@ -415,6 +416,38 @@ public sealed class Parser
 
         return new ForCommand(variable, items, body) { Span = new Span(start, Current.Start - start) };
     }
+
+    /// <summary>
+    /// Parses <c>coproc [NAME] command</c>.
+    /// </summary>
+    /// <remarks>
+    /// The optional name is only a name when a command follows it, which is why
+    /// <c>coproc { ... }</c> and <c>coproc mine { ... }</c> both parse: a <c>{</c> or any
+    /// other command opener rules out the name reading.
+    /// </remarks>
+    private Node ParseCoprocess()
+    {
+        var start = Current.Start;
+        ExpectKeyword("coproc");
+
+        var name = "COPROC";
+
+        if (Current.Kind == TokenKind.Word
+            && !BlockTerminators.Contains(Current.Text)
+            && IsName(Current.Text)
+            && Peek().Kind is TokenKind.Word or TokenKind.LeftParen)
+        {
+            name = Advance().Text;
+        }
+
+        var body = ParseCommand();
+        return new CoprocessCommand(name, body) { Span = new Span(start, Current.Start - start) };
+    }
+
+    private static bool IsName(string text) =>
+        text.Length > 0
+        && (char.IsAsciiLetter(text[0]) || text[0] == '_')
+        && text.All(static c => char.IsAsciiLetterOrDigit(c) || c == '_');
 
     /// <summary>Parses <c>select</c>, whose header is <c>for</c>'s minus the arithmetic form.</summary>
     private Node ParseSelect()

@@ -92,6 +92,28 @@ public sealed class ShellState
     public Dictionary<int, string?> Descriptors { get; private set; } = [];
 
     /// <summary>
+    /// Readable descriptors above 2, by number, holding what is left to read from each.
+    /// </summary>
+    /// <remarks>
+    /// A coprocess has no pipe to hold its output, so the output is buffered here and
+    /// <c>&lt;&amp;N</c> reads it. The buffer is consumed on read, which is what makes a
+    /// second read see end of input rather than the same bytes again.
+    /// </remarks>
+    public Dictionary<int, string> InputDescriptors { get; private set; } = [];
+
+    /// <summary>
+    /// Where a descriptor that duplicates the enclosing standard output collects its
+    /// writes.
+    /// </summary>
+    /// <remarks>
+    /// <c>{ ...; } 3&gt;&amp;1 &gt;file</c> is the standard way to keep progress output on
+    /// the terminal while the real output goes to a file: fd 3 captures stdout <i>before</i>
+    /// the file redirection takes effect, so writes to it must escape that redirection.
+    /// Buffering them separately is what lets a value-returning shell express that.
+    /// </remarks>
+    public Dictionary<int, System.Text.StringBuilder> DescriptorBuffers { get; private set; } = [];
+
+    /// <summary>
     /// Variables the shell seeded at start-up rather than the script exporting them.
     /// </summary>
     /// <remarks>
@@ -458,6 +480,11 @@ public sealed class ShellState
             PipeStatus = [.. PipeStatus],
             ShellDefaults = new HashSet<string>(ShellDefaults, StringComparer.Ordinal),
             Descriptors = new Dictionary<int, string?>(Descriptors),
+            InputDescriptors = new Dictionary<int, string>(InputDescriptors),
+
+            // The buffers are shared by reference: a subshell writing to an inherited
+            // descriptor writes to the same place the parent will read.
+            DescriptorBuffers = new Dictionary<int, System.Text.StringBuilder>(DescriptorBuffers),
         };
 
         fork._scopes.Clear();

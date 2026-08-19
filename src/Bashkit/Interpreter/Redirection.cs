@@ -21,6 +21,9 @@ namespace Bashkit.Interpreter;
 public sealed class Redirection
 {
     private readonly List<Target> _outputs = [];
+    private readonly List<StringBuilder> _escaping = [];
+    private StringBuilder? _stdoutEscape;
+    private bool _stdoutIsRedirected;
     private bool _discardStdout;
     private bool _discardStderr;
     private bool _stderrToStdout;
@@ -53,6 +56,13 @@ public sealed class Redirection
         CancellationToken cancellationToken)
     {
         var redirection = new Redirection(interpreter.FileSystem) { Stdin = stdin };
+
+        // A descriptor that duplicates stdout only needs a buffer of its own when this same
+        // list goes on to re-point stdout; otherwise it still is stdout.
+        redirection._stdoutIsRedirected = redirects.Any(static r =>
+            r.Kind is RedirectKind.Output or RedirectKind.Append or RedirectKind.Clobber
+                or RedirectKind.OutputBoth or RedirectKind.AppendBoth
+            && (r.Fd == 1 || r.Kind is RedirectKind.OutputBoth or RedirectKind.AppendBoth));
 
         foreach (var redirect in redirects)
         {
@@ -124,13 +134,26 @@ public sealed class Redirection
             }
 
             case RedirectKind.DuplicateInput:
-                // `<&N` with no real descriptors is a no-op unless it closes the input.
-                if ((await interpreter.Expander.ExpandToStringAsync(redirect.Target, cancellationToken)) == "-")
+            {
+                var target = await interpreter.Expander.ExpandToStringAsync(redirect.Target, cancellationToken);
+
+                if (target == "-")
                 {
                     Stdin = null;
+                    return;
+                }
+
+                // `<&N` reads a descriptor a coprocess opened; anything else has no real
+                // descriptor behind it and is a no-op.
+                if (int.TryParse(target, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var source)
+                    && interpreter.State.InputDescriptors.TryGetValue(source, out var buffered))
+                {
+                    Stdin = StreamData.FromText(buffered);
+                    interpreter.State.InputDescriptors[source] = string.Empty;
                 }
 
                 return;
+            }
 
             default:
             {
@@ -166,10 +189,24 @@ public sealed class Redirection
             return;
         }
 
-        // `N>&1` and `N>&2` make an extra descriptor an alias of a standard stream.
+        // `N>&1` and `N>&2` make an extra descriptor an alias of a standard stream. For
+        // stdout that alias is taken now, before any later redirection re-points it, so the
+        // descriptor gets a buffer of its own that this command's output is joined with.
         if (fd >= 3 && target is "1" or "2")
         {
             state.Descriptors[fd] = "&" + target;
+
+            if (target == "1" && _stdoutIsRedirected)
+            {
+                var buffer = new StringBuilder();
+                state.DescriptorBuffers[fd] = buffer;
+                _escaping.Add(buffer);
+            }
+            else if (target == "1")
+            {
+                state.DescriptorBuffers.Remove(fd);
+            }
+
             return;
         }
 
@@ -196,6 +233,23 @@ public sealed class Redirection
 
             if (opened.StartsWith('&'))
             {
+                if (opened == "&1" && state.DescriptorBuffers.TryGetValue(source, out var escape))
+                {
+                    // The descriptor was captured before the enclosing redirection, so what
+                    // is written to it bypasses that redirection.
+                    if (fd == 1)
+                    {
+                        _stdoutEscape = escape;
+                    }
+                    else
+                    {
+                        _stderrToStdout = true;
+                        _stdoutEscape = escape;
+                    }
+
+                    return;
+                }
+
                 if (fd == 2 && opened == "&1")
                 {
                     _stderrToStdout = true;
@@ -289,6 +343,14 @@ public sealed class Redirection
             stdout = StreamData.Empty;
         }
 
+        // Output bound for a descriptor that duplicated the outer stdout is set aside
+        // before any file redirection can claim it.
+        if (_stdoutEscape is not null)
+        {
+            _stdoutEscape.Append(stdout.ToString());
+            stdout = StreamData.Empty;
+        }
+
         foreach (var target in _outputs)
         {
             var payload = StreamData.Empty;
@@ -345,6 +407,16 @@ public sealed class Redirection
         if (_discardStderr)
         {
             stderr = StreamData.Empty;
+        }
+
+        // Whatever escaped through such a descriptor is this command's output.
+        foreach (var buffer in _escaping)
+        {
+            if (buffer.Length > 0)
+            {
+                stdout = StreamData.Concat(StreamData.FromText(buffer.ToString()), stdout);
+                buffer.Clear();
+            }
         }
 
         return result with { Stdout = stdout, Stderr = stderr };

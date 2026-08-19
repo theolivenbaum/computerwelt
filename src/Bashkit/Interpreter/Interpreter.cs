@@ -188,6 +188,7 @@ public sealed class Interpreter
                 new WhileCommand(untilCommand.Condition, untilCommand.Body), stdin, negate: true, cancellationToken),
             ForCommand forCommand => await ExecuteForAsync(forCommand, stdin, cancellationToken),
             SelectCommand selectCommand => await ExecuteSelectAsync(selectCommand, cancellationToken),
+            CoprocessCommand coprocess => await ExecuteCoprocessAsync(coprocess, cancellationToken),
             ArithmeticForCommand arithFor => await ExecuteArithmeticForAsync(arithFor, stdin, cancellationToken),
             CaseCommand caseCommand => await ExecuteCaseAsync(caseCommand, stdin, cancellationToken),
             Subshell subshell => await ExecuteSubshellAsync(subshell, stdin, cancellationToken),
@@ -887,6 +888,40 @@ public sealed class Interpreter
         }
 
         return result with { ControlFlow = ControlFlow.None };
+    }
+
+    /// <summary>
+    /// Runs a <c>coproc</c>: the command runs to completion and its output is buffered.
+    /// </summary>
+    /// <remarks>
+    /// A real coprocess runs concurrently with the shell, which nothing here can arrange.
+    /// Running it eagerly and buffering the result is observably identical for a script
+    /// that writes nothing to it, which is what the shape is almost always used for.
+    /// </remarks>
+    private async ValueTask<ExecResult> ExecuteCoprocessAsync(CoprocessCommand command, CancellationToken cancellationToken)
+    {
+        var fork = State.Fork();
+        var nested = new Interpreter(fork, FileSystem, Budget, _builtins);
+        var result = await nested.ExecuteAsync(command.Body, null, cancellationToken);
+
+        // bash numbers a coprocess's descriptors from the top of the table downwards.
+        var read = 63;
+
+        while (State.InputDescriptors.ContainsKey(read) && read > 3)
+        {
+            read--;
+        }
+
+        State.InputDescriptors[read] = result.Stdout.ToString();
+        State.GetOrCreate(command.Name).SetArray(
+        [
+            read.ToString(CultureInfo.InvariantCulture),
+            (read - 1).ToString(CultureInfo.InvariantCulture),
+        ]);
+
+        State.Set(command.Name + "_PID", "1");
+
+        return new ExecResult { Stderr = result.Stderr, ExitCode = 0 };
     }
 
     private async ValueTask<ExecResult> ExecuteConditionalAsync(ConditionalCommand command, CancellationToken cancellationToken)

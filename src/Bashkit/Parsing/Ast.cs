@@ -112,6 +112,11 @@ public sealed record IfCommand(Node Condition, Node Then, Node? Else) : Node;
 /// <param name="Body">The loop body.</param>
 public sealed record ForCommand(string Variable, IReadOnlyList<Word>? Items, Node Body) : Node;
 
+/// <summary><c>coproc [NAME] command</c> — runs a command with a readable output.</summary>
+/// <param name="Name">The array the descriptors are published in, <c>COPROC</c> by default.</param>
+/// <param name="Body">The command to run.</param>
+public sealed record CoprocessCommand(string Name, Node Body) : Node;
+
 /// <summary><c>select NAME [in words]; do ...; done</c>.</summary>
 /// <param name="Variable">The variable each chosen item is assigned to.</param>
 /// <param name="Items">The menu items, or <see langword="null"/> for the positional parameters.</param>
