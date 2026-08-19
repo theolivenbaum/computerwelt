@@ -363,13 +363,16 @@ public static class BuiltinNamespace
                 : throw new PyRaise(PyErrors.AttributeError(arguments[0].TypeName, name));
         });
 
-        DefineArity("setattr", 3, 3, static arguments =>
+        DefineExact("setattr", 3, static arguments =>
         {
             var name = Arity.AttributeName(arguments[1]);
 
             return arguments[0].SetAttribute(name, arguments[2])
                 ? PyNone.Instance
-                : throw new PyRaise(PyErrors.AttributeError(arguments[0].TypeName, name));
+                : throw new PyRaise(new PyException(
+                    PyExceptionType.AttributeError,
+                    $"'{arguments[0].TypeName}' object has no attribute '{name}' "
+                    + "and no __dict__ for setting new attributes"));
         });
 
         DefineExact("hasattr", 2, arguments =>

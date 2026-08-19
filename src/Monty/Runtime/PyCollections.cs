@@ -25,6 +25,24 @@ internal static class RecursionGuard
 
     /// <summary>Leaves a container entered with <see cref="TryEnter"/>.</summary>
     public static void Exit(object value) => active?.Remove(value);
+
+    /// <summary>
+    /// Enters a container for a comparison, refusing to re-enter one already being
+    /// compared.
+    /// </summary>
+    /// <remarks>
+    /// Rendering a cycle can elide it with <c>...</c>, but comparing one has no such
+    /// answer: CPython gives up and raises, and so does this rather than inventing a
+    /// verdict or overflowing the host stack.
+    /// </remarks>
+    public static void EnterComparison(object value)
+    {
+        if (!TryEnter(value))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.RecursionError, "maximum recursion depth exceeded in comparison"));
+        }
+    }
 }
 
 /// <summary><c>list</c>.</summary>
@@ -74,10 +92,12 @@ public sealed class PyList : PyObject
             return true;
         }
 
-        if (other is not PyList list || !RecursionGuard.TryEnter(this))
+        if (other is not PyList list)
         {
-            return other is PyList;
+            return false;
         }
+
+        RecursionGuard.EnterComparison(this);
 
         try
         {
@@ -222,8 +242,29 @@ public sealed class PyTuple : PyObject
     }
 
     /// <inheritdoc />
-    public override bool PyEquals(PyObject other) =>
-        other is PyTuple tuple && PyList.SequenceEquals(Items, tuple.Items);
+    public override bool PyEquals(PyObject other)
+    {
+        if (ReferenceEquals(this, other))
+        {
+            return true;
+        }
+
+        if (other is not PyTuple tuple || tuple.Items.Count != Items.Count)
+        {
+            return false;
+        }
+
+        RecursionGuard.EnterComparison(this);
+
+        try
+        {
+            return PyList.SequenceEquals(Items, tuple.Items);
+        }
+        finally
+        {
+            RecursionGuard.Exit(this);
+        }
+    }
 
     /// <inheritdoc />
     public override int? PyCompare(PyObject other) =>
@@ -388,10 +429,7 @@ public sealed class PyDict : PyObject
             return false;
         }
 
-        if (!RecursionGuard.TryEnter(this))
-        {
-            return true;
-        }
+        RecursionGuard.EnterComparison(this);
 
         try
         {

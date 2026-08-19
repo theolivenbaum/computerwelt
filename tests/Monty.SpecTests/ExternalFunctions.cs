@@ -29,17 +29,69 @@ public static class ExternalFunctions
         ["raise_error"] = static arguments =>
             throw new PyRaise(PyErrors.Create(arguments[0].Display(), arguments[1].Display())),
 
-        ["make_point"] = static _ =>
-            new PyDataclass("Point", ["x", "y"], [new PyInt(1), new PyInt(2)], frozen: true),
+        ["make_point"] = static _ => Point("Point", frozen: true),
 
-        ["make_mutable_point"] = static _ =>
-            new PyDataclass("MutablePoint", ["x", "y"], [new PyInt(1), new PyInt(2)], frozen: false),
+        ["make_mutable_point"] = static _ => Point("MutablePoint", frozen: false),
 
-        ["make_user"] = static arguments =>
-            new PyDataclass("User", ["name", "active"], [arguments[0], PyBool.True], frozen: true),
+        ["make_user"] = static arguments => new PyDataclass(
+            "User",
+            ["name", "active"],
+            [arguments[0], PyBool.True],
+            frozen: true)
+        {
+            Methods = new Dictionary<string, Func<PyDataclass, PyObject[], PyDict?, PyObject>>(StringComparer.Ordinal)
+            {
+                ["greeting"] = static (self, _, _) =>
+                    new PyStr($"Hello, {self.GetAttribute("name")!.Display()}!"),
+            },
+        },
 
         ["make_empty"] = static _ => new PyDataclass("Empty", [], [], frozen: true),
     };
+
+    /// <summary>
+    /// A point record with the methods upstream's harness gives it.
+    /// </summary>
+    /// <remarks>
+    /// The methods exist so the fixtures can exercise calling into a host object with each
+    /// argument shape — none, one, two, and keyword-only.
+    /// </remarks>
+    private static PyDataclass Point(string name, bool frozen) => new(
+        name,
+        ["x", "y"],
+        [new PyInt(1), new PyInt(2)],
+        frozen)
+    {
+        Methods = new Dictionary<string, Func<PyDataclass, PyObject[], PyDict?, PyObject>>(StringComparer.Ordinal)
+        {
+            ["sum"] = static (self, _, _) => new PyInt(X(self) + Y(self)),
+
+            ["add"] = static (self, arguments, _) => new PyDataclass(
+                self.TypeName,
+                ["x", "y"],
+                [new PyInt(X(self) + RequireInt(arguments[0])), new PyInt(Y(self) + RequireInt(arguments[1]))],
+                self.Frozen),
+
+            ["scale"] = static (self, arguments, _) => new PyDataclass(
+                self.TypeName,
+                ["x", "y"],
+                [new PyInt(X(self) * RequireInt(arguments[0])), new PyInt(Y(self) * RequireInt(arguments[0]))],
+                self.Frozen),
+
+            ["describe"] = static (self, arguments, keywords) =>
+            {
+                var label = arguments.Length > 0 ? arguments[0]
+                    : keywords is not null && keywords.TryGetValue(new PyStr("label"), out var named) ? named
+                    : new PyStr(self.TypeName);
+
+                return new PyStr($"{label.Display()}({X(self)}, {Y(self)})");
+            },
+        },
+    };
+
+    private static BigInteger X(PyDataclass point) => RequireInt(point.GetAttribute("x")!);
+
+    private static BigInteger Y(PyDataclass point) => RequireInt(point.GetAttribute("y")!);
 
     private static BigInteger RequireInt(PyObject value) => value switch
     {

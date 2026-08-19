@@ -12,6 +12,17 @@ public sealed class PyDataclass : PyObject
 {
     private readonly Dictionary<string, PyObject> _fields;
 
+    /// <summary>
+    /// Methods the host exposes on this value, by name.
+    /// </summary>
+    /// <remarks>
+    /// A host record is often more than data — it carries behaviour the sandbox is meant to
+    /// call. Each entry is bound to the receiver on lookup, so it reaches Python as an
+    /// ordinary method.
+    /// </remarks>
+    public IReadOnlyDictionary<string, Func<PyDataclass, PyObject[], PyDict?, PyObject>> Methods { get; init; }
+        = new Dictionary<string, Func<PyDataclass, PyObject[], PyDict?, PyObject>>(StringComparer.Ordinal);
+
     /// <summary>Creates a dataclass instance.</summary>
     public PyDataclass(string name, IReadOnlyList<string> fieldNames, IReadOnlyList<PyObject> values, bool frozen)
     {
@@ -39,11 +50,39 @@ public sealed class PyDataclass : PyObject
     public override string TypeName => Name;
 
     /// <inheritdoc />
-    public override string Repr() =>
-        Name + "(" + string.Join(", ", FieldNames.Select(field => $"{field}={_fields[field].Repr()}")) + ")";
+    /// <remarks>
+    /// Only the declared fields are rendered: an attribute set on the instance afterwards
+    /// is not part of what the class says it is.
+    /// </remarks>
+    public override string Repr()
+    {
+        if (!RecursionGuard.TryEnter(this))
+        {
+            return "...";
+        }
+
+        try
+        {
+            return Name + "(" + string.Join(", ", FieldNames.Select(field => $"{field}={_fields[field].Repr()}")) + ")";
+        }
+        finally
+        {
+            RecursionGuard.Exit(this);
+        }
+    }
 
     /// <inheritdoc />
-    public override PyObject? GetAttribute(string name) => _fields.GetValueOrDefault(name);
+    public override PyObject? GetAttribute(string name)
+    {
+        if (_fields.TryGetValue(name, out var value))
+        {
+            return value;
+        }
+
+        return Methods.TryGetValue(name, out var method)
+            ? new PyBoundMethod(name, this, (self, arguments, keywords) => method((PyDataclass)self, arguments, keywords))
+            : null;
+    }
 
     /// <inheritdoc />
     public override bool SetAttribute(string name, PyObject value)
@@ -54,11 +93,8 @@ public sealed class PyDataclass : PyObject
                 PyExceptionType.AttributeError, $"cannot assign to field '{name}'"));
         }
 
-        if (!_fields.ContainsKey(name))
-        {
-            return false;
-        }
-
+        // An unfrozen instance takes new attributes as any object does; only the declared
+        // fields take part in the repr and in equality.
         _fields[name] = value;
         return true;
     }
@@ -95,7 +131,16 @@ public sealed class PyDataclass : PyObject
             return false;
         }
 
-        return FieldNames.All(field =>
-            dataclass._fields.TryGetValue(field, out var value) && _fields[field].PyEquals(value));
+        RecursionGuard.EnterComparison(this);
+
+        try
+        {
+            return FieldNames.All(field =>
+                dataclass._fields.TryGetValue(field, out var value) && SameOrEqual(_fields[field], value));
+        }
+        finally
+        {
+            RecursionGuard.Exit(this);
+        }
     }
 }

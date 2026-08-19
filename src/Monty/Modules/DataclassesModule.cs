@@ -93,12 +93,22 @@ public static class DataclassesModule
 
         module.Add("fields", static arguments =>
         {
+            var declared = arguments[0] switch
+            {
+                PyClass type => type.GetAttribute("__dataclass_fields__"),
+                PyInstance owner => owner.Class.GetAttribute("__dataclass_fields__"),
+                _ => null,
+            };
+
+            if (declared is PyDict descriptors)
+            {
+                return new PyTuple([.. descriptors.Entries.Select(static entry => entry.Value)]);
+            }
+
             var names = arguments[0] switch
             {
                 PyDataclass dataclass => dataclass.FieldNames,
                 PyInstance instance => [.. instance.Fields.Entries.Select(static e => e.Key.Display())],
-                PyClass type when type.GetAttribute("__dataclass_fields__") is PyList declared =>
-                    [.. declared.Items.Select(static f => f.Display())],
                 _ => (IReadOnlyList<string>)[],
             };
 
@@ -160,7 +170,33 @@ public static class DataclassesModule
 
         var names = fields.Select(static f => f.Name).ToList();
 
-        type.SetAttribute("__dataclass_fields__", new PyList([.. names.Select(static f => (PyObject)new PyStr(f))]));
+        var descriptors = new PyDict();
+
+        foreach (var field in fields)
+        {
+            // Every field carries the decorator's defaults: `field()` and the
+            // `@dataclass(...)` switches that vary them are not modelled.
+            descriptors.Set(new PyStr(field.Name), new PyDataclass(
+                "Field",
+                ["name", "type", "default", "init", "repr", "compare", "kw_only", "hash", "doc"],
+                [
+                    new PyStr(field.Name),
+                    type.GetAttribute("__annotations__") is PyDict declared
+                        && declared.TryGetValue(new PyStr(field.Name), out var annotation)
+                        ? annotation
+                        : PyNone.Instance,
+                    field.Default ?? PyNone.Instance,
+                    PyBool.True,
+                    PyBool.True,
+                    PyBool.True,
+                    PyBool.False,
+                    PyNone.Instance,
+                    PyNone.Instance,
+                ],
+                frozen: true));
+        }
+
+        type.SetAttribute("__dataclass_fields__", descriptors);
         type.SetAttribute("__dataclass_frozen__", PyBool.Of(frozen));
 
         if (type.GetAttribute("__init__") is null)

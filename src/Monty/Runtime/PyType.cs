@@ -245,8 +245,29 @@ public static class TypeRegistry
         PyNone => NoneType,
         PyFunction => Function,
         PyGenerator => Generator,
+        // A host record names its own type; the type object is made on demand and cached,
+        // so `type(x) is type(y)` holds for two records of the same shape.
+        PyDataclass record => Named(record.Name),
         _ => All.TryGetValue(value.TypeName, out var known) ? known : Object,
     };
+
+    /// <summary>Gets, creating if needed, the type object for a host-supplied name.</summary>
+    private static PyType Named(string name)
+    {
+        lock (All)
+        {
+            if (All.TryGetValue(name, out var known))
+            {
+                return known;
+            }
+
+            var type = new PyType(name, value => value is PyDataclass record && record.Name == name, static (_, _) =>
+                throw new PyRaise(PyErrors.TypeError("cannot create instances of a host type")));
+
+            All[name] = type;
+            return type;
+        }
+    }
 
     /// <summary>True when <paramref name="value"/> is an instance of <paramref name="type"/>.</summary>
     public static bool IsInstance(PyObject value, PyObject type)
