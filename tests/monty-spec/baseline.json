@@ -291,6 +291,8 @@
   "refcount__shared_reference.py",
   "refcount__single_list.py",
   "refcount__unbound_result.py",
+  "refcount__user_contains.py",
+  "refcount__user_iterator.py",
   "repr__cycle_detection.py",
   "set__unpack_type_error.py",
   "slice__invalid_indices.py",

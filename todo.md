@@ -19,12 +19,12 @@ Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-
 **1,694 / 2,521 conformance cases passing (67.2 %)**.
 
 **Current state — python:** tokenizer, parser, bytecode compiler, VM, core types,
-builtins, six stdlib modules and the external-function boundary are in place.
-**353 / 558 fixtures passing (63.3 %)**.
+builtins, nine stdlib modules, dunder dispatch and the external-function boundary are in
+place. **371 / 558 fixtures passing (66.5 %)**. No host exception escapes to a script any
+more; every remaining failure is Python-level.
 
-Largest remaining gaps: 59 real semantic differences, 37 fixtures needing `re`,
-`datetime`, `dataclasses`, `os`/`pathlib` or `asyncio`, 20 pinning tracebacks the port
-does not format yet, and 16 where a host exception still escapes.
+Largest remaining gaps: ~75 real semantic differences, 22 fixtures needing `asyncio`,
+`os`/`pathlib` or `unicodedata`, and 20 pinning tracebacks the port does not format yet.
 
 | suite | passing |
 |---|---|
@@ -301,7 +301,8 @@ Upstream: `bytecode/` (620 KB — the largest single area)
 - [x] Class bodies as functions producing a namespace
 - [x] Comprehension lowering into implicit functions
 - [~] Generators lower to `Yield`/`YieldFrom`; coroutines do not
-- [ ] Non-constant default values (currently rejected at compile time)
+- [x] Default values evaluated at definition time in the enclosing scope, so a
+      mutable default is shared across calls
 - [ ] Constant folding and the peepholes upstream applies
 - [ ] Compile-time limits: bytecode size, constant count, nesting depth
 
@@ -335,7 +336,10 @@ Upstream: `types/` (1.1 MB), `builtins/` (188 KB)
       upstream limitations, not oversights
 - [x] Exception hierarchy with CPython's message wording
 - [ ] `complex`, `bytearray`, `memoryview`, `frozenset` as a distinct type
-- [ ] Dunder protocol dispatch on user classes (`__eq__`, `__len__`, `__iter__`, …)
+- [x] Dunder dispatch on user classes: `__repr__` `__str__` `__bool__` `__eq__`
+      `__hash__` `__lt__` `__len__` `__iter__` `__next__` `__contains__`
+      `__getitem__` `__setitem__` `__delitem__`, the arithmetic dunders and their
+      reflected forms, `__neg__` `__pos__` `__invert__`
 - [x] Builtins: `len` `range` `print` `sorted` `enumerate` `zip` `map` `filter` `sum`
       `min` `max` `abs` `all` `any` `repr` `str` `int` `float` `bool` `list` `dict`
       `set` `tuple` `isinstance` `issubclass` `type` `getattr` `setattr` `hasattr`
@@ -348,13 +352,12 @@ Upstream: `types/` (1.1 MB), `builtins/` (188 KB)
 
 Upstream: `modules/` — the permitted set and nothing more.
 
-- [x] `math`, `json`, `sys`, `typing`, `__future__`
+- [x] `math`, `json`, `sys`, `typing`, `__future__`, `re`, `datetime`, `dataclasses`
 - [x] `collections` (`Counter`, `defaultdict`, `namedtuple`, `OrderedDict`, `deque`)
 - [x] `itertools`
-- [ ] `re`, `datetime`, `dataclasses` — 37 fixtures blocked on these
 - [ ] `os` and `pathlib` — routed through this repo's `IFileSystem`, so Python and bash
       see one filesystem
-- [ ] `unicodedata`, `asyncio`
+- [ ] `unicodedata`, `asyncio`, `gc`
 - [~] `itertools.count` and `repeat` are bounded rather than infinite, since results are
       materialized rather than lazy
 

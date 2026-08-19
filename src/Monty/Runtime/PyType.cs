@@ -37,6 +37,34 @@ public sealed class PyType : PyCallable
     public override System.Numerics.BigInteger PyHash() =>
         new(StringComparer.Ordinal.GetHashCode(Name));
 
+    /// <inheritdoc />
+    public override PyObject? GetAttribute(string name)
+    {
+        if (name is "__name__" or "__qualname__")
+        {
+            return new PyStr(Name);
+        }
+
+        // `dict.fromkeys(...)` is reached through the type, not an instance.
+        if (Name == "dict" && name == "fromkeys")
+        {
+            return new PyBuiltinFunction("fromkeys", static arguments =>
+            {
+                var dict = new PyDict();
+                var value = arguments.Length > 1 ? arguments[1] : PyNone.Instance;
+
+                foreach (var key in VirtualMachine.RequireIterable(arguments[0]))
+                {
+                    dict.Set(key, value);
+                }
+
+                return dict;
+            });
+        }
+
+        return null;
+    }
+
     /// <summary>Constructs an instance.</summary>
     public PyObject Construct(PyObject[] arguments, PyDict? keywords) => _construct(arguments, keywords);
 

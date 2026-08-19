@@ -75,7 +75,7 @@ public static class SupportModules
     }
 
     /// <summary>Builds <c>itertools</c>.</summary>
-    public static PyModuleObject CreateItertools()
+    public static PyModuleObject CreateItertools(VirtualMachine machine)
     {
         var module = new PyModuleObject("itertools");
 
@@ -178,6 +178,59 @@ public static class SupportModules
 
             return new PyIterator(totals);
         });
+
+        module.Add("pairwise", static arguments =>
+        {
+            var items = VirtualMachine.RequireIterable(arguments[0]).ToList();
+            var pairs = new List<PyObject>(Math.Max(0, items.Count - 1));
+
+            for (var i = 0; i + 1 < items.Count; i++)
+            {
+                pairs.Add(new PyTuple([items[i], items[i + 1]]));
+            }
+
+            return new PyIterator(pairs);
+        });
+
+        module.Add("takewhile", arguments =>
+        {
+            var results = new List<PyObject>();
+
+            foreach (var item in VirtualMachine.RequireIterable(arguments[1]))
+            {
+                if (!machine.Call(arguments[0], [item]).IsTruthy())
+                {
+                    break;
+                }
+
+                results.Add(item);
+            }
+
+            return new PyIterator(results);
+        });
+
+        module.Add("dropwhile", arguments =>
+        {
+            var results = new List<PyObject>();
+            var dropping = true;
+
+            foreach (var item in VirtualMachine.RequireIterable(arguments[1]))
+            {
+                if (dropping && machine.Call(arguments[0], [item]).IsTruthy())
+                {
+                    continue;
+                }
+
+                dropping = false;
+                results.Add(item);
+            }
+
+            return new PyIterator(results);
+        });
+
+        module.Add("filterfalse", arguments => new PyIterator(
+            [.. VirtualMachine.RequireIterable(arguments[1])
+                .Where(item => !machine.Call(arguments[0], [item]).IsTruthy())]));
 
         module.Add("zip_longest", static (arguments, keywords) =>
         {

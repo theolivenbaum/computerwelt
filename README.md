@@ -78,7 +78,7 @@ Never lower a baseline number to make a build green.
 | | conformance | notes |
 |---|---|---|
 | shell | **1,694 / 2,521** | 73 commands implemented |
-| python | **353 / 558** | parser, bytecode compiler, VM, core types, builtins, 6 stdlib modules |
+| python | **371 / 558** | parser, bytecode compiler, VM, types, builtins, 9 stdlib modules, dunders |
 
 The two halves do not yet share a filesystem; that is the last step of the Python port.
 

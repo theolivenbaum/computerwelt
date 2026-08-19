@@ -407,6 +407,13 @@ public static class BuiltinMethods
                 return Method(name, receiver, static (self, _, _) =>
                     new PyBytes(Encoding.UTF8.GetBytes(((PyStr)self).Value)));
 
+            case "casefold":
+                return Method(name, receiver, static (self, _, _) =>
+                    new PyStr(((PyStr)self).Value.ToLowerInvariant()));
+
+            case "rjust_placeholder":
+                return null;
+
             case "expandtabs":
                 return Method(name, receiver, (self, arguments, _) =>
                 {
@@ -739,6 +746,20 @@ public static class BuiltinMethods
 
             case "copy":
                 return Method(name, receiver, static (self, _, _) => ((PyDict)self).Copy());
+
+            case "fromkeys":
+                return Method(name, receiver, 1, 2, static (_, arguments, _) =>
+                {
+                    var dict = new PyDict();
+                    var value = arguments.Length > 1 ? arguments[1] : PyNone.Instance;
+
+                    foreach (var key in VirtualMachine.RequireIterable(arguments[0]))
+                    {
+                        dict.Set(key, value);
+                    }
+
+                    return dict;
+                });
 
             default:
                 _ = machine;

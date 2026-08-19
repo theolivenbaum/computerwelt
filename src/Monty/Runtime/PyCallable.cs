@@ -173,11 +173,25 @@ public sealed class PyClass : PyCallable
     }
 }
 
-/// <summary>An instance of a Python class.</summary>
+/// <summary>
+/// An instance of a Python class.
+/// </summary>
+/// <remarks>
+/// Every protocol the interpreter uses — truthiness, equality, hashing, iteration,
+/// indexing, comparison — is answered by looking for the matching dunder on the class and
+/// calling it. That is what makes a user class behave like a built-in one, and it is why
+/// an instance holds a reference to the machine that will run those methods.
+/// </remarks>
 public sealed class PyInstance : PyObject
 {
+    private readonly VirtualMachine? _machine;
+
     /// <summary>Creates an instance of <paramref name="type"/>.</summary>
-    public PyInstance(PyClass type) => Class = type;
+    public PyInstance(PyClass type, VirtualMachine? machine = null)
+    {
+        Class = type;
+        _machine = machine;
+    }
 
     /// <summary>The class this is an instance of.</summary>
     public PyClass Class { get; }
@@ -189,7 +203,195 @@ public sealed class PyInstance : PyObject
     public override string TypeName => Class.Name;
 
     /// <inheritdoc />
-    public override string Repr() => $"<{Class.Name} object>";
+    public override string Repr() =>
+        Dunder("__repr__") is { } repr ? Invoke(repr, []).Display() : $"<{Class.Name} object>";
+
+    /// <inheritdoc />
+    public override string Display() =>
+        Dunder("__str__") is { } str ? Invoke(str, []).Display() : Repr();
+
+    /// <inheritdoc />
+    public override bool IsTruthy()
+    {
+        if (Dunder("__bool__") is { } boolean)
+        {
+            return Invoke(boolean, []).IsTruthy();
+        }
+
+        // Without `__bool__`, a container is falsy when empty; anything else is true.
+        return Dunder("__len__") is not { } length || Invoke(length, []).IsTruthy();
+    }
+
+    /// <inheritdoc />
+    public override bool PyEquals(PyObject other) =>
+        Dunder("__eq__") is { } equals
+            ? Invoke(equals, [other]).IsTruthy()
+            : ReferenceEquals(this, other);
+
+    /// <inheritdoc />
+    public override System.Numerics.BigInteger PyHash() =>
+        Dunder("__hash__") is { } hash
+            ? ((PyInt)Invoke(hash, [])).Value
+            // A class defining `__eq__` without `__hash__` is unhashable, as Python says.
+            : Dunder("__eq__") is not null
+                ? throw new PyRaise(PyErrors.TypeError($"unhashable type: '{Class.Name}'"))
+                : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
+
+    /// <inheritdoc />
+    public override int? PyCompare(PyObject other)
+    {
+        if (Dunder("__lt__") is { } less)
+        {
+            if (Invoke(less, [other]).IsTruthy())
+            {
+                return -1;
+            }
+
+            return PyEquals(other) ? 0 : 1;
+        }
+
+        return null;
+    }
+
+    /// <inheritdoc />
+    public override int? Length() =>
+        Dunder("__len__") is { } length ? ((PyInt)Invoke(length, [])).ToIndex() : null;
+
+    /// <inheritdoc />
+    public override IEnumerable<PyObject>? Iterate()
+    {
+        if (Dunder("__iter__") is { } iterator)
+        {
+            return Drain(Invoke(iterator, []));
+        }
+
+        // The legacy protocol: `__getitem__` from 0 until IndexError.
+        return Dunder("__getitem__") is null ? null : IterateByIndex();
+    }
+
+    /// <inheritdoc />
+    public override bool Contains(PyObject item) =>
+        Dunder("__contains__") is { } contains
+            ? Invoke(contains, [item]).IsTruthy()
+            : base.Contains(item);
+
+    /// <inheritdoc />
+    public override PyObject GetItem(PyObject index) =>
+        Dunder("__getitem__") is { } getter
+            ? Invoke(getter, [index])
+            : throw new PyRaise(PyErrors.TypeError($"'{Class.Name}' object is not subscriptable"));
+
+    /// <inheritdoc />
+    public override void SetItem(PyObject index, PyObject value)
+    {
+        if (Dunder("__setitem__") is not { } setter)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"'{Class.Name}' object does not support item assignment"));
+        }
+
+        Invoke(setter, [index, value]);
+    }
+
+    /// <inheritdoc />
+    public override void DeleteItem(PyObject index)
+    {
+        if (Dunder("__delitem__") is not { } deleter)
+        {
+            throw new PyRaise(PyErrors.TypeError($"'{Class.Name}' object doesn't support item deletion"));
+        }
+
+        Invoke(deleter, [index]);
+    }
+
+    /// <summary>Looks up a dunder method on the class, bound to this instance.</summary>
+    public PyObject? Dunder(string name)
+    {
+        if (_machine is null)
+        {
+            return null;
+        }
+
+        var attribute = Class.GetAttribute(name);
+
+        return attribute switch
+        {
+            PyFunction function => function.Bind(this),
+            null => null,
+            _ => attribute,
+        };
+    }
+
+    /// <summary>Calls a bound dunder.</summary>
+    public PyObject Invoke(PyObject callable, PyObject[] arguments) =>
+        _machine is null
+            ? throw new PyRaise(PyErrors.RuntimeError("no interpreter available"))
+            // A builtin `__init__` installed by a decorator is unbound, so it needs the
+            // receiver passed explicitly.
+            : _machine.Call(callable, callable is PyBuiltinFunction ? [this, .. arguments] : arguments);
+
+    private IEnumerable<PyObject> Drain(PyObject iterator)
+    {
+        if (iterator is PyIterator sequence)
+        {
+            while (sequence.Next() is { } value)
+            {
+                yield return value;
+            }
+
+            yield break;
+        }
+
+        if (iterator is PyGenerator generator)
+        {
+            while (generator.Next() is { } value)
+            {
+                yield return value;
+            }
+
+            yield break;
+        }
+
+        if (iterator is not PyInstance instance || instance.Dunder("__next__") is not { } next)
+        {
+            throw new PyRaise(PyErrors.TypeError("__iter__ returned a non-iterator"));
+        }
+
+        while (true)
+        {
+            PyObject value;
+
+            try
+            {
+                value = instance.Invoke(next, []);
+            }
+            catch (PyRaise raise) when (raise.Exception.IsInstanceOf(PyExceptionType.StopIteration))
+            {
+                yield break;
+            }
+
+            yield return value;
+        }
+    }
+
+    private IEnumerable<PyObject> IterateByIndex()
+    {
+        for (var i = 0; ; i++)
+        {
+            PyObject value;
+
+            try
+            {
+                value = GetItem(new PyInt(i));
+            }
+            catch (PyRaise raise) when (raise.Exception.IsInstanceOf(PyExceptionType.IndexError))
+            {
+                yield break;
+            }
+
+            yield return value;
+        }
+    }
 
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name)

@@ -13,13 +13,17 @@ namespace Monty.Modules;
 public static class StandardLibrary
 {
     /// <summary>Builds the standard modules for a machine.</summary>
-    public static Dictionary<string, PyObject> Create(VirtualMachine machine) => new(StringComparer.Ordinal)
+    public static Dictionary<string, PyObject> Create(VirtualMachine machine, TimeProvider? timeProvider = null) =>
+        new(StringComparer.Ordinal)
     {
+        ["re"] = ReModule.Create(),
+        ["dataclasses"] = DataclassesModule.Create(machine),
+        ["datetime"] = DatetimeModule.Create(timeProvider ?? TimeProvider.System),
         ["math"] = MathModule.Create(),
         ["sys"] = SysModule.Create(machine),
         ["json"] = JsonModule.Create(),
         ["collections"] = SupportModules.CreateCollections(machine),
-        ["itertools"] = SupportModules.CreateItertools(),
+        ["itertools"] = SupportModules.CreateItertools(machine),
         ["typing"] = SupportModules.CreateTyping(),
         ["__future__"] = new PyModuleObject("__future__").Add("annotations", PyNone.Instance),
     };

@@ -89,8 +89,11 @@ public sealed class VirtualMachine
             case PyClass type:
                 return Instantiate(type, arguments, keywords);
 
-            case Modules.NamedTupleFactory factory:
+            case Monty.Modules.NamedTupleFactory factory:
                 return factory.Instantiate(arguments, keywords);
+
+            case PyCallable constructible when Monty.Modules.DatetimeModule.TryConstruct(constructible, arguments) is { } built:
+                return built;
 
             case PyExceptionType exceptionType:
             {
@@ -105,15 +108,22 @@ public sealed class VirtualMachine
 
     private PyObject Instantiate(PyClass type, PyObject[] arguments, PyDict? keywords)
     {
-        var instance = new PyInstance(type);
+        var instance = new PyInstance(type, this);
 
-        if (type.GetAttribute("__init__") is PyFunction initializer)
+        switch (type.GetAttribute("__init__"))
         {
-            CallFunction(initializer.Bind(instance), arguments, keywords);
-        }
-        else if (arguments.Length > 0)
-        {
-            throw new PyRaise(PyErrors.TypeError($"{type.Name}() takes no arguments"));
+            case PyFunction initializer:
+                CallFunction(initializer.Bind(instance), arguments, keywords);
+                break;
+
+            // A decorator such as `@dataclass` installs a builtin `__init__`, which is
+            // unbound and therefore takes the receiver as its first argument.
+            case PyBuiltinFunction builtin:
+                builtin.Invoke([instance, .. arguments], keywords);
+                break;
+
+            case null when arguments.Length > 0:
+                throw new PyRaise(PyErrors.TypeError($"{type.Name}() takes no arguments"));
         }
 
         return instance;

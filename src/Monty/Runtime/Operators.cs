@@ -14,9 +14,43 @@ namespace Monty.Runtime;
 /// </remarks>
 public static class Operators
 {
+    /// <summary>The dunder each binary operator dispatches to on a user class.</summary>
+    private static readonly Dictionary<string, (string Forward, string Reflected)> ArithmeticDunders =
+        new(StringComparer.Ordinal)
+        {
+            ["+"] = ("__add__", "__radd__"),
+            ["-"] = ("__sub__", "__rsub__"),
+            ["*"] = ("__mul__", "__rmul__"),
+            ["/"] = ("__truediv__", "__rtruediv__"),
+            ["//"] = ("__floordiv__", "__rfloordiv__"),
+            ["%"] = ("__mod__", "__rmod__"),
+            ["**"] = ("__pow__", "__rpow__"),
+            ["&"] = ("__and__", "__rand__"),
+            ["|"] = ("__or__", "__ror__"),
+            ["^"] = ("__xor__", "__rxor__"),
+            ["<<"] = ("__lshift__", "__rlshift__"),
+            [">>"] = ("__rshift__", "__rrshift__"),
+            ["@"] = ("__matmul__", "__rmatmul__"),
+        };
+
     /// <summary>Applies a binary operator.</summary>
     public static PyObject Binary(string op, PyObject left, PyObject right)
     {
+        // A user class defines an operator by its dunder; the reflected form is tried when
+        // the left operand does not implement the forward one.
+        if ((left is PyInstance || right is PyInstance) && ArithmeticDunders.TryGetValue(op, out var dunders))
+        {
+            if (left is PyInstance leftInstance && leftInstance.Dunder(dunders.Forward) is { } forward)
+            {
+                return leftInstance.Invoke(forward, [right]);
+            }
+
+            if (right is PyInstance rightInstance && rightInstance.Dunder(dunders.Reflected) is { } reflected)
+            {
+                return rightInstance.Invoke(reflected, [left]);
+            }
+        }
+
         switch (op)
         {
             case "+": return Add(left, right);
@@ -45,6 +79,8 @@ public static class Operators
 
         "-" => operand switch
         {
+            PyInstance instance when instance.Dunder("__neg__") is { } negate =>
+                instance.Invoke(negate, []),
             PyBool flag => new PyInt(flag.Value ? -1 : 0),
             PyInt integer => new PyInt(-integer.Value),
             PyFloat number => new PyFloat(-number.Value),
@@ -53,6 +89,8 @@ public static class Operators
 
         "+" => operand switch
         {
+            PyInstance instance when instance.Dunder("__pos__") is { } plus =>
+                instance.Invoke(plus, []),
             PyBool flag => new PyInt(flag.Value ? 1 : 0),
             PyInt or PyFloat => operand,
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary +: '{operand.TypeName}'")),
@@ -60,6 +98,8 @@ public static class Operators
 
         "~" => operand switch
         {
+            PyInstance instance when instance.Dunder("__invert__") is { } invert =>
+                instance.Invoke(invert, []),
             PyInt integer => new PyInt(-integer.Value - 1),
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary ~: '{operand.TypeName}'")),
         },
