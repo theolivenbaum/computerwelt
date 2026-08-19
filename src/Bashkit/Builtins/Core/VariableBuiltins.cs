@@ -13,7 +13,8 @@ public sealed class ExportBuiltin : IBuiltin
     /// <inheritdoc />
     public ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
-        if (context.Arguments.Count == 0)
+        // `export` and `export -p` both list what is exported.
+        if (context.Arguments.Count == 0 || context.Arguments.All(static a => a is "-p"))
         {
             var builder = new StringBuilder();
             foreach (var (name, variable) in context.State.AllVariables().OrderBy(static p => p.Key, StringComparer.Ordinal))
@@ -563,7 +564,8 @@ public sealed class SetBuiltin : IBuiltin
     /// <inheritdoc />
     public ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
-        if (context.Arguments.Count == 0)
+        // `export` and `export -p` both list what is exported.
+        if (context.Arguments.Count == 0 || context.Arguments.All(static a => a is "-p"))
         {
             var builder = new StringBuilder();
             foreach (var (name, variable) in context.State.AllVariables().OrderBy(static p => p.Key, StringComparer.Ordinal))

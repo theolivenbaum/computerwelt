@@ -43,6 +43,16 @@ public abstract record Node
 {
     /// <summary>The source range this node covers.</summary>
     public Span Span { get; init; }
+
+    /// <summary>
+    /// The 1-based source line this node starts on, or zero when unknown.
+    /// </summary>
+    /// <remarks>
+    /// Recorded at parse time rather than derived later, because a function's body outlives
+    /// the script text it came from: by the time the function is called, the running script
+    /// may be a different file entirely.
+    /// </remarks>
+    public int Line { get; init; }
 }
 
 /// <summary>A command name with arguments, assignments and redirections.</summary>

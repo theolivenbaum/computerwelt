@@ -62,7 +62,7 @@ public sealed class SourceBuiltin : IBuiltin
     {
         if (context.Arguments.Count == 0)
         {
-            return ExecResult.Usage(Name, "filename argument required");
+            return ExecResult.Usage(Name, "filename argument required", ExitCodes.Failure);
         }
 
         var target = context.Arguments[0];

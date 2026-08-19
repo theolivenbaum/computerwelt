@@ -933,6 +933,11 @@ public sealed class Interpreter
 
     private async ValueTask<ExecResult> ExecuteSimpleCoreAsync(SimpleCommand command, StreamData? stdin, CancellationToken cancellationToken)
     {
+        if (command.Line > 0)
+        {
+            State.CurrentLine = command.Line;
+        }
+
         // A bare assignment list with no command name assigns in the current shell.
         if (command.Words.Count == 0)
         {

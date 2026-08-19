@@ -86,6 +86,22 @@ public sealed class Parser
     private ParseException Unexpected(string expectation) =>
         new($"syntax error near unexpected token `{Current.Text}': {expectation}", Current.Start);
 
+    /// <summary>The 1-based line <paramref name="offset"/> falls on.</summary>
+    private int LineOf(int offset)
+    {
+        var line = 1;
+
+        for (var i = 0; i < offset && i < _source.Length; i++)
+        {
+            if (_source[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
+    }
+
     /// <summary>The source text from <paramref name="start"/> to where parsing has reached.</summary>
     private string Slice(int start)
     {
@@ -945,6 +961,7 @@ public sealed class Parser
         return new SimpleCommand(assignments, words, redirects)
         {
             Span = new Span(start, Math.Max(0, Current.Start - start)),
+            Line = LineOf(start),
         };
     }
 

@@ -80,13 +80,15 @@ public sealed class ReadlinkBuiltin : IBuiltin
     {
         var cursor = new ArgCursor(context.Arguments);
         var canonicalize = false;
+        var noNewline = false;
 
         while (cursor.NextOption() is { } option)
         {
             switch (option)
             {
                 case "-f" or "-e" or "-m" or "--canonicalize": canonicalize = true; break;
-                case "-n" or "-q" or "-s" or "-v" or "-z": break;
+                case "-n" or "--no-newline": noNewline = true; break;
+                case "-q" or "-s" or "-v" or "-z": break;
                 default:
                     return ExecResult.Usage("readlink", $"invalid option -- '{option.TrimStart('-')}'");
             }
@@ -113,6 +115,12 @@ public sealed class ReadlinkBuiltin : IBuiltin
             {
                 failed = true;
             }
+        }
+
+        // `-n` drops the final newline, so the result can be embedded in a longer line.
+        if (noNewline && builder.Length > 0 && builder[^1] == '\n')
+        {
+            builder.Length--;
         }
 
         return new ExecResult
@@ -371,7 +379,15 @@ public sealed class StatBuiltin : IBuiltin
         {
             switch (option)
             {
-                case "-c" or "--format" or "--printf": format = cursor.TakeValue(); break;
+                case "-c" or "--format" or "--printf":
+                    format = cursor.TakeValue();
+
+                    if (format is null)
+                    {
+                        return ExecResult.Usage("stat", $"option requires an argument -- '{option.TrimStart('-')}'", ExitCodes.Usage);
+                    }
+
+                    break;
                 case "-L" or "--dereference" or "-t" or "-f": break;
                 default:
                     return ExecResult.Usage("stat", $"invalid option -- '{option.TrimStart('-')}'");

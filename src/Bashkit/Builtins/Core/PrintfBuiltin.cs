@@ -222,6 +222,33 @@ public sealed class PrintfBuiltin : IBuiltin
     }
 
     /// <summary>
+    /// Applies precision and the alternate-form flag to an already-rendered integer.
+    /// </summary>
+    /// <remarks>
+    /// A precision of zero prints nothing for a zero value, except that <c>%#o</c> still
+    /// prints its <c>0</c> prefix — the prefix is the alternate form, not the digit.
+    /// </remarks>
+    private static string Integer(string text, int? precision, string flags, string prefix)
+    {
+        var alternate = flags.Contains('#', StringComparison.Ordinal) && text != "0";
+
+        if (precision is { } digits)
+        {
+            text = text == "0" && digits == 0 ? string.Empty : text.PadLeft(digits, '0');
+        }
+
+        if (!flags.Contains('#', StringComparison.Ordinal))
+        {
+            return text;
+        }
+
+        // `%#o` guarantees a leading zero even when the value is zero.
+        return prefix == "0"
+            ? text.StartsWith('0') ? text : "0" + text
+            : alternate ? prefix + text : text;
+    }
+
+    /// <summary>
     /// Quotes an argument so the shell would read it back unchanged.
     /// </summary>
     /// <remarks>
@@ -326,9 +353,11 @@ public sealed class PrintfBuiltin : IBuiltin
             {
                 var value = ParseInteger(argument);
                 var text = Math.Abs(value).ToString(CultureInfo.InvariantCulture);
+
                 if (precision is { } digits)
                 {
-                    text = text.PadLeft(digits, '0');
+                    // An explicit precision of zero prints nothing for a zero value.
+                    text = value == 0 && digits == 0 ? string.Empty : text.PadLeft(digits, '0');
                 }
 
                 if (value < 0)
@@ -342,16 +371,16 @@ public sealed class PrintfBuiltin : IBuiltin
             }
 
             case 'u':
-                return ((ulong)ParseInteger(argument)).ToString(CultureInfo.InvariantCulture);
+                return Integer(((ulong)ParseInteger(argument)).ToString(CultureInfo.InvariantCulture), precision, flags, string.Empty);
 
             case 'x':
-                return ParseInteger(argument).ToString("x", CultureInfo.InvariantCulture);
+                return Integer(ParseInteger(argument).ToString("x", CultureInfo.InvariantCulture), precision, flags, "0x");
 
             case 'X':
-                return ParseInteger(argument).ToString("X", CultureInfo.InvariantCulture);
+                return Integer(ParseInteger(argument).ToString("X", CultureInfo.InvariantCulture), precision, flags, "0X");
 
             case 'o':
-                return System.Convert.ToString(ParseInteger(argument), 8);
+                return Integer(System.Convert.ToString(ParseInteger(argument), 8), precision, flags, "0");
 
             case 'c':
                 return argument.Length > 0 ? argument[0].ToString() : string.Empty;

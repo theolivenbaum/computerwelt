@@ -517,7 +517,14 @@ public sealed class PasteBuiltin : IBuiltin
         {
             switch (option)
             {
-                case "-d" or "--delimiters": delimiters = TrBuiltin.ExpandSet(cursor.TakeValue() ?? "\t"); break;
+                case "-d" or "--delimiters":
+                    if (cursor.TakeValue() is not { } value)
+                    {
+                        return ExecResult.Usage("paste", $"option requires an argument -- '{option.TrimStart('-')}'", ExitCodes.Failure);
+                    }
+
+                    delimiters = TrBuiltin.ExpandSet(value);
+                    break;
                 case "-s" or "--serial": serial = true; break;
                 default:
                     return ExecResult.Usage("paste", $"invalid option -- '{option.TrimStart('-')}'");
