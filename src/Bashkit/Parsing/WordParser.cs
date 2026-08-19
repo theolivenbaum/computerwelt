@@ -42,6 +42,23 @@ public static class WordParser
 
             switch (c)
             {
+                // `<(cmd)` and `>(cmd)` are word content the lexer kept together.
+                case '<' or '>' when i + 1 < raw.Length && raw[i + 1] == '(':
+                {
+                    var end = MatchParenthesis(raw, i + 1);
+
+                    if (end < 0)
+                    {
+                        break;
+                    }
+
+                    FlushLiteral(quoted: false);
+                    parts.Add(new WordPart.ProcessSubstitution(raw[(i + 2)..end], Output: c == '>'));
+                    i = end + 1;
+                    atStart = false;
+                    continue;
+                }
+
                 case '~' when atStart:
                 {
                     var end = i + 1;
@@ -696,6 +713,34 @@ public static class WordParser
 
         return text[start..end];
     }
+    /// <summary>Finds the <c>)</c> that closes the group opening at <paramref name="open"/>.</summary>
+    private static int MatchParenthesis(string text, int open)
+    {
+        var depth = 0;
+
+        for (var i = open; i < text.Length; i++)
+        {
+            switch (text[i])
+            {
+                case '(':
+                    depth++;
+                    break;
+
+                case ')':
+                    depth--;
+
+                    if (depth == 0)
+                    {
+                        return i;
+                    }
+
+                    break;
+            }
+        }
+
+        return -1;
+    }
+
 
     /// <summary>Formats an integer the way the shell does, with no locale influence.</summary>
     internal static string FormatNumber(long value) => value.ToString(CultureInfo.InvariantCulture);

@@ -64,6 +64,16 @@ public sealed class BuiltinContext
     /// <summary>Piped or redirected standard input, or <see langword="null"/> when there is none.</summary>
     public StreamData? Stdin { get; }
 
+    /// <summary>
+    /// The same input as a consumable stream, for the commands whose reads advance it.
+    /// </summary>
+    /// <remarks>
+    /// Only <c>read</c> needs this, and it needs it badly: sharing one stream across a
+    /// loop's iterations is what makes <c>while read line; do ...; done &lt; file</c>
+    /// terminate instead of re-reading the first line forever.
+    /// </remarks>
+    public InputStream? Input { get; init; }
+
     /// <summary>The current working directory.</summary>
     public VPath WorkingDirectory => State.WorkingDirectory;
 

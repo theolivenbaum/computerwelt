@@ -61,22 +61,23 @@ public sealed class Interpreter
         BuiltinNames: () => _builtins.Keys)
     {
         RunIsolated = RunIsolatedAsync,
-        SetStandardInput = data => _standardInput = data,
+        SetStandardInput = data => _standardInput = data is { } value ? new InputStream(value.ToString()) : null,
     };
 
     private Builtins.ShellHooks? _hooks;
 
     /// <summary>
-    /// The shell's standard input, remembered so command substitutions inherit it.
+    /// The shell's standard input, remembered so command substitutions inherit it and
+    /// successive reads advance through it.
     /// </summary>
-    private StreamData? _standardInput;
+    private InputStream? _standardInput;
 
     /// <summary>Runs a whole script and returns its combined result.</summary>
     public async ValueTask<ExecResult> RunAsync(Script script, StreamData? stdin = null, CancellationToken cancellationToken = default)
     {
         var stdout = new StringBuilder();
         var result = ExecResult.Success;
-        _standardInput ??= stdin;
+        _standardInput ??= stdin is { } data ? new InputStream(data.ToString()) : null;
 
         foreach (var command in script.Commands)
         {
@@ -359,8 +360,24 @@ public sealed class Interpreter
         {
             return redirectionFailure;
         }
-        var result = await ExecuteAsync(compound.Body, redirection.Stdin, cancellationToken);
-        return await redirection.ApplyAsync(result, cancellationToken);
+        // A redirection on a compound command scopes one input stream to its whole body,
+        // which is what lets a `while read` loop advance through the file.
+        var saved = _standardInput;
+
+        if (compound.Redirects.Any(static r => r.Kind is RedirectKind.Input or RedirectKind.HereDocument or RedirectKind.HereString))
+        {
+            _standardInput = new InputStream(redirection.Stdin?.ToString() ?? string.Empty);
+        }
+
+        try
+        {
+            var result = await ExecuteAsync(compound.Body, null, cancellationToken);
+            return await redirection.ApplyAsync(result, cancellationToken);
+        }
+        finally
+        {
+            _standardInput = saved;
+        }
     }
 
     private async ValueTask<ExecResult> ExecuteIfAsync(IfCommand command, StreamData? stdin, CancellationToken cancellationToken)
@@ -802,9 +819,10 @@ public sealed class Interpreter
         StreamData? stdin,
         CancellationToken cancellationToken)
     {
-        // A command with no input of its own reads the shell's, which `exec < file` may
-        // have redirected.
-        stdin ??= _standardInput;
+        // A command with no input of its own reads the shell's, which a redirection on an
+        // enclosing loop or an `exec < file` may have replaced.
+        var inheritsShellInput = stdin is null;
+        stdin ??= _standardInput?.Remaining;
 
         if (State.Functions.TryGetValue(name, out var function))
         {
@@ -820,7 +838,13 @@ public sealed class Interpreter
         var saved = await ApplyTemporaryAssignmentsAsync(assignments, cancellationToken);
         try
         {
-            var context = new BuiltinContext(name, arguments, State, FileSystem, Budget, stdin, Hooks);
+            // Reads share the shell's stream when the input came from it, and get a
+            // private one otherwise — a pipe feeds exactly one command.
+            var input = inheritsShellInput
+                ? _standardInput
+                : stdin is { } data ? new InputStream(data.ToString()) : null;
+
+            var context = new BuiltinContext(name, arguments, State, FileSystem, Budget, stdin, Hooks) { Input = input };
             return await builtin.ExecuteAsync(context, cancellationToken);
         }
         finally
@@ -1034,12 +1058,11 @@ public sealed class Interpreter
         using var nesting = Budget.EnterNesting();
 
         var parsed = Parser.Parse(script, Budget);
-        var nested = new Interpreter(State, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
-
         // A substitution inherits the shell's standard input, so `x=$(cat)` in a script fed
         // from a pipe reads that pipe — the file descriptor a real shell would have handed
         // down.
-        var result = await nested.RunAsync(parsed, _standardInput, cancellationToken);
+        var nested = new Interpreter(State, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
+        var result = await nested.RunAsync(parsed, _standardInput?.Remaining, cancellationToken);
 
         AppendStderr(result.Stderr);
         return result with { Stderr = StreamData.Empty, ControlFlow = ControlFlow.None };

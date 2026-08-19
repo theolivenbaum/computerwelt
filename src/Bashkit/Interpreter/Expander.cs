@@ -242,9 +242,8 @@ public sealed class Expander
                 return [result.Stdout.ToString().TrimEnd('\n')];
             }
 
-            case WordPart.ProcessSubstitution:
-                // Requires a real descriptor to hand to the command; not yet supported.
-                return [string.Empty];
+            case WordPart.ProcessSubstitution substitution:
+                return [await ExpandProcessSubstitutionAsync(substitution, cancellationToken)];
 
             case WordPart.Parameter parameter:
                 return await ExpandParameterAsync(parameter, splitting, cancellationToken);
@@ -253,6 +252,37 @@ public sealed class Expander
                 return [];
         }
     }
+
+    /// <summary>
+    /// Expands <c>&lt;(...)</c> by running the command and handing back a path to its
+    /// output.
+    /// </summary>
+    /// <remarks>
+    /// bash names a pipe under <c>/dev/fd</c>; there are no descriptors here, so the output
+    /// is materialised into a file instead. The difference is only visible to a command that
+    /// inspects the path, and everything that simply reads it — <c>cat</c>, <c>diff</c>,
+    /// <c>paste</c>, a redirection — behaves identically.
+    /// </remarks>
+    private async ValueTask<string> ExpandProcessSubstitutionAsync(
+        WordPart.ProcessSubstitution substitution,
+        CancellationToken cancellationToken)
+    {
+        if (substitution.Output)
+        {
+            // `>(cmd)` would need the command to run as the writer drains it, which without
+            // concurrent processes cannot be arranged.
+            return "/dev/null";
+        }
+
+        var result = await _runCommandSubstitution(substitution.Script, cancellationToken);
+        var path = VPath.Parse($"/tmp/.bashkit-procsub-{Interlocked.Increment(ref _processSubstitutionCount)}");
+
+        await _fileSystem.CreateDirectoryAsync(VPath.Parse("/tmp"), recursive: true, cancellationToken);
+        await _fileSystem.WriteFileAsync(path, result.Stdout.Memory, cancellationToken);
+        return path.Value;
+    }
+
+    private static int _processSubstitutionCount;
 
     private string ExpandTilde(string user)
     {

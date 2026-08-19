@@ -286,15 +286,24 @@ public sealed class ReadBuiltin : IBuiltin
             }
         }
 
-        var input = context.StdinText;
+        // Reading consumes, so a loop over the same input advances rather than repeating.
+        string? line;
 
-        if (input.Length == 0)
+        if (context.Input is { } stream)
+        {
+            line = stream.ReadLine(delimiter);
+        }
+        else
+        {
+            var input = context.StdinText;
+            var newline = input.IndexOf(delimiter, StringComparison.Ordinal);
+            line = input.Length == 0 ? null : newline < 0 ? input : input[..newline];
+        }
+
+        if (line is null)
         {
             return ValueTask.FromResult(ExecResult.FromExitCode(1));
         }
-
-        var newline = input.IndexOf(delimiter, StringComparison.Ordinal);
-        var line = newline < 0 ? input : input[..newline];
 
         if (maxChars is { } limit && line.Length > limit)
         {
