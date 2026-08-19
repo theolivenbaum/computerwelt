@@ -146,7 +146,7 @@ public sealed class PyList : PyObject
 
         for (var i = 0; i < left.Count; i++)
         {
-            if (!left[i].PyEquals(right[i]))
+            if (!SameOrEqual(left[i], right[i]))
             {
                 return false;
             }
@@ -161,7 +161,7 @@ public sealed class PyList : PyObject
 
         for (var i = 0; i < shared; i++)
         {
-            if (left[i].PyEquals(right[i]))
+            if (SameOrEqual(left[i], right[i]))
             {
                 continue;
             }
@@ -779,7 +779,7 @@ public sealed class PyView : PyObject
     public override IEnumerable<PyObject>? Iterate() => _items;
 
     /// <inheritdoc />
-    public override bool Contains(PyObject item) => _items.Any(candidate => candidate.PyEquals(item));
+    public override bool Contains(PyObject item) => _items.Any(candidate => SameOrEqual(candidate, item));
 
     /// <inheritdoc />
     public override string Repr() =>

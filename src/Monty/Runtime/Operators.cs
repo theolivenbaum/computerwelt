@@ -110,8 +110,8 @@ public static class Operators
     /// <summary>Applies a comparison.</summary>
     public static PyObject Compare(string op, PyObject left, PyObject right) => op switch
     {
-        "==" => PyBool.Of(left.PyEquals(right)),
-        "!=" => PyBool.Of(!left.PyEquals(right)),
+        "==" => Equality(left, right, negate: false),
+        "!=" => Equality(left, right, negate: true),
         "is" => PyBool.Of(Identical(left, right)),
         "is not" => PyBool.Of(!Identical(left, right)),
         "in" => PyBool.Of(right.Contains(left)),
@@ -122,6 +122,53 @@ public static class Operators
         ">=" => PyBool.Of(Order(op, left, right) >= 0),
         _ => throw new PyRaise(PyErrors.TypeError($"unsupported comparison {op}")),
     };
+
+    /// <summary>
+    /// Applies <c>==</c> or <c>!=</c>.
+    /// </summary>
+    /// <remarks>
+    /// A user <c>__eq__</c> may return anything, and the operator hands that object back
+    /// unchanged — only <c>NotImplemented</c> is special, meaning "ask the other side", and
+    /// falling back to identity when neither side answers. Truth-testing the result is the
+    /// caller's business, which is why containers use <see cref="PyObject.SameOrEqual"/>
+    /// instead of this.
+    /// </remarks>
+    private static PyObject Equality(PyObject left, PyObject right, bool negate)
+    {
+        if (RichEquals(left, right) is { } result)
+        {
+            return negate ? PyBool.Of(!result.IsTruthy()) : result;
+        }
+
+        var identical = ReferenceEquals(left, right);
+        return PyBool.Of(negate ? !identical : identical);
+    }
+
+    /// <summary>Runs <c>__eq__</c> on either side, or null when neither answered.</summary>
+    internal static PyObject? RichEquals(PyObject left, PyObject right)
+    {
+        if (left is PyInstance instance && instance.Dunder("__eq__") is { } equals)
+        {
+            var answer = instance.Invoke(equals, [right]);
+
+            if (answer is not Builtins.NotImplementedSingleton)
+            {
+                return answer;
+            }
+        }
+
+        if (right is PyInstance reflected && reflected.Dunder("__eq__") is { } reflectedEquals)
+        {
+            var answer = reflected.Invoke(reflectedEquals, [left]);
+
+            if (answer is not Builtins.NotImplementedSingleton)
+            {
+                return answer;
+            }
+        }
+
+        return left is PyInstance || right is PyInstance ? null : PyBool.Of(left.PyEquals(right));
+    }
 
     /// <summary>
     /// Identity, as <c>is</c> defines it. Small integers, booleans and <c>None</c> are

@@ -30,6 +30,11 @@ public sealed class Compiler
     private readonly List<FinallyContext> _finallies = [];
     private readonly bool _isFunctionScope;
 
+    /// <summary>The name a class body records its annotations under.</summary>
+    private const string AnnotationsName = "__annotations__";
+
+    private bool _isClassBody;
+
     private Compiler(string name, string fileName, Compiler? parent, bool isFunctionScope)
     {
         _code = new CodeObject(name, fileName);
@@ -519,6 +524,17 @@ public sealed class Compiler
 
     private void CompileAssign(Assign assign)
     {
+        // In a class body an annotation is data: it names a field, whether or not the
+        // statement also assigns a default.
+        if (_isClassBody && assign.Annotation is { } annotation
+            && assign.Targets is [Parsing.Name annotated])
+        {
+            CompileExpression(annotation);
+            EmitLoad(AnnotationsName, assign.Line);
+            Emit(OpCode.LoadConst, _code.AddConstant(new PyStr(annotated.Id)), assign.Line);
+            Emit(OpCode.StoreSubscript, 0, assign.Line);
+        }
+
         // A bare annotation (`x: int`) declares without assigning.
         if (assign.Value is null)
         {
@@ -947,9 +963,13 @@ public sealed class Compiler
         ParameterList parameters,
         IReadOnlyList<Statement> body,
         int line,
-        bool? isGeneratorHint)
+        bool? isGeneratorHint,
+        bool isClassBody = false)
     {
-        var compiler = new Compiler(name, _code.FileName, this, isFunctionScope: true);
+        var compiler = new Compiler(name, _code.FileName, this, isFunctionScope: true)
+        {
+            _isClassBody = isClassBody,
+        };
 
         // Parameters occupy the first local slots, in declaration order.
         foreach (var parameter in parameters.Parameters)
@@ -979,6 +999,15 @@ public sealed class Compiler
         compiler.CollectBindings(body);
         compiler._code.Parameters = parameters;
         compiler._code.IsGenerator = isGeneratorHint ?? ContainsYield(body);
+
+        // A class that annotates any of its names gets an `__annotations__` mapping, which
+        // is where `@dataclass` reads its fields from — the annotations are the fields.
+        if (isClassBody && body.Any(static statement => statement is Assign { Annotation: not null }))
+        {
+            compiler.Declare(AnnotationsName);
+            compiler.Emit(OpCode.BuildMap, 0, line);
+            compiler.EmitStore(AnnotationsName, line);
+        }
 
         compiler.CompileStatements(body);
         compiler.Emit(OpCode.LoadConst, compiler._code.AddConstant(PyNone.Instance), line);
@@ -1045,7 +1074,8 @@ public sealed class Compiler
 
     private void CompileClassDef(ClassDef classDef)
     {
-        var body = CompileFunctionBody(classDef.Name, ParameterList.Empty, classDef.Body, classDef.Line, isGeneratorHint: false);
+        var body = CompileFunctionBody(
+            classDef.Name, ParameterList.Empty, classDef.Body, classDef.Line, isGeneratorHint: false, isClassBody: true);
 
         foreach (var decorator in classDef.Decorators)
         {

@@ -70,6 +70,19 @@ public abstract class PyObject
     public virtual void DeleteItem(PyObject index) =>
         throw new PyRaise(PyErrors.TypeError($"'{TypeName}' object doesn't support item deletion"));
 
+    /// <summary>
+    /// Whether two values count as equal for a container operation.
+    /// </summary>
+    /// <remarks>
+    /// Membership, <c>count</c>, <c>index</c> and sequence comparison treat an object as
+    /// equal to itself without asking <c>__eq__</c>, which is what keeps a value with a
+    /// deliberately odd equality — a NaN, or a class that never compares equal — findable
+    /// in the list it was put into.
+    /// </remarks>
+    public static bool SameOrEqual(PyObject left, PyObject right) =>
+        ReferenceEquals(left, right)
+        || (Operators.RichEquals(left, right) is { } result ? result.IsTruthy() : left.PyEquals(right));
+
     /// <summary>Membership, for <c>in</c>.</summary>
     public virtual bool Contains(PyObject item)
     {
@@ -78,7 +91,7 @@ public abstract class PyObject
 
         foreach (var candidate in items)
         {
-            if (candidate.PyEquals(item))
+            if (SameOrEqual(candidate, item))
             {
                 return true;
             }

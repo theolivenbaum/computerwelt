@@ -155,6 +155,31 @@ public sealed class VirtualMachine
         return instance;
     }
 
+    /// <summary>
+    /// Counts one level of host-side recursion against the call-depth limit.
+    /// </summary>
+    /// <remarks>
+    /// A generated method — a dataclass's <c>__eq__</c> or <c>__repr__</c> — recurses in C#
+    /// rather than in bytecode, so it has to charge the same budget or a cyclic structure
+    /// would overflow the host stack instead of raising <c>RecursionError</c>.
+    /// </remarks>
+    public IDisposable EnterRecursion()
+    {
+        if (++_depth > RecursionLimit)
+        {
+            _depth--;
+            throw new PyRaise(new PyException(
+                PyExceptionType.RecursionError, "maximum recursion depth exceeded"));
+        }
+
+        return new RecursionLevel(this);
+    }
+
+    private sealed class RecursionLevel(VirtualMachine machine) : IDisposable
+    {
+        public void Dispose() => machine._depth--;
+    }
+
     private PyObject CallFunction(PyFunction function, PyObject[] arguments, PyDict? keywords)
     {
         if (++_depth > RecursionLimit)
@@ -1043,6 +1068,17 @@ public sealed class VirtualMachine
                 var keywords = (PyDict)frame.Pop();
                 var positional = (PyList)frame.Pop();
                 var callable = frame.Pop();
+
+                // Every key is checked before the call, so `f(**{1: 2})` reports the bad
+                // key rather than whatever the callee makes of it.
+                foreach (var (key, _) in keywords.Entries)
+                {
+                    if (key is not PyStr)
+                    {
+                        throw new PyRaise(PyErrors.TypeError("keywords must be strings"));
+                    }
+                }
+
                 frame.Push(Call(callable, [.. positional.Items], keywords.Count > 0 ? keywords : null));
                 return false;
             }

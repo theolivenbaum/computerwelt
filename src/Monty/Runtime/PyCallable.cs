@@ -9,6 +9,14 @@ public abstract class PyCallable : PyObject
     public abstract string Name { get; }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// A callable is hashable by identity, which is what lets a function be a dict key —
+    /// a dispatch table keyed by function is an ordinary thing to write.
+    /// </remarks>
+    public override System.Numerics.BigInteger PyHash() =>
+        System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
+
+    /// <inheritdoc />
     public override PyObject? GetAttribute(string name) =>
         name is "__name__" or "__qualname__" ? new PyStr(Name) : null;
 }

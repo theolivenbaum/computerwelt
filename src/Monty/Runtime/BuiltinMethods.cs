@@ -570,7 +570,7 @@ public static class BuiltinMethods
                 return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var items = ((PyList)self).Items;
-                    var index = items.FindIndex(item => item.PyEquals(arguments[0]));
+                    var index = items.FindIndex(item => PyObject.SameOrEqual(item, arguments[0]));
 
                     if (index < 0)
                     {
@@ -604,7 +604,7 @@ public static class BuiltinMethods
 
             case "count":
                 return Method(name, receiver, 1, static (self, arguments, _) =>
-                    new PyInt(((PyList)self).Items.Count(item => item.PyEquals(arguments[0]))));
+                    new PyInt(((PyList)self).Items.Count(item => PyObject.SameOrEqual(item, arguments[0]))));
 
             case "reverse":
                 return Method(name, receiver, static (self, _, _) =>
@@ -941,7 +941,7 @@ public static class BuiltinMethods
 
         for (var i = start; i < end; i++)
         {
-            if (items[i].PyEquals(arguments[0]))
+            if (PyObject.SameOrEqual(items[i], arguments[0]))
             {
                 return i;
             }
@@ -962,7 +962,7 @@ public static class BuiltinMethods
     private static PyObject? BindTuple(PyObject receiver, string name) => name switch
     {
         "count" => Method(name, receiver, 1, static (self, arguments, _) =>
-            new PyInt(((PyTuple)self).Items.Count(item => item.PyEquals(arguments[0])))),
+            new PyInt(((PyTuple)self).Items.Count(item => PyObject.SameOrEqual(item, arguments[0])))),
 
         "index" => Method(name, receiver, 1, 3, static (self, arguments, _) =>
         {

@@ -31,6 +31,17 @@ public sealed class PyType : PyCallable
     public override string Repr() => $"<class '{Name}'>";
 
     /// <inheritdoc />
+    /// <remarks>
+    /// <c>list[int]</c> is a type annotation, not an operation: subscripting a type yields
+    /// the type itself, which is all a runtime that erases annotations needs it to mean.
+    /// </remarks>
+    public override PyObject GetItem(PyObject index)
+    {
+        _ = index;
+        return this;
+    }
+
+    /// <inheritdoc />
     public override bool PyEquals(PyObject other) => ReferenceEquals(this, other);
 
     /// <inheritdoc />

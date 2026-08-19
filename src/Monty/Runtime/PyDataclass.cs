@@ -64,6 +64,28 @@ public sealed class PyDataclass : PyObject
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// A frozen instance hashes by its fields, which is the point of freezing it; an
+    /// unfrozen one would break the dict invariant the moment a field changed.
+    /// </remarks>
+    public override System.Numerics.BigInteger PyHash()
+    {
+        if (!Frozen)
+        {
+            throw new PyRaise(PyErrors.TypeError($"unhashable type: '{Name}'"));
+        }
+
+        var hash = new System.Numerics.BigInteger(17);
+
+        foreach (var field in FieldNames)
+        {
+            hash = (hash * 31) + _fields[field].PyHash();
+        }
+
+        return hash;
+    }
+
+    /// <inheritdoc />
     public override bool PyEquals(PyObject other)
     {
         if (other is not PyDataclass dataclass
