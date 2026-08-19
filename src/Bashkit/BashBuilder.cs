@@ -261,6 +261,8 @@ public sealed class BashBuilder
         Register(new DirectoryStackBuiltin("popd"));
         Register(new DirectoryStackBuiltin("dirs"));
 
+        Register(new BashBuiltin());
+        Register(new BashBuiltin("sh"));
         Register(new SourceBuiltin());
         Register(new SourceBuiltin("."));
         Register(new CommandBuiltin());

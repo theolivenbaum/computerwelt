@@ -58,15 +58,24 @@ public sealed class Interpreter
         RunFragment: RunFragmentAsync,
         RunCommand: RunBuiltinDirectlyAsync,
         IsBuiltin: HasBuiltin,
-        BuiltinNames: () => _builtins.Keys);
+        BuiltinNames: () => _builtins.Keys)
+    {
+        RunIsolated = RunIsolatedAsync,
+    };
 
     private Builtins.ShellHooks? _hooks;
+
+    /// <summary>
+    /// The shell's standard input, remembered so command substitutions inherit it.
+    /// </summary>
+    private StreamData? _standardInput;
 
     /// <summary>Runs a whole script and returns its combined result.</summary>
     public async ValueTask<ExecResult> RunAsync(Script script, StreamData? stdin = null, CancellationToken cancellationToken = default)
     {
         var stdout = new StringBuilder();
         var result = ExecResult.Success;
+        _standardInput ??= stdin;
 
         foreach (var command in script.Commands)
         {
@@ -779,7 +788,7 @@ public sealed class Interpreter
 
         if (!_builtins.TryGetValue(name, out var builtin))
         {
-            return ExecResult.Error($"bash: {name}: command not found\n", ExitCodes.NotFound);
+            return await RunScriptFileAsync(name, arguments, assignments, stdin, cancellationToken);
         }
 
         // Assignments preceding a command apply only for that command's duration.
@@ -1000,14 +1009,163 @@ public sealed class Interpreter
         using var nesting = Budget.EnterNesting();
 
         var parsed = Parser.Parse(script, Budget);
-        var nested = new Interpreter(State, FileSystem, Budget, _builtins);
-        var result = await nested.RunAsync(parsed, null, cancellationToken);
+        var nested = new Interpreter(State, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
+
+        // A substitution inherits the shell's standard input, so `x=$(cat)` in a script fed
+        // from a pipe reads that pipe — the file descriptor a real shell would have handed
+        // down.
+        var result = await nested.RunAsync(parsed, _standardInput, cancellationToken);
 
         AppendStderr(result.Stderr);
         return result with { Stderr = StreamData.Empty, ControlFlow = ControlFlow.None };
     }
 
     /// <summary>Runs a script fragment in the current shell, as <c>eval</c> and <c>source</c> do.</summary>
+    /// <summary>
+    /// Runs a name that is not a builtin or a function as a script from the filesystem.
+    /// </summary>
+    /// <remarks>
+    /// This is the closest the sandbox comes to <c>exec</c>, and it deliberately stops well
+    /// short of it: the file must live in the virtual filesystem and must be a shell script,
+    /// there is no interpreter dispatch on the shebang line, and it runs in-process as an
+    /// isolated child shell. Nothing here can reach a host binary.
+    /// </remarks>
+    private async ValueTask<ExecResult> RunScriptFileAsync(
+        string name,
+        List<string> arguments,
+        IReadOnlyList<Assignment> assignments,
+        StreamData? stdin,
+        CancellationToken cancellationToken)
+    {
+        var saved = await ApplyTemporaryAssignmentsAsync(assignments, cancellationToken);
+
+        try
+        {
+            var path = await ResolveExecutableAsync(name, cancellationToken);
+
+            if (path is null)
+            {
+                return ExecResult.Error($"bash: {name}: command not found\n", ExitCodes.NotFound);
+            }
+
+            FileMetadata metadata;
+
+            try
+            {
+                metadata = await FileSystem.StatAsync(path.Value, cancellationToken);
+            }
+            catch (BashkitException)
+            {
+                return ExecResult.Error($"bash: {name}: command not found\n", ExitCodes.NotFound);
+            }
+
+            if (metadata.IsDirectory)
+            {
+                return ExecResult.Error($"bash: {name}: Is a directory\n", ExitCodes.NotExecutable);
+            }
+
+            if ((metadata.Mode & 0b001_001_001) == 0)
+            {
+                return ExecResult.Error($"bash: {name}: Permission denied\n", ExitCodes.NotExecutable);
+            }
+
+            var source = System.Text.Encoding.UTF8.GetString(await FileSystem.ReadFileAsync(path.Value, cancellationToken));
+
+            return await RunIsolatedAsync(
+                new Builtins.ChildShell(source)
+                {
+                    ScriptName = name.Contains('/', StringComparison.Ordinal) ? name : path.Value.Value,
+                    Positional = arguments,
+                    Stdin = stdin,
+                },
+                cancellationToken);
+        }
+        finally
+        {
+            RestoreTemporaryAssignments(saved);
+        }
+    }
+
+    /// <summary>Finds an executable by path or by searching <c>PATH</c>.</summary>
+    private async ValueTask<VPath?> ResolveExecutableAsync(string name, CancellationToken cancellationToken)
+    {
+        if (name.Contains('/', StringComparison.Ordinal))
+        {
+            var direct = VPath.Resolve(State.WorkingDirectory, name);
+            return await FileSystem.ExistsAsync(direct, cancellationToken) ? direct : (VPath?)null;
+        }
+
+        foreach (var directory in (State.Get("PATH") ?? string.Empty)
+                     .Split(':', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = VPath.Parse(directory).Join(name);
+
+            if (await FileSystem.ExistsAsync(candidate, cancellationToken))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Runs a script in a fresh shell that shares only the filesystem.
+    /// </summary>
+    /// <remarks>
+    /// This is what <c>bash -c</c> and running a script file need, and it is not the same as
+    /// a subshell: a subshell forks the whole state, whereas a child shell starts from the
+    /// exported environment alone. Non-exported variables, functions and aliases do not
+    /// cross, and nothing the child does comes back.
+    /// </remarks>
+    public async ValueTask<ExecResult> RunIsolatedAsync(
+        Builtins.ChildShell request,
+        CancellationToken cancellationToken)
+    {
+        using var nesting = Budget.EnterNesting();
+
+        var child = new ShellState
+        {
+            WorkingDirectory = State.WorkingDirectory,
+            ScriptName = request.ScriptName,
+            Positional = [.. request.Positional],
+        };
+
+        foreach (var (name, value) in State.ExportedEnvironment())
+        {
+            child.Set(name, value);
+            child.GetOrCreate(name).Attributes |= VariableAttributes.Exported;
+        }
+
+        // `${BASH_SOURCE[0]}` is how a script finds its own path, and it is set for a
+        // script run as a command just as `source` sets it.
+        child.GetOrCreate("BASH_SOURCE").SetArray([request.ScriptName]);
+
+        request.Configure?.Invoke(child.Options);
+
+        Script parsed;
+
+        try
+        {
+            parsed = Parser.Parse(request.Script, Budget);
+        }
+        catch (BashkitException exception) when (exception.Kind == BashkitErrorKind.Parse)
+        {
+            return ExecResult.Error($"{request.ScriptName}: {exception.Message}\n", ExitCodes.Usage);
+        }
+
+        // `-n` asks for a syntax check only, which the parse above has just performed.
+        if (child.Options.NoExec)
+        {
+            return ExecResult.Success;
+        }
+
+        var nested = new Interpreter(child, FileSystem, Budget, _builtins);
+        var result = await nested.RunAsync(parsed, request.Stdin, cancellationToken);
+        return result with { ControlFlow = ControlFlow.None };
+    }
+
+    /// <summary>Parses and runs a script fragment in this shell, sharing all of its state.</summary>
     public async ValueTask<ExecResult> RunFragmentAsync(string script, StreamData? stdin, CancellationToken cancellationToken)
     {
         using var nesting = Budget.EnterNesting();

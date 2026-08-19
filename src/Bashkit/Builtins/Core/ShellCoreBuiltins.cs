@@ -13,7 +13,35 @@ public sealed record ShellHooks(
     Func<string, StreamData?, CancellationToken, ValueTask<ExecResult>> RunFragment,
     Func<IReadOnlyList<string>, StreamData?, CancellationToken, ValueTask<ExecResult>> RunCommand,
     Func<string, bool> IsBuiltin,
-    Func<IEnumerable<string>> BuiltinNames);
+    Func<IEnumerable<string>> BuiltinNames)
+{
+    /// <summary>
+    /// Runs a script in a fresh shell that shares only the filesystem.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from <see cref="RunFragment"/>, which runs in the caller's own shell. A
+    /// child shell starts from the exported environment alone, so nothing it assigns,
+    /// defines or unsets is visible afterwards — the isolation a real <c>fork</c> gives.
+    /// </remarks>
+    public Func<ChildShell, CancellationToken, ValueTask<ExecResult>>? RunIsolated { get; init; }
+}
+
+/// <summary>A request to run a script in an isolated child shell.</summary>
+/// <param name="Script">The script source.</param>
+public sealed record ChildShell(string Script)
+{
+    /// <summary>What <c>$0</c> reports.</summary>
+    public string ScriptName { get; init; } = "bash";
+
+    /// <summary>The positional parameters, <c>$1</c> onwards.</summary>
+    public IReadOnlyList<string> Positional { get; init; } = [];
+
+    /// <summary>Standard input for the script.</summary>
+    public StreamData? Stdin { get; init; }
+
+    /// <summary>Applies the flags the child starts with, such as those from <c>bash -e</c>.</summary>
+    public Action<Interpreter.ShellOptions>? Configure { get; init; }
+}
 
 /// <summary><c>source</c> and <c>.</c> — run a script from the filesystem in this shell.</summary>
 public sealed class SourceBuiltin : IBuiltin
