@@ -21,13 +21,15 @@ public sealed class XargsBuiltin : IBuiltin
     /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
-        var cursor = new ArgCursor(context.Arguments);
+        var cursor = new ArgCursor(context.Arguments) { StopAtFirstOperand = true };
         var maxArgs = 0;
         string? replace = null;
         var nullSeparated = false;
         string? delimiter = null;
-        var noRunIfEmpty = false;
         var trace = false;
+
+        var slots = 1;
+        string? slotVariable = null;
 
         while (cursor.NextOption() is { } option)
         {
@@ -43,9 +45,15 @@ public sealed class XargsBuiltin : IBuiltin
 
                 case "-0" or "--null": nullSeparated = true; break;
                 case "-d" or "--delimiter": delimiter = cursor.TakeValue(); break;
-                case "-r" or "--no-run-if-empty": noRunIfEmpty = true; break;
+                // Nothing runs on empty input anyway, so `-r` is already the behaviour.
+                case "-r" or "--no-run-if-empty": break;
                 case "-t" or "--verbose": trace = true; break;
-                case "-P" or "--max-procs" or "-s" or "--max-chars" or "-L": cursor.TakeValue(); break;
+                case "-P" or "--max-procs":
+                    int.TryParse(cursor.TakeValue(), CultureInfo.InvariantCulture, out slots);
+                    break;
+
+                case "--process-slot-var": slotVariable = cursor.TakeValue(); break;
+                case "-s" or "--max-chars" or "-L": cursor.TakeValue(); break;
                 case "-x" or "-p": break;
                 default:
                     return ExecResult.Usage("xargs", $"invalid option -- '{option.TrimStart('-')}'");
@@ -57,11 +65,11 @@ public sealed class XargsBuiltin : IBuiltin
         // Default command is `echo`, which is what makes `xargs` alone a joiner.
         var template = cursor.Operands.Count > 0 ? cursor.Operands : ["echo"];
 
+        // With nothing to pass, there is nothing to run: an empty input produces no
+        // output rather than one bare invocation of the command.
         if (items.Count == 0)
         {
-            return noRunIfEmpty || replace is not null
-                ? ExecResult.Success
-                : await RunAsync(context, template, trace, cancellationToken);
+            return ExecResult.Success;
         }
 
         var output = new StringBuilder();
@@ -71,9 +79,11 @@ public sealed class XargsBuiltin : IBuiltin
         if (replace is not null)
         {
             // `-I` runs once per item, substituting into every word of the template.
-            foreach (var item in items)
+            for (var i = 0; i < items.Count; i++)
             {
+                var item = items[i];
                 var words = template.Select(word => word.Replace(replace, item, StringComparison.Ordinal)).ToList();
+                AssignSlot(context, slotVariable, slots, i);
                 var result = await RunAsync(context, words, trace, cancellationToken);
                 output.Append(result.Stdout.ToString());
                 errors.Append(result.Stderr.ToString());
@@ -85,10 +95,13 @@ public sealed class XargsBuiltin : IBuiltin
 
         var batchSize = maxArgs > 0 ? maxArgs : items.Count;
 
+        var batch = 0;
+
         for (var offset = 0; offset < items.Count; offset += batchSize)
         {
             var words = new List<string>(template);
             words.AddRange(items.Skip(offset).Take(batchSize));
+            AssignSlot(context, slotVariable, slots, batch++);
 
             var result = await RunAsync(context, words, trace, cancellationToken);
             output.Append(result.Stdout.ToString());
@@ -97,6 +110,26 @@ public sealed class XargsBuiltin : IBuiltin
         }
 
         return Combine(output, errors, exitCode);
+    }
+
+    /// <summary>
+    /// Publishes the parallel slot a command is running in, for <c>--process-slot-var</c>.
+    /// </summary>
+    /// <remarks>
+    /// Nothing here actually runs in parallel, but sharding logic reads the slot to decide
+    /// which part of the work it owns, and every command reporting slot 0 would make every
+    /// shard do the same work.
+    /// </remarks>
+    private static void AssignSlot(BuiltinContext context, string? name, int slots, int index)
+    {
+        if (name is null)
+        {
+            return;
+        }
+
+        var slot = slots > 1 ? index % slots : 0;
+        context.State.Set(name, slot.ToString(CultureInfo.InvariantCulture));
+        context.State.GetOrCreate(name).Attributes |= Interpreter.VariableAttributes.Exported;
     }
 
     private static ExecResult Combine(StringBuilder output, StringBuilder errors, int exitCode) => new()

@@ -230,13 +230,27 @@ public sealed class Redirection
                 payload = StreamData.Concat(payload, stderr);
             }
 
-            if (target.Append)
+            try
             {
-                await FileSystem.AppendFileAsync(target.Path, payload.Memory, cancellationToken);
+                if (target.Append)
+                {
+                    await FileSystem.AppendFileAsync(target.Path, payload.Memory, cancellationToken);
+                }
+                else
+                {
+                    await FileSystem.WriteFileAsync(target.Path, payload.Memory, cancellationToken);
+                }
             }
-            else
+            catch (BashkitException e) when (e.Kind is BashkitErrorKind.FileSystem or BashkitErrorKind.PermissionDenied)
             {
-                await FileSystem.WriteFileAsync(target.Path, payload.Memory, cancellationToken);
+                // Writing to a directory or a read-only file fails the command; it is not
+                // an error in the shell itself.
+                return result with
+                {
+                    Stdout = StreamData.Empty,
+                    Stderr = StreamData.Concat(stderr, StreamData.FromText($"bash: {e.Message}\n")),
+                    ExitCode = ExitCodes.Failure,
+                };
             }
 
             if (target.CapturesStdout)

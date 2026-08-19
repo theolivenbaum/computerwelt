@@ -33,6 +33,16 @@ public sealed class ArgCursor
     /// <summary>Non-option arguments collected so far.</summary>
     public List<string> Operands { get; }
 
+    /// <summary>
+    /// Stops option parsing at the first operand.
+    /// </summary>
+    /// <remarks>
+    /// A command that takes another command as its operands — <c>xargs</c>, <c>timeout</c>,
+    /// <c>env</c> — must not read the inner command's flags as its own: in
+    /// <c>xargs -I{} sh -c '...'</c> the <c>-c</c> belongs to <c>sh</c>.
+    /// </remarks>
+    public bool StopAtFirstOperand { get; init; }
+
     /// <summary>True when every argument has been consumed.</summary>
     public bool AtEnd => _index >= _arguments.Count;
 
@@ -63,6 +73,12 @@ public sealed class ArgCursor
             {
                 Operands.Add(argument);
                 _index++;
+
+                if (StopAtFirstOperand)
+                {
+                    _stopped = true;
+                }
+
                 continue;
             }
 

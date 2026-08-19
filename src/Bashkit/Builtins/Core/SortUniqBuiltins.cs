@@ -678,8 +678,17 @@ public sealed class TacBuiltin : IBuiltin
     /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
+        var cursor = new ArgCursor(context.Arguments);
+
+        while (cursor.NextOption() is { } option)
+        {
+            // `-s`, `-b` and `-r` change what a record is, which this reverses-by-line
+            // implementation does not model; rejecting them beats silently ignoring them.
+            return ExecResult.Usage("tac", $"invalid option -- '{option.TrimStart('-')}'", ExitCodes.Usage);
+        }
+
         var errors = new StringBuilder();
-        var inputs = await TextHelpers.ReadInputsAsync(context, context.Arguments, "tac", errors, cancellationToken);
+        var inputs = await TextHelpers.ReadInputsAsync(context, cursor.Operands, "tac", errors, cancellationToken);
         var lines = new List<string>();
 
         foreach (var (_, content) in inputs)

@@ -598,14 +598,25 @@ public sealed class TruncateBuiltin : IBuiltin
         var op = spec[0];
         var numberPart = op is '+' or '-' or '<' or '>' or '/' or '%' ? spec[1..] : spec;
 
+        // A trailing `B` picks the decimal reading: `1K` is 1024 bytes, `1KB` is 1000.
+        var scale = 1024L;
+
+        if (numberPart.Length > 1 && char.ToUpperInvariant(numberPart[^1]) == 'B')
+        {
+            scale = 1000;
+            numberPart = numberPart[..^1];
+        }
+
         var multiplier = 1L;
+
         if (numberPart.Length > 0)
         {
             switch (char.ToUpperInvariant(numberPart[^1]))
             {
-                case 'K': multiplier = 1024; numberPart = numberPart[..^1]; break;
-                case 'M': multiplier = 1024 * 1024; numberPart = numberPart[..^1]; break;
-                case 'G': multiplier = 1024 * 1024 * 1024; numberPart = numberPart[..^1]; break;
+                case 'K': multiplier = scale; numberPart = numberPart[..^1]; break;
+                case 'M': multiplier = scale * scale; numberPart = numberPart[..^1]; break;
+                case 'G': multiplier = scale * scale * scale; numberPart = numberPart[..^1]; break;
+                case 'T': multiplier = scale * scale * scale * scale; numberPart = numberPart[..^1]; break;
             }
         }
 

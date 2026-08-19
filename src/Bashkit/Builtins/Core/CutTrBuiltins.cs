@@ -22,6 +22,7 @@ public sealed class CutBuiltin : IBuiltin
         string? outputDelimiter = null;
         var onlyDelimited = false;
         var complement = false;
+        var nullTerminated = false;
 
         while (cursor.NextOption() is { } option)
         {
@@ -40,6 +41,7 @@ public sealed class CutBuiltin : IBuiltin
                 case "--output-delimiter": outputDelimiter = cursor.TakeValue(); break;
                 case "-s" or "--only-delimited": onlyDelimited = true; break;
                 case "--complement": complement = true; break;
+                case "-z" or "--zero-terminated": nullTerminated = true; break;
                 case "-n": break;
                 default:
                     return ExecResult.Usage("cut", $"invalid option -- '{option.TrimStart('-')}'");
@@ -48,7 +50,10 @@ public sealed class CutBuiltin : IBuiltin
 
         if (mode is null || ranges is null)
         {
-            return ExecResult.Usage("cut", "you must specify a list of bytes, characters, or fields");
+            return ExecResult.Usage(
+                "cut",
+                "you must specify a list of bytes, characters, or fields",
+                ExitCodes.Failure);
         }
 
         List<Range> selection;
@@ -67,7 +72,11 @@ public sealed class CutBuiltin : IBuiltin
 
         foreach (var (_, content) in inputs)
         {
-            foreach (var line in TextHelpers.SplitLines(content))
+            var records = nullTerminated
+                ? content.Split('\0', StringSplitOptions.RemoveEmptyEntries)
+                : TextHelpers.SplitLines(content);
+
+            foreach (var line in records)
             {
                 if (mode == Mode.Fields)
                 {

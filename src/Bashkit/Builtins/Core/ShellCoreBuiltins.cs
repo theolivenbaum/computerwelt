@@ -159,7 +159,11 @@ public sealed class CommandBuiltin : IBuiltin
 
             foreach (var name in rest)
             {
-                if (context.State.Functions.ContainsKey(name))
+                if (TypeBuiltin.IsKeyword(name))
+                {
+                    builder.Append(verbose ? $"{name} is a shell keyword\n" : name + "\n");
+                }
+                else if (context.State.Functions.ContainsKey(name))
                 {
                     builder.Append(verbose ? $"{name} is a function\n" : name + "\n");
                 }

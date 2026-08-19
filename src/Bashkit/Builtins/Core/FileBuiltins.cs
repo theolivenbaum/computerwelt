@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 
 namespace Bashkit.Builtins;
@@ -36,6 +37,7 @@ public sealed class CatBuiltin : IBuiltin
         var numberNonBlank = false;
         var showEnds = false;
         var squeezeBlank = false;
+        var showTabs = false;
 
         while (cursor.NextOption() is { } option)
         {
@@ -45,8 +47,11 @@ public sealed class CatBuiltin : IBuiltin
                 case "-b" or "--number-nonblank": numberNonBlank = true; break;
                 case "-E" or "--show-ends": showEnds = true; break;
                 case "-s" or "--squeeze-blank": squeezeBlank = true; break;
-                case "-A" or "--show-all": showEnds = true; break;
-                case "-u" or "-v" or "-T" or "-t" or "-e": break;
+                case "-A" or "--show-all": showEnds = true; showTabs = true; break;
+                case "-T" or "--show-tabs": showTabs = true; break;
+                case "-t": showTabs = true; break;
+                case "-e": showEnds = true; break;
+                case "-u" or "-v": break;
                 default:
                     return ExecResult.Usage("cat", $"invalid option -- '{option.TrimStart('-')}'");
             }
@@ -75,15 +80,15 @@ public sealed class CatBuiltin : IBuiltin
 
         var text = builder.ToString();
 
-        if (!numberAll && !numberNonBlank && !showEnds && !squeezeBlank)
+        if (!numberAll && !numberNonBlank && !showEnds && !squeezeBlank && !showTabs)
         {
             return ExecResult.Ok(text);
         }
 
-        return ExecResult.Ok(Format(text, numberAll, numberNonBlank, showEnds, squeezeBlank));
+        return ExecResult.Ok(Format(text, numberAll, numberNonBlank, showEnds, squeezeBlank, showTabs));
     }
 
-    private static string Format(string text, bool numberAll, bool numberNonBlank, bool showEnds, bool squeezeBlank)
+    private static string Format(string text, bool numberAll, bool numberNonBlank, bool showEnds, bool squeezeBlank, bool showTabs)
     {
         var endsWithNewline = text.EndsWith('\n');
         var lines = text.Split('\n');
@@ -120,7 +125,9 @@ public sealed class CatBuiltin : IBuiltin
                 builder.Append(number++.ToString(System.Globalization.CultureInfo.InvariantCulture).PadLeft(6)).Append("\t");
             }
 
-            builder.Append(line);
+            // `-T` renders a tab as the caret notation for it, which is what makes the
+            // difference between a tab and spaces visible.
+            builder.Append(showTabs ? line.Replace("\t", "^I", StringComparison.Ordinal) : line);
 
             if (showEnds)
             {
@@ -265,6 +272,8 @@ public sealed class TouchBuiltin : IBuiltin
     {
         var cursor = new ArgCursor(context.Arguments);
         var noCreate = false;
+        DateTimeOffset? stamp = null;
+        string? reference = null;
 
         while (cursor.NextOption() is { } option)
         {
@@ -272,7 +281,29 @@ public sealed class TouchBuiltin : IBuiltin
             {
                 case "-c" or "--no-create": noCreate = true; break;
                 case "-a" or "-m": break;
-                case "-d" or "-t" or "-r": cursor.TakeValue(); break;
+
+                case "-t":
+                    if (!TryParseStamp(cursor.TakeValue(), out var parsed))
+                    {
+                        return ExecResult.Usage("touch", "invalid date format", ExitCodes.Failure);
+                    }
+
+                    stamp = parsed;
+                    break;
+
+                case "-d" or "--date":
+                    if (DateTimeOffset.TryParse(
+                        cursor.TakeValue(),
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                        out var dated))
+                    {
+                        stamp = dated;
+                    }
+
+                    break;
+
+                case "-r" or "--reference": reference = cursor.TakeValue(); break;
                 default:
                     return ExecResult.Usage("touch", $"invalid option -- '{option.TrimStart('-')}'");
             }
@@ -283,8 +314,20 @@ public sealed class TouchBuiltin : IBuiltin
             return ExecResult.Usage("touch", "missing file operand", ExitCodes.Failure);
         }
 
+        if (reference is not null)
+        {
+            try
+            {
+                stamp = (await context.FileSystem.StatAsync(context.ResolvePath(reference), cancellationToken)).ModifiedAt;
+            }
+            catch (FileSystemException)
+            {
+                return ExecResult.Error($"touch: failed to get attributes of '{reference}': No such file or directory\n", ExitCodes.Failure);
+            }
+        }
+
         var errors = new StringBuilder();
-        var now = DateTimeOffset.UtcNow;
+        var now = stamp ?? DateTimeOffset.UtcNow;
 
         foreach (var operand in cursor.Operands)
         {
@@ -304,6 +347,7 @@ public sealed class TouchBuiltin : IBuiltin
                 }
 
                 await context.FileSystem.WriteFileAsync(path, ReadOnlyMemory<byte>.Empty, cancellationToken);
+                await context.FileSystem.SetModifiedTimeAsync(path, now, cancellationToken);
             }
             catch (FileSystemException e)
             {
@@ -313,6 +357,26 @@ public sealed class TouchBuiltin : IBuiltin
         }
 
         return errors.Length == 0 ? ExecResult.Success : ExecResult.Error(errors.ToString(), ExitCodes.Failure);
+    }
+
+    /// <summary>Parses touch's <c>-t</c> stamp: <c>[[CC]YY]MMDDhhmm[.ss]</c>.</summary>
+    private static bool TryParseStamp(string? text, out DateTimeOffset stamp)
+    {
+        stamp = default;
+
+        if (text is null)
+        {
+            return false;
+        }
+
+        var formats = new[] { "yyyyMMddHHmm.ss", "yyyyMMddHHmm", "yyMMddHHmm.ss", "yyMMddHHmm", "MMddHHmm.ss", "MMddHHmm" };
+
+        return DateTimeOffset.TryParseExact(
+            text,
+            formats,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out stamp);
     }
 }
 

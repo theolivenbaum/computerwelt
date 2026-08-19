@@ -163,3 +163,32 @@ public sealed class CallerBuiltin : IBuiltin
         return ValueTask.FromResult(ExecResult.Ok($"{line} {caller} {source}\n"));
     }
 }
+
+/// <summary><c>wait</c> — waits for background jobs.</summary>
+/// <remarks>
+/// A backgrounded command has already run to completion by the time this is reached: there
+/// are no processes to schedule, so <c>&amp;</c> runs the command and remembers its status.
+/// <c>wait</c> therefore has nothing to block on and reports what already happened, which
+/// keeps the common <c>cmd &amp; wait</c> shape working.
+/// </remarks>
+public sealed class WaitBuiltin : IBuiltin
+{
+    /// <inheritdoc />
+    public string Name => "wait";
+
+    /// <inheritdoc />
+    public string? LlmHint => "wait: Waits for background jobs. Jobs already ran, so it reports their status.";
+
+    /// <inheritdoc />
+    public ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
+    {
+        var cursor = new ArgCursor(context.Arguments);
+
+        while (cursor.NextOption() is not null)
+        {
+            // `-n` and `-f` change which job is waited for, which is moot with none pending.
+        }
+
+        return ValueTask.FromResult(ExecResult.Success);
+    }
+}

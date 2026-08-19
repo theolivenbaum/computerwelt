@@ -655,6 +655,9 @@ public sealed class TypeBuiltin : IBuiltin
         "until", "do", "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc",
     };
 
+    /// <summary>True when a word is shell syntax rather than a command name.</summary>
+    internal static bool IsKeyword(string name) => Keywords.Contains(name);
+
     private static string? Classify(BuiltinContext context, string name)
     {
         if (context.State.Aliases.ContainsKey(name))

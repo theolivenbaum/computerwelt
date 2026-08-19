@@ -914,7 +914,9 @@ public sealed class Interpreter
 
         Budget.ChargeCommand();
 
+        _lastSubstitutionStatus = null;
         var words = await Expander.ExpandAllAsync(command.Words, cancellationToken);
+
         if (words.Count == 0)
         {
             foreach (var assignment in command.Assignments)
@@ -922,7 +924,11 @@ public sealed class Interpreter
                 await ApplyAssignmentAsync(assignment, cancellationToken);
             }
 
-            return ExecResult.Success;
+            // A command that expanded to nothing still reports what its substitutions did:
+            // `$(exit 42)` on its own leaves `$?` at 42.
+            return _lastSubstitutionStatus is { } substituted
+                ? ExecResult.FromExitCode(substituted)
+                : ExecResult.Success;
         }
 
         var name = words[0];
