@@ -119,7 +119,7 @@ public sealed class Redirection
             case RedirectKind.DuplicateOutput:
             {
                 var target = await interpreter.Expander.ExpandToStringAsync(redirect.Target, cancellationToken);
-                ApplyDuplicate(redirect.Fd, target);
+                ApplyDuplicate(interpreter.State, redirect.Fd, target);
                 return;
             }
 
@@ -141,7 +141,7 @@ public sealed class Redirection
         }
     }
 
-    private void ApplyDuplicate(int fd, string target)
+    private void ApplyDuplicate(ShellState state, int fd, string target)
     {
         switch (target)
         {
@@ -158,6 +158,59 @@ public sealed class Redirection
                 _discardStderr = true;
                 return;
         }
+
+        // `N>&-` closes an extra descriptor.
+        if (fd >= 3 && target == "-")
+        {
+            state.Descriptors.Remove(fd);
+            return;
+        }
+
+        // `N>&1` and `N>&2` make an extra descriptor an alias of a standard stream.
+        if (fd >= 3 && target is "1" or "2")
+        {
+            state.Descriptors[fd] = "&" + target;
+            return;
+        }
+
+        // `1>&N` and `2>&N` send a standard stream wherever N was opened. An unopened
+        // descriptor is left alone rather than guessed at.
+        if (fd is 1 or 2
+            && int.TryParse(target, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var source)
+            && source >= 3
+            && state.Descriptors.TryGetValue(source, out var opened))
+        {
+            if (opened is null)
+            {
+                if (fd == 1)
+                {
+                    _discardStdout = true;
+                }
+                else
+                {
+                    _discardStderr = true;
+                }
+
+                return;
+            }
+
+            if (opened.StartsWith('&'))
+            {
+                if (fd == 2 && opened == "&1")
+                {
+                    _stderrToStdout = true;
+                }
+                else if (fd == 1 && opened == "&2")
+                {
+                    _stdoutToStderr = true;
+                }
+
+                return;
+            }
+
+            // The descriptor stays open across commands, so each write appends to it.
+            _outputs.Add(new Target(VPath.Parse(opened), Append: true, fd == 1, fd == 2));
+        }
     }
 
     private async ValueTask AddOutputAsync(Interpreter interpreter, Redirect redirect, string path, CancellationToken cancellationToken)
@@ -169,6 +222,12 @@ public sealed class Redirection
         // device nodes, so it is recognized by name.
         if (path is "/dev/null")
         {
+            if (redirect.Fd >= 3 && !both)
+            {
+                interpreter.State.Descriptors[redirect.Fd] = null;
+                return;
+            }
+
             if (both || redirect.Fd == 1)
             {
                 _discardStdout = true;
@@ -183,6 +242,20 @@ public sealed class Redirection
         }
 
         var resolved = interpreter.State.WorkingDirectory.Join(path);
+
+        // A descriptor above 2 has no stream of its own to divert; opening it records
+        // where later `>&N` writes should land.
+        if (redirect.Fd >= 3 && !both)
+        {
+            interpreter.State.Descriptors[redirect.Fd] = resolved.Value;
+
+            if (!append)
+            {
+                await FileSystem.WriteFileAsync(resolved, ReadOnlyMemory<byte>.Empty, cancellationToken);
+            }
+
+            return;
+        }
 
         if (!append && interpreter.State.Options.NoClobber && redirect.Kind == RedirectKind.Output
             && await FileSystem.ExistsAsync(resolved, cancellationToken))

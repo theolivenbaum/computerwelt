@@ -81,6 +81,17 @@ public sealed class ShellState
     public HashSet<string> AliasesInProgress { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// Descriptors above 2 that <c>exec N&gt;...</c> has opened, by number.
+    /// </summary>
+    /// <remarks>
+    /// The value is the file the descriptor writes to, <see langword="null"/> for
+    /// <c>/dev/null</c>, or <c>&amp;1</c>/<c>&amp;2</c> when it duplicates one of the
+    /// standard streams. Only these three shapes are reachable without real descriptors,
+    /// and together they cover what <c>N&gt;&amp;</c> in a script can ask for.
+    /// </remarks>
+    public Dictionary<int, string?> Descriptors { get; private set; } = [];
+
+    /// <summary>
     /// Variables the shell seeded at start-up rather than the script exporting them.
     /// </summary>
     /// <remarks>
@@ -446,6 +457,7 @@ public sealed class ShellState
             LastExitCode = LastExitCode,
             PipeStatus = [.. PipeStatus],
             ShellDefaults = new HashSet<string>(ShellDefaults, StringComparer.Ordinal),
+            Descriptors = new Dictionary<int, string?>(Descriptors),
         };
 
         fork._scopes.Clear();
