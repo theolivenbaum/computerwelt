@@ -72,6 +72,12 @@ public sealed class Interpreter
     /// </summary>
     private InputStream? _standardInput;
 
+    /// <summary>
+    /// The exit status of the most recent command substitution, so a command that is
+    /// nothing but assignments reports it: <c>x=$(false)</c> leaves <c>$?</c> at 1.
+    /// </summary>
+    private int? _lastSubstitutionStatus;
+
     /// <summary>Runs a whole script and returns its combined result.</summary>
     public async ValueTask<ExecResult> RunAsync(Script script, StreamData? stdin = null, CancellationToken cancellationToken = default)
     {
@@ -812,12 +818,19 @@ public sealed class Interpreter
             {
                 return assignmentFailure;
             }
+            _lastSubstitutionStatus = null;
+
             foreach (var assignment in command.Assignments)
             {
                 await ApplyAssignmentAsync(assignment, cancellationToken);
             }
 
-            return await redirectionOnly.ApplyAsync(ExecResult.Success, cancellationToken);
+            // `x=$(false)` reports the substitution's status, but a plain `x=1` succeeds.
+            var assigned = _lastSubstitutionStatus is { } status
+                ? ExecResult.FromExitCode(status)
+                : ExecResult.Success;
+
+            return await redirectionOnly.ApplyAsync(assigned, cancellationToken);
         }
 
         Budget.ChargeCommand();
@@ -1152,14 +1165,34 @@ public sealed class Interpreter
         using var nesting = Budget.EnterNesting();
 
         var parsed = Parser.Parse(script, Budget);
-        // A substitution inherits the shell's standard input, so `x=$(cat)` in a script fed
-        // from a pipe reads that pipe — the file descriptor a real shell would have handed
-        // down.
-        var nested = new Interpreter(State, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
+
+        // A substitution is a subshell: assignments, function definitions and traps made
+        // inside it are discarded, which is what keeps `x=$(myvar=inside; ...)` from
+        // rewriting the caller's variable.
+        var fork = State.Fork();
+
+        // It does inherit the shell's standard input, so `x=$(cat)` in a script fed from a
+        // pipe reads that pipe — the file descriptor a real shell would have handed down.
+        var nested = new Interpreter(fork, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
         var result = await nested.RunAsync(parsed, _standardInput?.Remaining, cancellationToken);
 
+        // The subshell exits when the substitution ends, so its EXIT trap fires here and
+        // its output belongs to the substituted value.
+        var atExit = await nested.RunTrapAsync("EXIT", cancellationToken);
+
+        _lastSubstitutionStatus = result.ControlFlow.Kind == ControlFlowKind.Exit
+            ? result.ControlFlow.Level
+            : result.ExitCode;
+
         AppendStderr(result.Stderr);
-        return result with { Stderr = StreamData.Empty, ControlFlow = ControlFlow.None };
+        AppendStderr(atExit.Stderr);
+
+        return result with
+        {
+            Stdout = StreamData.Concat(result.Stdout, atExit.Stdout),
+            Stderr = StreamData.Empty,
+            ControlFlow = ControlFlow.None,
+        };
     }
 
     /// <summary>Runs a script fragment in the current shell, as <c>eval</c> and <c>source</c> do.</summary>

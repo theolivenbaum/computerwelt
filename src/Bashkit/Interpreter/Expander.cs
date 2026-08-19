@@ -329,6 +329,29 @@ public sealed class Expander
     {
         var values = GetSplatValues(parameter);
 
+        // A default or alternate on a list applies to the list as a whole: `${@-x}` yields
+        // `x` when there are no positional parameters, not one `x` per parameter.
+        if (parameter.Operation is ParameterOp.UseDefault or ParameterOp.UseDefaultUnsetOnly
+            or ParameterOp.UseAlternate or ParameterOp.UseAlternateSetOnly)
+        {
+            var isSet = values.Count > 0;
+            var isNull = string.Join(_state.FirstIfsCharacter(), values).Length == 0;
+
+            var argument = parameter.Argument is null
+                ? string.Empty
+                : await ExpandToStringAsync(parameter.Argument, cancellationToken);
+
+            string[] replacement = [argument];
+
+            values = parameter.Operation switch
+            {
+                ParameterOp.UseDefaultUnsetOnly => isSet ? values : replacement,
+                ParameterOp.UseDefault => isSet && !isNull ? values : replacement,
+                ParameterOp.UseAlternateSetOnly => isSet ? replacement : [],
+                _ => isSet && !isNull ? replacement : [],
+            };
+        }
+
         // `${arr[*]}` joins like `$*`; only the `@` form is one field per element.
         if (parameter.Name == "*" || parameter.Index == "*")
         {
@@ -363,8 +386,6 @@ public sealed class Expander
                 AppendSplit(fields, values[i]);
             }
         }
-
-        await ValueTask.CompletedTask;
     }
 
     /// <summary>

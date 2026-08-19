@@ -416,6 +416,16 @@ public static class WordParser
         var rest = body[i..];
         var (op, argText, replacementText) = ParseOperator(rest);
 
+        // In a default or alternate word a backslash keeps its double-quoted meaning: it
+        // escapes only `$`, a backtick, a quote and itself, so `${x-\(}` really is `\(`.
+        if (argText is not null && op is ParameterOp.UseDefault or ParameterOp.UseDefaultUnsetOnly
+            or ParameterOp.AssignDefault or ParameterOp.AssignDefaultUnsetOnly
+            or ParameterOp.UseAlternate or ParameterOp.UseAlternateSetOnly
+            or ParameterOp.ErrorIfUnset or ParameterOp.ErrorIfUnsetOnly)
+        {
+            argText = ProtectBackslashes(argText);
+        }
+
         return new WordPart.Parameter(
             name,
             op,
@@ -426,6 +436,29 @@ public static class WordParser
         {
             Replacement = replacementText is null ? null : Parse(replacementText),
         };
+    }
+
+    /// <summary>Doubles the backslashes that a double-quoted reading would leave alone.</summary>
+    private static string ProtectBackslashes(string text)
+    {
+        if (!text.Contains('\\', StringComparison.Ordinal))
+        {
+            return text;
+        }
+
+        var builder = new System.Text.StringBuilder(text.Length);
+
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '\\' && i + 1 < text.Length && text[i + 1] is not ('$' or '`' or '"' or '\\' or '\n'))
+            {
+                builder.Append('\\');
+            }
+
+            builder.Append(text[i]);
+        }
+
+        return builder.ToString();
     }
 
     private static (ParameterOp Op, string? Argument, string? Replacement) ParseOperator(string rest)
