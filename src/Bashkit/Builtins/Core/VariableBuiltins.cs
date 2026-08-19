@@ -186,11 +186,8 @@ public sealed class LocalBuiltin : IBuiltin
     /// <inheritdoc />
     public ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
-        if (context.State.ScopeDepth == 0)
-        {
-            return ValueTask.FromResult(ExecResult.Usage("local", "can only be used in a function", ExitCodes.Failure));
-        }
-
+        // At the top level the innermost scope is the global one, so `local` there is an
+        // ordinary declaration rather than an error.
         var attributes = VariableAttributes.None;
 
         foreach (var argument in context.Arguments)
@@ -204,6 +201,12 @@ public sealed class LocalBuiltin : IBuiltin
             var equals = argument.IndexOf('=', StringComparison.Ordinal);
             var name = equals < 0 ? argument : argument[..equals];
             var value = equals < 0 ? null : argument[(equals + 1)..];
+
+            if (!ExportBuiltin.IsValidName(name.Split('[')[0]))
+            {
+                return ValueTask.FromResult(
+                    ExecResult.Usage("local", $"`{argument}': not a valid identifier", ExitCodes.Failure));
+            }
 
             var variable = context.State.SetLocal(name, null);
             variable.Attributes |= attributes;

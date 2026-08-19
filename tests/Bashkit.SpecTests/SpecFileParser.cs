@@ -112,7 +112,10 @@ public static class SpecFileParser
 
                 if (directive.StartsWith("exit_code:", StringComparison.Ordinal))
                 {
-                    if (int.TryParse(directive[10..].Trim(), out var parsed))
+                    // A directive outside any case — the corpus has a couple stranded after
+                    // `### end` — belongs to nothing and is dropped rather than leaking
+                    // into whichever case comes next.
+                    if (name is not null && int.TryParse(directive[10..].Trim(), out var parsed))
                     {
                         exitCode = parsed;
                     }

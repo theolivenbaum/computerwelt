@@ -397,6 +397,12 @@ public static class WordParser
 
         var name = body[nameStart..i];
 
+        // `${%}` and friends name nothing; bash calls that a bad substitution.
+        if (name.Length == 0 && !lengthOf && !indirect)
+        {
+            return new WordPart.Parameter(body, ParameterOp.BadSubstitution);
+        }
+
         string? index = null;
         if (i < body.Length && body[i] == '[')
         {

@@ -689,6 +689,9 @@ public sealed class Expander
 
         switch (op)
         {
+            case ParameterOp.BadSubstitution:
+                throw new BashkitException(BashkitErrorKind.Internal, $"${{{parameter.Name}}}: bad substitution");
+
             case ParameterOp.UseDefault:
                 return isNullOrUnset && argument is not null
                     ? await ExpandToStringAsync(argument, cancellationToken)

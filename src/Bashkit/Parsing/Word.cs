@@ -132,6 +132,15 @@ public enum ParameterOp
     /// <summary>No modifier: plain <c>${name}</c>.</summary>
     None,
 
+    /// <summary>
+    /// A <c>${...}</c> whose body names no parameter at all.
+    /// </summary>
+    /// <remarks>
+    /// This is a runtime error rather than a syntax error, because that is where bash
+    /// reports it: the script parses, and <c>${%}</c> fails when it is expanded.
+    /// </remarks>
+    BadSubstitution,
+
     /// <summary><c>${name:-word}</c> — substitute when unset or empty.</summary>
     UseDefault,
 
