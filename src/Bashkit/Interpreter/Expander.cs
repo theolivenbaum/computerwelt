@@ -222,6 +222,23 @@ public sealed class Expander
             .Replace("}", "\\}", StringComparison.Ordinal)
             .Replace(",", "\\,", StringComparison.Ordinal);
 
+    /// <summary>
+    /// Expands and then evaluates an arithmetic expression.
+    /// </summary>
+    /// <remarks>
+    /// The text inside <c>$(( ))</c> is expanded before it is parsed as arithmetic, so
+    /// <c>$(( $1 * $(f) ))</c> means what it looks like it means. Doing it the other way
+    /// round leaves the evaluator staring at a <c>$</c> it cannot read.
+    /// </remarks>
+    public async ValueTask<long> EvaluateArithmeticAsync(string expression, CancellationToken cancellationToken = default)
+    {
+        var expanded = expression.Contains('$', StringComparison.Ordinal)
+            ? await ExpandToStringAsync(WordParser.Parse(expression), cancellationToken)
+            : expression;
+
+        return ArithmeticEvaluator.Evaluate(_state, expanded);
+    }
+
     private async ValueTask<List<string>> ExpandPartAsync(WordPart part, bool splitting, CancellationToken cancellationToken)
     {
         switch (part)
@@ -233,7 +250,10 @@ public sealed class Expander
                 return [ExpandTilde(tilde.User)];
 
             case WordPart.Arithmetic arithmetic:
-                return [ArithmeticEvaluator.Evaluate(_state, arithmetic.Expression).ToString(CultureInfo.InvariantCulture)];
+            {
+                var value = await EvaluateArithmeticAsync(arithmetic.Expression, cancellationToken);
+                return [value.ToString(CultureInfo.InvariantCulture)];
+            }
 
             case WordPart.CommandSubstitution substitution:
             {

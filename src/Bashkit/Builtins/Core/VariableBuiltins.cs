@@ -220,7 +220,7 @@ public sealed class LocalBuiltin : IBuiltin
                 continue;
             }
 
-            variable.SetScalar(value);
+            DeclareBuiltin.AssignScalar(context, variable, value);
         }
 
         return ValueTask.FromResult(ExecResult.Success);
@@ -244,6 +244,10 @@ public sealed class DeclareBuiltin : IBuiltin
         var local = context.State.ScopeDepth > 0;
         var printed = new StringBuilder();
         var sawName = false;
+        var print = false;
+        var functions = false;
+        var namesOnly = false;
+        var missing = false;
 
         foreach (var argument in context.Arguments)
         {
@@ -259,11 +263,57 @@ public sealed class DeclareBuiltin : IBuiltin
                     local = false;
                 }
 
+                if (argument.Contains('p', StringComparison.Ordinal))
+                {
+                    print = true;
+                }
+
+                if (argument.Contains('f', StringComparison.Ordinal))
+                {
+                    functions = true;
+                }
+
+                if (argument.Contains('F', StringComparison.Ordinal))
+                {
+                    functions = true;
+                    namesOnly = true;
+                }
+
                 attributes |= ParseAttributes(argument);
                 continue;
             }
 
             sawName = true;
+
+            // `-p name` reports the declaration rather than making one.
+            if (print || functions)
+            {
+                if (functions)
+                {
+                    if (context.State.Functions.TryGetValue(argument, out var function))
+                    {
+                        printed.Append(namesOnly ? $"declare -f {argument}\n" : Definition(argument, function));
+                    }
+                    else
+                    {
+                        missing = true;
+                    }
+
+                    continue;
+                }
+
+                if (context.State.LookupRaw(argument) is { } declared)
+                {
+                    printed.Append(Describe(argument, declared));
+                }
+                else
+                {
+                    missing = true;
+                }
+
+                continue;
+            }
+
             var equals = argument.IndexOf('=', StringComparison.Ordinal);
             var name = equals < 0 ? argument : argument[..equals];
             var value = equals < 0 ? null : argument[(equals + 1)..];
@@ -295,21 +345,76 @@ public sealed class DeclareBuiltin : IBuiltin
                 continue;
             }
 
-            variable.SetScalar(value);
+            AssignScalar(context, variable, value);
         }
 
         if (!sawName)
         {
-            foreach (var (name, variable) in context.State.AllVariables().OrderBy(static p => p.Key, StringComparer.Ordinal))
+            if (functions)
             {
-                printed.Append(Describe(name, variable));
+                foreach (var (name, function) in context.State.Functions.OrderBy(static p => p.Key, StringComparer.Ordinal))
+                {
+                    printed.Append(namesOnly ? $"declare -f {name}\n" : Definition(name, function));
+                }
+            }
+            else
+            {
+                foreach (var (name, variable) in context.State.AllVariables().OrderBy(static p => p.Key, StringComparer.Ordinal))
+                {
+                    printed.Append(Describe(name, variable));
+                }
             }
 
             return ValueTask.FromResult(ExecResult.Ok(printed.ToString()));
         }
 
+        if (printed.Length > 0 || missing)
+        {
+            return ValueTask.FromResult(new ExecResult
+            {
+                Stdout = StreamData.FromText(printed.ToString()),
+                ExitCode = missing ? ExitCodes.Failure : 0,
+            });
+        }
+
         return ValueTask.FromResult(ExecResult.Success);
     }
+
+    /// <summary>
+    /// Assigns a scalar, applying whatever attributes the variable carries.
+    /// </summary>
+    /// <remarks>
+    /// <c>declare -i x=5+3</c> stores 8, not the text: the integer attribute makes every
+    /// later assignment an arithmetic evaluation, and <c>-u</c>/<c>-l</c> fold case the
+    /// same way.
+    /// </remarks>
+    internal static void AssignScalar(BuiltinContext context, ShellVariable variable, string value)
+    {
+        if (variable.Attributes.HasFlag(VariableAttributes.Integer))
+        {
+            var numeric = Interpreter.ArithmeticEvaluator.Evaluate(context.State, value);
+            variable.SetScalar(numeric.ToString(CultureInfo.InvariantCulture));
+            return;
+        }
+
+        if (variable.Attributes.HasFlag(VariableAttributes.UpperCase))
+        {
+            variable.SetScalar(value.ToUpperInvariant());
+            return;
+        }
+
+        if (variable.Attributes.HasFlag(VariableAttributes.LowerCase))
+        {
+            variable.SetScalar(value.ToLowerInvariant());
+            return;
+        }
+
+        variable.SetScalar(value);
+    }
+
+    /// <summary>Renders a function definition, preferring its own source text.</summary>
+    private static string Definition(string name, Parsing.FunctionDef function) =>
+        function.Source is { Length: > 0 } source ? source + "\n" : $"{name} ()\n{{\n}}\n";
 
     internal static VariableAttributes ParseAttributes(string flags)
     {

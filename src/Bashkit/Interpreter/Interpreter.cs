@@ -144,6 +144,34 @@ public sealed class Interpreter
     {
         Budget.ThrowIfExpired();
 
+        // A pipe into a compound command feeds the whole body from one consuming stream,
+        // not each command from a fresh copy: that is what makes `cmd | while read line`
+        // advance line by line instead of seeing the first line forever.
+        if (stdin is { } piped && SharesInput(node))
+        {
+            var savedInput = _standardInput;
+            _standardInput = new InputStream(piped.ToString());
+
+            try
+            {
+                return await DispatchNodeAsync(node, null, cancellationToken);
+            }
+            finally
+            {
+                _standardInput = savedInput;
+            }
+        }
+
+        return await DispatchNodeAsync(node, stdin, cancellationToken);
+    }
+
+    /// <summary>True for the node kinds whose body shares one input stream.</summary>
+    private static bool SharesInput(Node node) =>
+        node is WhileCommand or UntilCommand or ForCommand or ArithmeticForCommand
+            or CaseCommand or IfCommand or CompoundCommand or BraceGroup or Subshell;
+
+    private async ValueTask<ExecResult> DispatchNodeAsync(Node node, StreamData? stdin, CancellationToken cancellationToken)
+    {
         return node switch
         {
             SimpleCommand simple => await ExecuteSimpleAsync(simple, stdin, cancellationToken),
@@ -159,7 +187,7 @@ public sealed class Interpreter
             CaseCommand caseCommand => await ExecuteCaseAsync(caseCommand, stdin, cancellationToken),
             Subshell subshell => await ExecuteSubshellAsync(subshell, stdin, cancellationToken),
             BraceGroup group => await ExecuteAsync(group.Body, stdin, cancellationToken),
-            ArithmeticCommand arithmetic => ExecuteArithmetic(arithmetic),
+            ArithmeticCommand arithmetic => await ExecuteArithmeticAsync(arithmetic, cancellationToken),
             ConditionalCommand conditional => await ExecuteConditionalAsync(conditional, cancellationToken),
             FunctionDef definition => DefineFunction(definition),
             _ => ExecResult.Success,
@@ -223,13 +251,13 @@ public sealed class Interpreter
         return ExecResult.Success;
     }
 
-    private ExecResult ExecuteArithmetic(ArithmeticCommand command)
+    private async ValueTask<ExecResult> ExecuteArithmeticAsync(ArithmeticCommand command, CancellationToken cancellationToken)
     {
         try
         {
             // `(( expr ))` succeeds when the expression is non-zero — the opposite of the
             // usual C convention, and a classic source of off-by-one bugs in ports.
-            var value = ArithmeticEvaluator.Evaluate(State, command.Expression);
+            var value = await Expander.EvaluateArithmeticAsync(command.Expression, cancellationToken);
             return ExecResult.FromExitCode(value != 0 ? 0 : 1);
         }
         catch (ShellArithmeticException e)
@@ -523,7 +551,7 @@ public sealed class Interpreter
 
         if (command.Init.Length > 0)
         {
-            ArithmeticEvaluator.Evaluate(State, command.Init);
+            await Expander.EvaluateArithmeticAsync(command.Init, cancellationToken);
         }
 
         _loopDepth++;
@@ -535,7 +563,8 @@ public sealed class Interpreter
                 cancellationToken.ThrowIfCancellationRequested();
 
                 // An omitted condition means "always true", as in C.
-                if (command.Condition.Length > 0 && ArithmeticEvaluator.Evaluate(State, command.Condition) == 0)
+                if (command.Condition.Length > 0
+                    && await Expander.EvaluateArithmeticAsync(command.Condition, cancellationToken) == 0)
                 {
                     break;
                 }
@@ -560,7 +589,7 @@ public sealed class Interpreter
 
                 if (command.Update.Length > 0)
                 {
-                    ArithmeticEvaluator.Evaluate(State, command.Update);
+                    await Expander.EvaluateArithmeticAsync(command.Update, cancellationToken);
                 }
             }
         }

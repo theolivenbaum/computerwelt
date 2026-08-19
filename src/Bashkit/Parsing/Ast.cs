@@ -162,7 +162,11 @@ public sealed record ConditionalCommand(ConditionalExpression Expression) : Node
 /// <summary><c>NAME() { ... }</c>.</summary>
 /// <param name="Name">The function's name.</param>
 /// <param name="Body">The function body.</param>
-public sealed record FunctionDef(string Name, Node Body) : Node;
+public sealed record FunctionDef(string Name, Node Body) : Node
+{
+    /// <summary>The definition's source text, for <c>declare -f</c> and <c>type</c>.</summary>
+    public string? Source { get; init; }
+}
 
 /// <summary>A variable assignment.</summary>
 /// <param name="Name">The variable name.</param>

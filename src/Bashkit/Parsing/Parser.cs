@@ -86,6 +86,13 @@ public sealed class Parser
     private ParseException Unexpected(string expectation) =>
         new($"syntax error near unexpected token `{Current.Text}': {expectation}", Current.Start);
 
+    /// <summary>The source text from <paramref name="start"/> to where parsing has reached.</summary>
+    private string Slice(int start)
+    {
+        var end = Math.Min(Current.Start, _source.Length);
+        return start < end ? _source[start..end].TrimEnd() : string.Empty;
+    }
+
     private Script ParseScript()
     {
         var commands = new List<Node>();
@@ -734,7 +741,7 @@ public sealed class Parser
 
         SkipNewlinesOnly();
         var body = ParseFunctionBody();
-        return new FunctionDef(name, body) { Span = new Span(start, Current.Start - start) };
+        return new FunctionDef(name, body) { Span = new Span(start, Current.Start - start), Source = Slice(start) };
     }
 
     private Node ParseFunctionShorthand()
@@ -744,7 +751,7 @@ public sealed class Parser
         _index += 2; // `(` `)`
         SkipNewlinesOnly();
         var body = ParseFunctionBody();
-        return new FunctionDef(name, body) { Span = new Span(start, Current.Start - start) };
+        return new FunctionDef(name, body) { Span = new Span(start, Current.Start - start), Source = Slice(start) };
     }
 
     private Node ParseFunctionBody()
