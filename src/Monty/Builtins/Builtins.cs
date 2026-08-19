@@ -29,15 +29,23 @@ public static class BuiltinNamespace
         void DefineArity(string name, int minimum, int maximum, Func<PyObject[], PyObject> implementation) =>
             builtins.Set(new PyStr(name), new PyBuiltinFunction(name, arguments =>
             {
-                if (arguments.Length < minimum || arguments.Length > maximum)
+                if (minimum == maximum)
                 {
-                    throw new PyRaise(PyErrors.TypeError(minimum == maximum
-                        ? $"{name}() takes exactly {(minimum == 1 ? "one argument" : minimum + " arguments")} ({arguments.Length} given)"
-                        : arguments.Length < minimum
-                            ? $"{name} expected at least {minimum} argument{(minimum == 1 ? string.Empty : "s")}, got {arguments.Length}"
-                            : $"{name} expected at most {maximum} argument{(maximum == 1 ? string.Empty : "s")}, got {arguments.Length}"));
+                    Arity.Exact(name, arguments, minimum);
+                }
+                else
+                {
+                    Arity.Between(name, arguments, minimum, maximum);
                 }
 
+                return implementation(arguments);
+            }));
+
+        // A few builtins spell their fixed arity the other way round; see `Arity`.
+        void DefineExact(string name, int count, Func<PyObject[], PyObject> implementation) =>
+            builtins.Set(new PyStr(name), new PyBuiltinFunction(name, arguments =>
+            {
+                Arity.ExactCount(name, arguments, count);
                 return implementation(arguments);
             }));
 
@@ -121,8 +129,14 @@ public static class BuiltinNamespace
             return new PyIterator(rows);
         });
 
-        DefineArity("map", 2, int.MaxValue, arguments =>
+        builtins.Set(new PyStr("map"), new PyBuiltinFunction("map", arguments =>
         {
+            // `map` words its own arity error, and words it as a sentence.
+            if (arguments.Length < 2)
+            {
+                throw new PyRaise(PyErrors.TypeError("map() must have at least two arguments."));
+            }
+
             var function = arguments[0];
             var sequences = arguments.Skip(1).Select(static a => VirtualMachine.RequireIterable(a).ToList()).ToList();
             var length = sequences.Count == 0 ? 0 : sequences.Min(static s => s.Count);
@@ -134,7 +148,7 @@ public static class BuiltinNamespace
             }
 
             return new PyIterator(results);
-        });
+        }));
 
         DefineArity("filter", 2, 2, arguments =>
         {
@@ -172,6 +186,18 @@ public static class BuiltinNamespace
         {
             var total = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "start") ?? new PyInt(0);
 
+            // Summing strings is almost always a mistake and quadratic when it is not, so
+            // CPython refuses and points at the right tool instead.
+            if (total is PyStr)
+            {
+                throw new PyRaise(PyErrors.TypeError("sum() can't sum strings [use ''.join(seq) instead]"));
+            }
+
+            if (total is PyBytes)
+            {
+                throw new PyRaise(PyErrors.TypeError("sum() can't sum bytes [use b''.join(seq) instead]"));
+            }
+
             foreach (var item in VirtualMachine.RequireIterable(arguments[0]))
             {
                 total = Operators.Binary("+", total, item);
@@ -203,16 +229,21 @@ public static class BuiltinNamespace
                 ?? throw new PyRaise(PyErrors.TypeError("round() missing required argument 'number'"));
 
             var given = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "ndigits");
-            var digits = given is null or PyNone ? 0 : (int)RequireInt(given, "round");
+            var requested = given is null or PyNone ? BigInteger.Zero : RequireInt(given, "round");
+
+            // A precision wider than any representable number saturates: asking for 10**30
+            // digits leaves the value alone, and -10**30 flattens it to zero.
+            var digits = requested > 400 ? 400 : requested < -400 ? -400 : (int)requested;
 
             return number switch
             {
                 PyInt integer when digits >= 0 => integer,
+                PyInt when digits <= -400 => new PyInt(BigInteger.Zero),
                 // Python rounds half to even, unlike the usual half-away-from-zero.
                 PyFloat value => given is null or PyNone
                     ? new PyInt(new BigInteger(Math.Round(value.Value, MidpointRounding.ToEven)))
                     : new PyFloat(Math.Round(value.Value, digits, MidpointRounding.ToEven)),
-                PyInt integer => new PyInt(integer.Value),
+                PyInt integer => new PyInt(RoundToMultiple(integer.Value, BigInteger.Pow(10, -digits))),
                 var other => throw new PyRaise(PyErrors.TypeError(
                     $"type {other.TypeName} doesn't define __round__ method")),
             };
@@ -308,7 +339,8 @@ public static class BuiltinNamespace
 
         DefineArity("getattr", 2, 3, arguments =>
         {
-            var value = Runtime.Attributes.TryGet(machine, arguments[0], arguments[1].Display());
+            var name = Arity.AttributeName(arguments[1]);
+            var value = Runtime.Attributes.TryGet(machine, arguments[0], name);
 
             if (value is not null)
             {
@@ -317,20 +349,20 @@ public static class BuiltinNamespace
 
             return arguments.Length > 2
                 ? arguments[2]
-                : throw new PyRaise(PyErrors.AttributeError(arguments[0].TypeName, arguments[1].Display()));
+                : throw new PyRaise(PyErrors.AttributeError(arguments[0].TypeName, name));
         });
 
         DefineArity("setattr", 3, 3, static arguments =>
         {
-            var name = arguments[1].Display();
+            var name = Arity.AttributeName(arguments[1]);
 
             return arguments[0].SetAttribute(name, arguments[2])
                 ? PyNone.Instance
                 : throw new PyRaise(PyErrors.AttributeError(arguments[0].TypeName, name));
         });
 
-        DefineArity("hasattr", 2, 2, arguments =>
-            PyBool.Of(Runtime.Attributes.TryGet(machine, arguments[0], arguments[1].Display()) is not null));
+        DefineExact("hasattr", 2, arguments =>
+            PyBool.Of(Runtime.Attributes.TryGet(machine, arguments[0], Arity.AttributeName(arguments[1])) is not null));
 
         DefineArity("callable", 1, 1, static arguments => PyBool.Of(arguments[0] is PyCallable or PyExceptionType));
 
@@ -362,6 +394,17 @@ public static class BuiltinNamespace
 
     private static PyObject Extreme(VirtualMachine machine, PyObject[] arguments, PyDict? keywords, bool smallest)
     {
+        var name = smallest ? "min" : "max";
+
+        foreach (var (keyword, _) in keywords?.Entries ?? [])
+        {
+            if (keyword.Display() is not ("key" or "default"))
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{name}() got an unexpected keyword argument '{keyword.Display()}'"));
+            }
+        }
+
         // One iterable argument means "over its elements"; several mean "among them".
         var items = arguments.Length == 1
             ? VirtualMachine.RequireIterable(arguments[0]).ToList()
@@ -371,12 +414,11 @@ public static class BuiltinNamespace
         {
             var fallback = Keyword(keywords, "default");
 
-            return fallback
-                ?? throw new PyRaise(PyErrors.ValueError(
-                    $"{(smallest ? "min" : "max")}() iterable argument is empty"));
+            return fallback ?? throw new PyRaise(PyErrors.ValueError($"{name}() iterable argument is empty"));
         }
 
-        var key = Keyword(keywords, "key");
+        // An explicit `key=None` asks for the identity, not for None to be called.
+        var key = Keyword(keywords, "key") is { } given and not PyNone ? given : null;
         var best = items[0];
         var bestKey = key is null ? best : machine.Call(key, [best]);
 
@@ -395,6 +437,28 @@ public static class BuiltinNamespace
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// Rounds an integer to the nearest multiple, halves going to the even multiple.
+    /// </summary>
+    /// <remarks>
+    /// This is what <c>round(1250, -2)</c> asks for. Doing it in floating point would lose
+    /// the exactness that makes an integer round trip.
+    /// </remarks>
+    private static BigInteger RoundToMultiple(BigInteger value, BigInteger multiple)
+    {
+        var quotient = BigInteger.DivRem(value, multiple, out var remainder);
+
+        if (remainder.IsZero)
+        {
+            return value;
+        }
+
+        var doubled = BigInteger.Abs(remainder) * 2;
+        var rounds = doubled > multiple || (doubled == multiple && !quotient.IsEven);
+
+        return rounds ? (quotient + value.Sign) * multiple : quotient * multiple;
     }
 
     private static PyStr Prefixed(BigInteger value, int radix, string prefix)

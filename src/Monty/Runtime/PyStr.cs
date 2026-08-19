@@ -104,8 +104,10 @@ public sealed class PyStr : PyObject
         var builder = new StringBuilder(value.Length + 2);
         builder.Append(quote);
 
-        foreach (var c in value)
+        for (var i = 0; i < value.Length; i++)
         {
+            var c = value[i];
+
             switch (c)
             {
                 case '\\': builder.Append("\\\\"); break;
@@ -116,14 +118,39 @@ public sealed class PyStr : PyObject
                     if (c == quote)
                     {
                         builder.Append('\\').Append(c);
+                        break;
                     }
-                    else if (char.IsControl(c))
+
+                    // A surrogate pair is one code point, and it is printable or not as a
+                    // whole; testing the halves separately would call every pair unprintable.
+                    if (char.IsHighSurrogate(c) && i + 1 < value.Length && char.IsLowSurrogate(value[i + 1]))
+                    {
+                        var codePoint = char.ConvertToUtf32(c, value[i + 1]);
+                        i++;
+
+                        if (IsPrintable(char.GetUnicodeCategory(value, i - 1)))
+                        {
+                            builder.Append(c).Append(value[i]);
+                        }
+                        else
+                        {
+                            builder.Append("\\U").Append(codePoint.ToString("x8", CultureInfo.InvariantCulture));
+                        }
+
+                        break;
+                    }
+
+                    if (c == ' ' || IsPrintable(CharUnicodeInfo.GetUnicodeCategory(c)))
+                    {
+                        builder.Append(c);
+                    }
+                    else if (c <= 0xFF)
                     {
                         builder.Append("\\x").Append(((int)c).ToString("x2", CultureInfo.InvariantCulture));
                     }
                     else
                     {
-                        builder.Append(c);
+                        builder.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
                     }
 
                     break;
@@ -133,6 +160,25 @@ public sealed class PyStr : PyObject
         builder.Append(quote);
         return builder.ToString();
     }
+
+    /// <summary>
+    /// Whether a character survives <c>repr</c> as itself.
+    /// </summary>
+    /// <remarks>
+    /// This is <c>str.isprintable</c>'s rule: everything except the separators (other than
+    /// a plain space) and the "other" categories — control, format, surrogate, private use
+    /// and unassigned. Testing for a control character alone would leave a no-break space
+    /// or a line separator in the output looking exactly like an ordinary one.
+    /// </remarks>
+    private static bool IsPrintable(UnicodeCategory category) => category is not (
+        UnicodeCategory.Control
+        or UnicodeCategory.Format
+        or UnicodeCategory.Surrogate
+        or UnicodeCategory.PrivateUse
+        or UnicodeCategory.OtherNotAssigned
+        or UnicodeCategory.LineSeparator
+        or UnicodeCategory.ParagraphSeparator
+        or UnicodeCategory.SpaceSeparator);
 }
 
 /// <summary><c>bytes</c>.</summary>

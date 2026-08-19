@@ -69,10 +69,30 @@ public sealed class PyBuiltinFunction : PyCallable
         _implementation = implementation;
     }
 
-    /// <summary>Creates a builtin that takes only positional arguments.</summary>
+    /// <summary>
+    /// Creates a builtin that takes only positional arguments.
+    /// </summary>
+    /// <remarks>
+    /// Passing a keyword to one of these is an error, not something to ignore: CPython's
+    /// builtins written in C accept no keywords at all, and a script that spells an
+    /// argument as a keyword needs to hear about it.
+    /// </remarks>
     public PyBuiltinFunction(string name, Func<PyObject[], PyObject> implementation)
-        : this(name, (arguments, _) => implementation(arguments))
+        : this(name, (arguments, keywords) =>
+        {
+            RejectKeywords(name, keywords);
+            return implementation(arguments);
+        })
     {
+    }
+
+    /// <summary>Raises when a positional-only builtin was given keyword arguments.</summary>
+    internal static void RejectKeywords(string name, PyDict? keywords)
+    {
+        if (keywords is { Count: > 0 })
+        {
+            throw new PyRaise(PyErrors.TypeError($"{name}() takes no keyword arguments"));
+        }
     }
 
     /// <inheritdoc />
@@ -93,6 +113,16 @@ public sealed class PyBuiltinFunction : PyCallable
 public sealed class PyBoundMethod : PyCallable
 {
     private readonly Func<PyObject, PyObject[], PyDict?, PyObject> _implementation;
+
+    /// <summary>Creates a bound method taking only positional arguments.</summary>
+    public PyBoundMethod(string name, PyObject receiver, Func<PyObject, PyObject[], PyObject> implementation)
+        : this(name, receiver, (self, arguments, keywords) =>
+        {
+            PyBuiltinFunction.RejectKeywords(name, keywords);
+            return implementation(self, arguments);
+        })
+    {
+    }
 
     /// <summary>Creates a bound method over <paramref name="receiver"/>.</summary>
     public PyBoundMethod(string name, PyObject receiver, Func<PyObject, PyObject[], PyDict?, PyObject> implementation)
