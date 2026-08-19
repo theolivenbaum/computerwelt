@@ -20,6 +20,7 @@ public sealed class BashBuilder
     private ExecutionLimits _limits = ExecutionLimits.Default;
     private FsLimits _fileSystemLimits = FsLimits.Default;
     private VPath _workingDirectory = VPath.Parse("/");
+    private TimeProvider _timeProvider = TimeProvider.System;
     private string _username = "user";
     private string _hostname = "sandbox";
     private bool _registerDefaults = true;
@@ -35,6 +36,16 @@ public sealed class BashBuilder
     public BashBuilder WithFileSystemLimits(FsLimits limits)
     {
         _fileSystemLimits = limits;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the clock the session reads. Pin it to make runs reproducible and to keep the
+    /// host's wall clock from becoming a fingerprinting channel.
+    /// </summary>
+    public BashBuilder WithTimeProvider(TimeProvider timeProvider)
+    {
+        _timeProvider = timeProvider;
         return this;
     }
 
@@ -94,7 +105,7 @@ public sealed class BashBuilder
     /// <summary>Builds the session.</summary>
     public Bash Build()
     {
-        var fileSystem = _fileSystem ?? new InMemoryFileSystem(_fileSystemLimits);
+        var fileSystem = _fileSystem ?? new InMemoryFileSystem(_fileSystemLimits, _timeProvider);
         var state = new ShellState { WorkingDirectory = _workingDirectory };
 
         SeedEnvironment(state);
@@ -154,7 +165,7 @@ public sealed class BashBuilder
         }
     }
 
-    private static void RegisterDefaults(Dictionary<string, IBuiltin> registry)
+    private void RegisterDefaults(Dictionary<string, IBuiltin> registry)
     {
         void Register(IBuiltin builtin) => registry[builtin.Name] = builtin;
 
@@ -239,6 +250,8 @@ public sealed class BashBuilder
         Register(new IdentityBuiltin("hostname"));
         Register(new IdentityBuiltin("uname"));
         Register(new SleepBuiltin());
+        Register(new DateBuiltin(_timeProvider));
+        Register(new TimeoutBuiltin());
         Register(new DirectoryStackBuiltin("pushd"));
         Register(new DirectoryStackBuiltin("popd"));
         Register(new DirectoryStackBuiltin("dirs"));

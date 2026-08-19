@@ -1,0 +1,1453 @@
+//! String, bytes, and long integer interning for efficient storage of literals and identifiers.
+//!
+//! This module provides interners that store unique strings, bytes, and long integers in vectors
+//! and return indices (`StringId`, `BytesId`, `LongIntId`) for efficient storage and comparison.
+//! This avoids the overhead of cloning strings or using atomic reference counting.
+//!
+//! The interners are populated during parsing and preparation, then owned by the `Executor`.
+//! During execution, lookups are needed only for error messages and repr output.
+//!
+//! StringIds are laid out as follows:
+//! * 0 to 128 - single character strings for all 128 ASCII characters
+//! * 1000 to count(StaticStrings) - strings StaticStrings
+//! * 10_000+ - strings interned per executor
+
+use std::{slice::from_ref, str::FromStr};
+
+use ahash::AHashMap;
+use num_bigint::BigInt;
+#[cfg(test)]
+use strum::IntoEnumIterator;
+use strum::{EnumCount, EnumIter, EnumString, FromRepr, IntoStaticStr};
+
+use crate::{
+    function::Function,
+    hash::{ASCII_HASHES, HashValue, STATIC_HASHES, WithHash, hash_python_str},
+    value::Value,
+};
+
+/// Index into the string interner's storage.
+///
+/// Uses `u32` to save space (4 bytes vs 8 bytes for `usize`). This limits us to
+/// ~4 billion unique interns, which is more than sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub struct StringId(u32);
+
+impl StringId {
+    /// Creates a StringId from a raw index value.
+    ///
+    /// Used by the bytecode VM to reconstruct StringIds from operands stored
+    /// in bytecode. The caller is responsible for ensuring the index is valid.
+    #[inline]
+    pub fn from_index(index: u16) -> Self {
+        Self(u32::from(index))
+    }
+
+    /// Returns the raw index value.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// Returns the StringId for an ASCII byte.
+    #[must_use]
+    pub const fn from_ascii(byte: u8) -> Self {
+        Self(byte as u32)
+    }
+
+    /// Const equivalent of `StringId::from(StaticStrings)`, for building
+    /// `static` tables (e.g. the `ParamSpec`s emitted by `derive(FromArgs)`)
+    /// where trait-based `From` conversions cannot be used.
+    #[must_use]
+    pub const fn from_static(value: StaticStrings) -> Self {
+        Self(value as u32)
+    }
+}
+
+/// StringId offsets
+const STATIC_STRING_ID_OFFSET: u16 = 1000;
+const INTERN_STRING_ID_OFFSET: usize = 10_000;
+
+/// Static strings for all 128 ASCII characters.
+///
+/// Exposed `pub(crate)` so the [`crate::hash::ASCII_HASHES`] table can hash
+/// them in lockstep — both tables must agree on the same `&str` per byte.
+pub(crate) static ASCII_STRS: [&str; 128] = const {
+    // Initialize array of 128 bytes which will be used as the raw storage
+    const ASCII_BYTES: [u8; 128] = const {
+        let mut bytes: [u8; 128] = [0; 128];
+        let mut i: u8 = 0;
+        while i < 128 {
+            bytes[i as usize] = i;
+            i += 1;
+        }
+        bytes
+    };
+    // Index into the above array to build the `&'static str` forms
+    let mut strs: [&str; 128] = [""; 128];
+    let mut i = 0;
+    while i < 128 {
+        strs[i] = match str::from_utf8(from_ref(&ASCII_BYTES[i])) {
+            Ok(s) => s,
+            Err(_) => panic!("invalid ascii byte"),
+        };
+        i += 1;
+    }
+    strs
+};
+
+/// Static string values which are known at compile time and don't need to be interned.
+///
+/// Discriminant starts from STATIC_STRING_ID_OFFSET to make conversion to/from stringid
+/// cheap when within bounds.
+#[repr(u16)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    FromRepr,
+    EnumCount,
+    EnumIter,
+    EnumString,
+    IntoStaticStr,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum StaticStrings {
+    #[strum(serialize = "")]
+    EmptyString = STATIC_STRING_ID_OFFSET,
+    #[strum(serialize = "<module>")]
+    Module,
+    // ==========================
+    // List methods
+    // Also uses shared: POP, CLEAR, COPY, REMOVE
+    // Also uses string-shared: INDEX, COUNT
+    Append,
+    Insert,
+    Extend,
+    Reverse,
+    Sort,
+
+    // ==========================
+    // Dict methods
+    // Also uses shared: POP, CLEAR, COPY, UPDATE
+    Get,
+    Keys,
+    Values,
+    Items,
+    Setdefault,
+    Popitem,
+    Fromkeys,
+
+    // ==========================
+    // Shared methods
+    // Used by multiple container types: list, dict, set
+    Pop,
+    Clear,
+    Copy,
+
+    // ==========================
+    // Set methods
+    // Also uses shared: POP, CLEAR, COPY
+    Add,
+    Remove,
+    Discard,
+    Update,
+    Union,
+    Intersection,
+    Difference,
+    SymmetricDifference,
+    Issubset,
+    Issuperset,
+    Isdisjoint,
+
+    // ==========================
+    // String methods
+    // Some methods shared with bytes: FIND, INDEX, COUNT, STARTSWITH, ENDSWITH
+    // Some methods shared with list/tuple: INDEX, COUNT
+    Join,
+    // Simple transformations
+    Lower,
+    Upper,
+    Capitalize,
+    Title,
+    Swapcase,
+    Casefold,
+    // Predicate methods
+    Isalpha,
+    Isdigit,
+    Isalnum,
+    Isnumeric,
+    Isspace,
+    Islower,
+    Isupper,
+    Isascii,
+    Isdecimal,
+    // Search methods (some shared with bytes, list, tuple)
+    Find,
+    Rfind,
+    Index,
+    Rindex,
+    Count,
+    Startswith,
+    Endswith,
+    // Strip/trim methods
+    Strip,
+    Lstrip,
+    Rstrip,
+    Removeprefix,
+    Removesuffix,
+    // Split methods
+    Split,
+    Rsplit,
+    Splitlines,
+    Partition,
+    Rpartition,
+    // Replace/padding methods
+    Replace,
+    Center,
+    Ljust,
+    Rjust,
+    Zfill,
+    Expandtabs,
+    // Keyword argument names for string/bytes methods and constructors
+    Tabsize,
+    Keepends,
+    Obj,
+    Object,
+    Source,
+    Base,
+    // Additional string methods
+    Encode,
+    Isidentifier,
+    Istitle,
+
+    // ==========================
+    // Bytes methods
+    // Also uses string-shared: FIND, INDEX, COUNT, STARTSWITH, ENDSWITH
+    // Also uses most string methods: LOWER, UPPER, CAPITALIZE, TITLE, SWAPCASE,
+    // ISALPHA, ISDIGIT, ISALNUM, ISSPACE, ISLOWER, ISUPPER, ISASCII, ISTITLE,
+    // RFIND, RINDEX, STRIP, LSTRIP, RSTRIP, REMOVEPREFIX, REMOVESUFFIX,
+    // SPLIT, RSPLIT, SPLITLINES, PARTITION, RPARTITION, REPLACE,
+    // CENTER, LJUST, RJUST, ZFILL, JOIN
+    Decode,
+    Hex,
+    Fromhex,
+
+    // ==========================
+    // sys module strings
+    Sys,
+    #[strum(serialize = "sys.version_info")]
+    SysVersionInfo,
+    Version,
+    VersionInfo,
+    Platform,
+    Stdout,
+    Stderr,
+    Major,
+    Minor,
+    Micro,
+    Releaselevel,
+    Serial,
+    Final,
+    #[strum(serialize = "3.14.0 (Monty)")]
+    MontyVersionString,
+    Monty,
+
+    // ==========================
+    // os.stat_result fields
+    #[strum(serialize = "StatResult")]
+    OsStatResult,
+    StMode,
+    StIno,
+    StDev,
+    StNlink,
+    StUid,
+    StGid,
+    StSize,
+    StAtime,
+    StMtime,
+    StCtime,
+
+    // ==========================
+    // typing module strings
+    Typing,
+    #[strum(serialize = "TYPE_CHECKING")]
+    TypeChecking,
+    #[strum(serialize = "Any")]
+    Any,
+    #[strum(serialize = "Optional")]
+    Optional,
+    #[strum(serialize = "Union")]
+    UnionType,
+    #[strum(serialize = "List")]
+    ListType,
+    #[strum(serialize = "Dict")]
+    DictType,
+    #[strum(serialize = "Tuple")]
+    TupleType,
+    #[strum(serialize = "Set")]
+    SetType,
+    #[strum(serialize = "FrozenSet")]
+    FrozenSet,
+    #[strum(serialize = "Callable")]
+    Callable,
+    #[strum(serialize = "Type")]
+    Type,
+    #[strum(serialize = "Sequence")]
+    Sequence,
+    #[strum(serialize = "Mapping")]
+    Mapping,
+    #[strum(serialize = "Iterable")]
+    Iterable,
+    #[strum(serialize = "Iterator")]
+    IteratorType,
+    #[strum(serialize = "Generator")]
+    Generator,
+    #[strum(serialize = "ClassVar")]
+    ClassVar,
+    #[strum(serialize = "Final")]
+    FinalType,
+    #[strum(serialize = "Literal")]
+    Literal,
+    #[strum(serialize = "TypeVar")]
+    TypeVar,
+    #[strum(serialize = "Generic")]
+    Generic,
+    #[strum(serialize = "Protocol")]
+    Protocol,
+    #[strum(serialize = "Annotated")]
+    Annotated,
+    #[strum(serialize = "Self")]
+    SelfType,
+    #[strum(serialize = "Never")]
+    Never,
+    #[strum(serialize = "NoReturn")]
+    NoReturn,
+
+    // ==========================
+    // asyncio module strings
+    Asyncio,
+    Gather,
+    Run,
+
+    // ==========================
+    // os module strings
+    Os,
+    Getenv,
+    Environ,
+    Default,
+
+    // ==========================
+    // Exception attributes
+    Args,
+
+    // ==========================
+    // Type attributes
+    #[strum(serialize = "__name__")]
+    DunderName,
+    #[strum(serialize = "__enter__")]
+    Enter,
+    #[strum(serialize = "__exit__")]
+    Exit,
+
+    // ==========================
+    // pathlib module strings
+    Pathlib,
+    #[strum(serialize = "Path")]
+    PathClass,
+
+    // Path properties (pure - no I/O)
+    Name,
+    Parent,
+    Stem,
+    Suffix,
+    Suffixes,
+    Parts,
+
+    // Path pure methods (no I/O)
+    IsAbsolute,
+    Joinpath,
+    WithName,
+    WithStem,
+    WithSuffix,
+    AsPosix,
+    #[strum(serialize = "__fspath__")]
+    Fspath,
+
+    // Path filesystem methods (require OsAccess - yield external calls)
+    Exists,
+    IsFile,
+    IsDir,
+    IsSymlink,
+    #[strum(serialize = "stat")]
+    StatMethod,
+    ReadBytes,
+    ReadText,
+    Iterdir,
+    Resolve,
+    Absolute,
+
+    // Path write methods (require OsAccess - yield external calls)
+    WriteText,
+    WriteBytes,
+    AppendText,
+    AppendBytes,
+    Mkdir,
+    Unlink,
+    Rmdir,
+    Rename,
+
+    // Path.open(): wraps the same `OsFunction::Open` round-trip as the
+    // `open()` builtin. Handled in `Path::py_call_attr` with custom
+    // mode/kwarg validation (so it cannot go through the generic
+    // `OsFunction::try_from(StaticStrings)` short-circuit).
+    Open,
+
+    // ==========================
+    // File object methods and attributes
+    Read,
+    Write,
+    Close,
+    Flush,
+    Readable,
+    Writable,
+    Seekable,
+    Readline,
+    Readlines,
+    Tell,
+    Seek,
+    Closed,
+    Mode,
+    Encoding,
+    File,
+    Buffering,
+    Errors,
+    Newline,
+    Closefd,
+    Opener,
+    Repl,
+    Old,
+    New,
+
+    // Slice attributes
+    Start,
+    Stop,
+    Step,
+
+    // ==========================
+    // module strings
+    // ==========================
+
+    // math module strings
+    Math,
+    // Rounding
+    Floor,
+    Ceil,
+    Trunc,
+    // Roots & powers
+    Sqrt,
+    Isqrt,
+    Cbrt,
+    Pow,
+    Exp,
+    Exp2,
+    Expm1,
+    // Logarithms
+    Log,
+    Log1p,
+    Log2,
+    Log10,
+    // Float properties
+    Fabs,
+    Isnan,
+    Isinf,
+    Isfinite,
+    Copysign,
+    Isclose,
+    Nextafter,
+    Ulp,
+    // Trigonometric
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    // Hyperbolic
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    // Angular conversion
+    Degrees,
+    Radians,
+    // Integer math
+    Factorial,
+    Gcd,
+    Lcm,
+    Comb,
+    Perm,
+    // Modular / decomposition
+    Fmod,
+    Remainder,
+    Modf,
+    Frexp,
+    Ldexp,
+    // Special functions
+    Gamma,
+    Lgamma,
+    Erf,
+    Erfc,
+    // Constants
+    /// `math.pi` constant
+    Pi,
+    /// `math.e` constant
+    #[strum(serialize = "e")]
+    MathE,
+    /// `math.tau` constant
+    Tau,
+    /// `math.inf` constant
+    #[strum(serialize = "inf")]
+    MathInf,
+    /// `math.nan` constant
+    #[strum(serialize = "nan")]
+    MathNan,
+
+    // ==========================
+    // json module strings
+    /// Module name for `import json`.
+    Json,
+    /// `json.loads()` function.
+    Loads,
+    /// `json.dumps()` function.
+    Dumps,
+    /// `json.JSONDecodeError` exception.
+    #[strum(serialize = "JSONDecodeError")]
+    JsonDecodeError,
+    /// `json.dumps(indent=...)` keyword.
+    Indent,
+    /// `json.dumps(sort_keys=...)` keyword.
+    #[strum(serialize = "sort_keys")]
+    SortKeys,
+    /// `json.dumps(ensure_ascii=...)` keyword.
+    #[strum(serialize = "ensure_ascii")]
+    EnsureAscii,
+    /// `json.dumps(allow_nan=...)` keyword.
+    #[strum(serialize = "allow_nan")]
+    AllowNan,
+    /// `json.dumps(separators=...)` keyword.
+    Separators,
+    /// `json.dumps(skipkeys=...)` keyword.
+    Skipkeys,
+
+    // ==========================
+    // datetime module strings
+    Datetime,
+    Date,
+    Timedelta,
+    Timezone,
+    Today,
+    Now,
+    Utc,
+    TotalSeconds,
+    Tzinfo,
+    // date/datetime field attributes
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Microsecond,
+    Fold,
+    // timedelta constructor/attribute names
+    Days,
+    Seconds,
+    Microseconds,
+    Milliseconds,
+    Minutes,
+    Hours,
+    Weeks,
+    // timezone constructor kwargs
+    Offset,
+    // datetime.now() kwarg
+    Tz,
+    // round() kwargs
+    Number,
+    Ndigits,
+    // date/datetime methods
+    Isoformat,
+    Strftime,
+    Weekday,
+    Isoweekday,
+    Timestamp,
+    Strptime,
+    Fromisoformat,
+
+    // re module strings
+    /// Module name for `import re`.
+    Re,
+    /// `re.compile()` function
+    Compile,
+    /// `re.match()` / `pattern.match()` method
+    Match,
+    /// `re.search()` / `pattern.search()` method
+    Search,
+    /// `re.fullmatch()` / `pattern.fullmatch()` method
+    Fullmatch,
+    /// `re.findall()` / `pattern.findall()` method
+    Findall,
+    /// `re.sub()` / `pattern.sub()` method
+    Sub,
+    /// `match.group()` method
+    Group,
+    /// `match.groups()` method
+    Groups,
+    /// `match.span()` method
+    Span,
+    /// `match.end()` method
+    End,
+    /// `re.Pattern`
+    #[strum(serialize = "Pattern")]
+    PatternClass,
+    /// `re.Match`
+    #[strum(serialize = "Match")]
+    MatchClass,
+    /// `pattern.pattern`
+    #[strum(serialize = "pattern")]
+    PatternAttr,
+    /// `match.string`
+    #[strum(serialize = "string")]
+    StringAttr,
+    /// `pattern.flags`
+    Flags,
+    /// `re.IGNORECASE` flag
+    #[strum(serialize = "IGNORECASE")]
+    Ignorecase,
+    /// `re.I` flag, alias
+    #[strum(serialize = "I")]
+    I,
+    /// `re.MULTILINE` flag
+    #[strum(serialize = "MULTILINE")]
+    MultilineFlag,
+    /// `re.M` flag, alias
+    #[strum(serialize = "M")]
+    M,
+    /// `re.DOTALL` flag
+    #[strum(serialize = "DOTALL")]
+    DotallFlag,
+    /// `re.S` flag, alias
+    #[strum(serialize = "S")]
+    S,
+    /// `re.NOFLAG` flag
+    #[strum(serialize = "NOFLAG")]
+    NoFlag,
+    /// `re.ASCII` flag
+    #[strum(serialize = "ASCII")]
+    AsciiFlag,
+    /// `re.A` flag, alias
+    #[strum(serialize = "A")]
+    A,
+    /// `re.PatternError` exception
+    #[strum(serialize = "PatternError")]
+    PatternError,
+    /// `re.error` exception alias (same as `re.PatternError`)
+    #[strum(serialize = "error")]
+    Error,
+    /// `re.escape()` function
+    Escape,
+    /// `re.finditer()` / `pattern.finditer()` method
+    Finditer,
+    /// `match.groupdict()` method
+    Groupdict,
+
+    // ==========================
+    // gc module strings (only reachable when the `test-hooks` feature is enabled,
+    // but interned unconditionally so the variant ordering — and therefore every
+    // `StringId` used elsewhere — stays stable across feature combinations).
+    /// Module name for `import gc`.
+    Gc,
+    /// `gc.collect()` function.
+    Collect,
+    /// `gc.disable()` function.
+    Disable,
+    /// `gc.enable()` function.
+    Enable,
+
+    // ==========================
+    // Kwarg names referenced by `#[derive(FromArgs)]` macros and the
+    // hand-written argument extractors they're gradually replacing.
+    // These exist purely as `StaticStrings` so the generated dispatch
+    // code can use `StringId` equality (O(1)) instead of string compare.
+    /// Kwarg name `key` — `sorted(key=...)`, `min(key=...)`, etc.
+    Key,
+    /// Kwarg name `sep` — `str.split(sep=...)`, `print(sep=...)`, etc.
+    Sep,
+    /// Kwarg name `maxsplit` — `str.split(maxsplit=...)`, `re.split(maxsplit=...)`.
+    Maxsplit,
+    /// Kwarg name `strict` — `zip(strict=...)`.
+    Strict,
+    /// Kwarg name `return_exceptions` — `asyncio.gather(return_exceptions=...)`.
+    ReturnExceptions,
+    /// Kwarg name `rel_tol` — `math.isclose(rel_tol=...)`.
+    RelTol,
+    /// Kwarg name `abs_tol` — `math.isclose(abs_tol=...)`.
+    AbsTol,
+    /// Kwarg name `format` — `date.strftime(format=...)`, `datetime.strftime(format=...)`.
+    Format,
+    /// Kwarg name `parents` — `Path.mkdir(parents=...)`.
+    Parents,
+    /// Kwarg name `exist_ok` — `Path.mkdir(exist_ok=...)`.
+    ExistOk,
+
+    // ==========================
+    // sys module test-hook strings (kept interned unconditionally for the
+    // same StringId-stability reason as the gc entries above).
+    /// `sys.setrecursionlimit()` function (only callable under `test-hooks`).
+    Setrecursionlimit,
+
+    // ==========================
+    // unicodedata module strings. The `name()` function reuses the existing
+    // `Name` variant (both intern to "name").
+    /// Module name for `import unicodedata`.
+    Unicodedata,
+    /// `unicodedata.normalize()` function.
+    Normalize,
+    /// `unicodedata.is_normalized()` function.
+    #[strum(serialize = "is_normalized")]
+    IsNormalized,
+    /// `unicodedata.category()` function.
+    Category,
+    /// `unicodedata.lookup()` function.
+    Lookup,
+    /// `unicodedata.combining()` function.
+    Combining,
+    /// `unicodedata.unidata_version` constant.
+    #[strum(serialize = "unidata_version")]
+    UnidataVersion,
+
+    // ==========================
+    // Module dunder values.
+    #[strum(serialize = "__main__")]
+    DunderMain,
+
+    // ==========================
+    // Class dunder attributes.
+    /// `__doc__` — synthesized into the namespace of classes created by the
+    /// 3-arg `type()` builtin when the caller's dict omits it (compiled
+    /// `class` bodies get theirs from the parser). Appended at the enum end:
+    /// StaticStrings discriminants are serialized `StringId`s, so mid-enum
+    /// insertion would shift every later id.
+    #[strum(serialize = "__doc__")]
+    DunderDoc,
+
+    // ==========================
+    // Singleton `repr()`/`str()` values. Interned so `str(None)`, `repr(True)`,
+    // `f"{...}"`, `print(False)` etc. resolve to an existing `StringId` instead
+    // of allocating a fresh heap string each time — see `Value::py_repr`.
+    // Appended at the enum end: discriminants are serialized `StringId`s, so
+    // mid-enum insertion would shift every later id.
+    #[strum(serialize = "None")]
+    NoneRepr,
+    #[strum(serialize = "True")]
+    TrueRepr,
+    #[strum(serialize = "False")]
+    FalseRepr,
+    #[strum(serialize = "Ellipsis")]
+    EllipsisRepr,
+
+    // ==========================
+    // os module function/constant names. Appended at the enum end:
+    // discriminants are serialized `StringId`s, so mid-enum insertion would
+    // shift every later id. Constants reuse existing variants where the text
+    // already exists (`Sep` in the kwarg section, `Name`, single-char ASCII
+    // ids for `/`, `.`, `\n`).
+    /// `os.listdir()` function.
+    Listdir,
+    /// `os.makedirs()` function.
+    Makedirs,
+    /// `os.fspath()` function — distinct from `Fspath` (`__fspath__`).
+    #[strum(serialize = "fspath")]
+    OsFspath,
+    /// `os.altsep` constant name.
+    Altsep,
+    /// `os.extsep` constant name.
+    Extsep,
+    /// `os.curdir` constant name.
+    Curdir,
+    /// `os.pardir` constant name.
+    Pardir,
+    /// `os.linesep` constant name.
+    Linesep,
+    /// `os.devnull` constant name.
+    Devnull,
+    /// Value of `os.name`.
+    Posix,
+    /// Value of `os.pardir`.
+    #[strum(serialize = "..")]
+    ParentDirString,
+    /// Value of `os.devnull`.
+    #[strum(serialize = "/dev/null")]
+    DevNullString,
+    /// Kwarg name `path` — `os.listdir(path=...)`, `os.stat(path=...)`, etc.
+    Path,
+    /// Kwarg name `dir_fd` — `os.stat(dir_fd=...)`, `os.mkdir(dir_fd=...)`, etc.
+    DirFd,
+    /// Kwarg name `follow_symlinks` — `os.stat(follow_symlinks=...)`.
+    FollowSymlinks,
+    /// Kwarg name `src` — `os.rename(src=...)`, `os.replace(src=...)`.
+    Src,
+    /// Kwarg name `dst` — `os.rename(dst=...)`, `os.replace(dst=...)`.
+    Dst,
+    /// Kwarg name `src_dir_fd` — `os.rename(src_dir_fd=...)`.
+    SrcDirFd,
+    /// Kwarg name `dst_dir_fd` — `os.rename(dst_dir_fd=...)`.
+    DstDirFd,
+
+    // itertools module strings; `count`, `start`, `step` and `object` reuse the
+    // existing variants of the same name. Appended, per the rule above.
+    /// Module name for `import itertools`.
+    Itertools,
+    /// `itertools.repeat()` function.
+    Repeat,
+    /// `times` keyword argument of `itertools.repeat()`.
+    Times,
+
+    // ==========================
+    // dataclasses module strings. Appended at the enum end: discriminants are
+    // serialized `StringId`s, so mid-enum insertion would shift every later id.
+    /// Module name for `import dataclasses`.
+    Dataclasses,
+    /// `dataclasses.dataclass` decorator.
+    Dataclass,
+    /// `dataclasses.is_dataclass()` function.
+    IsDataclass,
+    /// The `__dataclass_fields__` class attribute `@dataclass` writes: the
+    /// name -> `Field` mapping that drives every synthesized dunder.
+    #[strum(serialize = "__dataclass_fields__")]
+    DataclassFields,
+
+    // ==========================
+    // collections module strings. Appended at the enum end: discriminants are
+    // serialized `StringId`s, so mid-enum insertion would shift every later id.
+    /// Module name for `import collections`.
+    Collections,
+    /// The `collections.deque` type.
+    Deque,
+    /// `deque.appendleft()` method.
+    Appendleft,
+    /// `deque.extendleft()` method.
+    Extendleft,
+    /// `deque.popleft()` method.
+    Popleft,
+    /// `deque.rotate()` method.
+    Rotate,
+    /// `deque.maxlen` attribute (also a constructor keyword argument).
+    Maxlen,
+    /// `deque(iterable=...)` — the constructor's first parameter, which CPython
+    /// also accepts by keyword. Distinct from [`Self::Iterable`], which is the
+    /// capitalized `typing.Iterable`.
+    #[strum(serialize = "iterable")]
+    IterableArg,
+    /// The `collections.namedtuple` factory function.
+    Namedtuple,
+    /// The `collections.defaultdict` factory function.
+    Defaultdict,
+    /// The `collections.Counter` type/factory.
+    #[strum(serialize = "Counter")]
+    Counter,
+    /// `Counter.most_common()` method.
+    #[strum(serialize = "most_common")]
+    MostCommon,
+    /// `Counter.elements()` method.
+    Elements,
+    /// `Counter.total()` method.
+    Total,
+    /// `Counter.subtract()` method.
+    Subtract,
+    /// `namedtuple(typename=...)` keyword argument.
+    Typename,
+    /// `namedtuple(field_names=...)` keyword argument.
+    #[strum(serialize = "field_names")]
+    FieldNames,
+    /// `NamedTuple._fields` — tuple of field names.
+    #[strum(serialize = "_fields")]
+    UnderFields,
+    /// `NamedTuple._field_defaults` — dict of defaulted field names to values.
+    #[strum(serialize = "_field_defaults")]
+    UnderFieldDefaults,
+    /// `NamedTuple._make(iterable)` classmethod.
+    #[strum(serialize = "_make")]
+    UnderMake,
+    /// `NamedTuple._replace(**kwargs)` method.
+    #[strum(serialize = "_replace")]
+    UnderReplace,
+    /// `NamedTuple._asdict()` method.
+    #[strum(serialize = "_asdict")]
+    UnderAsdict,
+    /// `namedtuple(..., defaults=...)` keyword argument.
+    Defaults,
+    /// `namedtuple(..., module=...)` keyword argument.
+    #[strum(serialize = "module")]
+    ModuleKwarg,
+    /// `defaultdict.default_factory` attribute.
+    #[strum(serialize = "default_factory")]
+    DefaultFactory,
+    /// `defaultdict.__missing__` method.
+    #[strum(serialize = "__missing__")]
+    DunderMissing,
+    /// `__module__` — the defining module name, exposed on namedtuple classes.
+    #[strum(serialize = "__module__")]
+    DunderModule,
+    /// `__getnewargs__` — the copy/pickle hook on named tuples.
+    #[strum(serialize = "__getnewargs__")]
+    DunderGetnewargs,
+    /// `__qualname__` — the qualified class name, exposed on namedtuple classes.
+    #[strum(serialize = "__qualname__")]
+    DunderQualname,
+
+    // ==========================
+    // More itertools module strings. Appended at the enum end rather than
+    // beside the earlier itertools block: discriminants are serialized
+    // `StringId`s, so inserting there would shift every later id.
+    /// `itertools.pairwise()` function.
+    Pairwise,
+    /// `itertools.compress()` function.
+    Compress,
+    /// `data` keyword argument of `itertools.compress()`.
+    Data,
+    /// `selectors` keyword argument of `itertools.compress()`.
+    Selectors,
+    /// `itertools.islice()` function.
+    Islice,
+    /// `itertools.chain()` function.
+    Chain,
+    /// `itertools.cycle()` function.
+    Cycle,
+    /// Python's `NotImplemented` singleton representation.
+    #[strum(serialize = "NotImplemented")]
+    NotImplementedRepr,
+}
+
+/// Computes an FNV-1a hash over static-string identities and serialization.
+#[cfg(test)]
+pub(crate) fn static_strings_fingerprint() -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+
+    fn update(hash: &mut u64, bytes: &[u8]) {
+        for byte in u32::try_from(bytes.len())
+            .expect("fingerprint field length fits u32")
+            .to_le_bytes()
+        {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(PRIME);
+        }
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(PRIME);
+        }
+    }
+
+    let mut hash = OFFSET_BASIS;
+    for value in StaticStrings::iter() {
+        update(&mut hash, &(value as u16).to_le_bytes());
+        update(&mut hash, format!("{value:?}").as_bytes());
+        let string: &'static str = value.into();
+        update(&mut hash, string.as_bytes());
+        update(
+            &mut hash,
+            &postcard::to_allocvec(&value).expect("StaticStrings serialization cannot fail"),
+        );
+    }
+    hash
+}
+
+impl StaticStrings {
+    /// Attempts to convert a `StringId` back to a `StaticStrings` variant.
+    ///
+    /// Returns `None` if the `StringId` doesn't correspond to a static string
+    /// (e.g., it's an ASCII char or a dynamically interned string).
+    pub fn from_string_id(id: StringId) -> Option<Self> {
+        u16::try_from(id.0).ok().and_then(Self::from_repr)
+    }
+}
+
+/// Converts this static string variant to its corresponding `StringId`.
+impl From<StaticStrings> for StringId {
+    fn from(value: StaticStrings) -> Self {
+        Self(value as u32)
+    }
+}
+
+impl From<StaticStrings> for Value {
+    fn from(value: StaticStrings) -> Self {
+        Self::InternString(value.into())
+    }
+}
+
+impl PartialEq<StaticStrings> for StringId {
+    fn eq(&self, other: &StaticStrings) -> bool {
+        *self == Self::from(*other)
+    }
+}
+
+impl PartialEq<StringId> for StaticStrings {
+    fn eq(&self, other: &StringId) -> bool {
+        StringId::from(*self) == *other
+    }
+}
+
+/// Index into the bytes interner's storage.
+///
+/// Separate from `StringId` to distinguish string vs bytes literals at the type level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct BytesId(u32);
+
+impl BytesId {
+    /// Returns the raw index value.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Index into the long integer interner's storage.
+///
+/// Used for integer literals that exceed i64 range. The actual `BigInt` values
+/// are stored in the `Interns` table and looked up by index at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct LongIntId(u32);
+
+impl LongIntId {
+    /// Returns the raw index value.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Unique identifier for functions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct FunctionId(u32);
+
+impl FunctionId {
+    /// Creates a FunctionId from a raw index value.
+    ///
+    /// Used by the bytecode VM to reconstruct FunctionIds from operands stored
+    /// in bytecode. The caller is responsible for ensuring the index is valid.
+    #[inline]
+    pub fn from_index(index: u16) -> Self {
+        Self(u32::from(index))
+    }
+
+    /// Returns the raw index value.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A string, bytes, and long integer interner that stores unique values and returns indices for lookup.
+///
+/// Interns are deduplicated on insertion - interning the same string twice returns
+/// the same `StringId`. Bytes and long integers are NOT deduplicated (rare enough that it's not worth it).
+/// The interner owns all strings/bytes/long integers and provides lookup by index.
+///
+/// # Thread Safety
+///
+/// The interner is not thread-safe. It's designed to be used single-threaded during
+/// parsing/preparation, then the values are accessed read-only during execution.
+#[derive(Debug, Default, Clone)]
+pub struct InternerBuilder {
+    /// Maps strings to their indices for deduplication during interning.
+    string_map: AHashMap<String, StringId>,
+    /// Storage for interned strings, indexed by `StringId`. Each entry pairs
+    /// the string with its precomputed [`HashValue`] (see [`WithHash`]) so
+    /// `str_hash(id)` is a plain index lookup at runtime.
+    strings: Vec<WithHash<String>>,
+    /// Storage for interned bytes literals, indexed by `BytesId`. Each
+    /// entry carries its precomputed [`HashValue`].
+    /// Not deduplicated since bytes literals are rare.
+    bytes: Vec<WithHash<Vec<u8>>>,
+    /// Storage for interned long integer literals, indexed by `LongIntId`.
+    /// Each entry carries its precomputed [`HashValue`].
+    /// Not deduplicated since long integer literals are rare.
+    long_ints: Vec<WithHash<BigInt>>,
+}
+
+impl InternerBuilder {
+    /// Creates a new string interner with pre-interned strings.
+    ///
+    /// Clones from a lazily-initialized base interner that contains all pre-interned
+    /// strings (`<module>`, attribute names, ASCII chars). This avoids rebuilding
+    /// the base set on every call.
+    ///
+    /// # Arguments
+    /// * `code` - The code being parsed, used for a very rough guess at how many
+    ///   additional strings will be interned beyond the base set.
+    ///
+    /// Pre-interns (via `BASE_INTERNER`):
+    /// - Index 0: `"<module>"` for module-level code
+    /// - Indices 1-MAX_ATTR_ID: Known attribute names (append, insert, get, join, etc.)
+    /// - Indices MAX_ATTR_ID+1..: ASCII single-character strings
+    pub fn new(code: &str) -> Self {
+        // Reserve capacity for code-specific strings
+        // Rough guess: count quotes and divide by 2 (open+close per string)
+        let capacity = code.bytes().filter(|&b| b == b'"' || b == b'\'').count() >> 1;
+        Self {
+            string_map: AHashMap::with_capacity(capacity),
+            strings: Vec::with_capacity(capacity),
+            bytes: Vec::new(),
+            long_ints: Vec::new(),
+        }
+    }
+
+    /// Creates a builder pre-seeded from an existing [`Interns`] table.
+    ///
+    /// This is used by REPL incremental compilation: previously compiled interned
+    /// values keep stable IDs, and newly interned values are appended.
+    pub(crate) fn from_interns(interns: &Interns, code: &str) -> Self {
+        let mut builder = Self::new(code);
+        builder.strings.clone_from(&interns.strings);
+        builder.bytes.clone_from(&interns.bytes);
+        builder.long_ints.clone_from(&interns.long_ints);
+
+        builder.string_map = builder
+            .strings
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let id = StringId(
+                    u32::try_from(INTERN_STRING_ID_OFFSET + index).expect("StringId overflow while seeding interner"),
+                );
+                (entry.value().clone(), id)
+            })
+            .collect();
+        builder
+    }
+
+    /// Interns a string, returning its `StringId`.
+    ///
+    /// * If the string is ascii, return the pre-interned string id
+    /// * If the string is a known static string, return the pre-interned string id
+    /// * If the string was already interned, returns the existing string id
+    /// * Otherwise, stores the string and returns a new string id
+    pub fn intern(&mut self, s: &str) -> StringId {
+        if s.len() == 1 {
+            StringId::from_ascii(s.as_bytes()[0])
+        } else if let Ok(ss) = StaticStrings::from_str(s) {
+            ss.into()
+        } else {
+            *self.string_map.entry(s.to_owned()).or_insert_with(|| {
+                let string_id = self.strings.len() + INTERN_STRING_ID_OFFSET;
+                let id = StringId(string_id.try_into().expect("StringId overflow"));
+                self.strings.push(WithHash::for_str(s.to_owned()));
+                id
+            })
+        }
+    }
+
+    /// Interns bytes, returning its `BytesId`.
+    ///
+    /// Unlike interns, bytes are not deduplicated (bytes literals are rare).
+    pub fn intern_bytes(&mut self, b: &[u8]) -> BytesId {
+        let id = BytesId(self.bytes.len().try_into().expect("BytesId overflow"));
+        self.bytes.push(WithHash::for_bytes(b.to_vec()));
+        id
+    }
+
+    /// Interns a long integer, returning its `LongIntId`.
+    ///
+    /// Big integers are not deduplicated since literals exceeding i64 are rare.
+    pub fn intern_long_int(&mut self, bi: BigInt) -> LongIntId {
+        let id = LongIntId(self.long_ints.len().try_into().expect("LongIntId overflow"));
+        self.long_ints.push(WithHash::for_long_int(bi));
+        id
+    }
+
+    /// Looks up a string by its `StringId`.
+    #[inline]
+    pub fn get_str(&self, id: StringId) -> &str {
+        get_str(&self.strings, id)
+    }
+}
+
+/// Looks up a string by its `StringId`.
+///
+/// # Panics
+///
+/// Panics if the `StringId` is invalid - not from this interner or ascii chars or StaticStrings.
+fn get_str(strings: &[WithHash<String>], id: StringId) -> &str {
+    if let Some(ascii_str) = ASCII_STRS.get(id.index()) {
+        ascii_str
+    } else if let Some(intern_index) = id.index().checked_sub(INTERN_STRING_ID_OFFSET) {
+        strings[intern_index].value()
+    } else {
+        let static_str = StaticStrings::from_string_id(id).expect("Invalid static string ID");
+        static_str.into()
+    }
+}
+
+/// Read-only storage for interned strings, bytes, and long integers.
+///
+/// This provides lookup by `StringId`, `BytesId`, `LongIntId` and `FunctionId` for interned literals and functions.
+///
+/// # Hash tables
+///
+/// Each entry in `strings`/`bytes`/`long_ints` is a [`WithHash`] pairing
+/// the value with its precomputed [`HashValue`] — populated eagerly at
+/// intern time by [`InternerBuilder`]. `str_hash` / `bytes_hash` /
+/// `long_int_hash` are plain index lookups.
+///
+/// # Reverse string lookup
+///
+/// [`get_string_id_by_name`](Self::get_string_id_by_name) returns the
+/// `StringId` for a host-supplied `&str`. It is backed by an in-memory
+/// `String → StringId` map that is rebuilt deterministically at construction
+/// time (and after deserialization, via [`InternsWire`]). REPL hot paths
+/// such as [`MontyRepl::call_function`](crate::MontyRepl::call_function)
+/// and [`MontyRepl::has_function`](crate::MontyRepl::has_function) call this
+/// per host-supplied name, so the lookup must be O(1) — not the previous
+/// linear scan over `strings`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(from = "InternsWire")]
+pub(crate) struct Interns {
+    strings: Vec<WithHash<String>>,
+    bytes: Vec<WithHash<Vec<u8>>>,
+    long_ints: Vec<WithHash<BigInt>>,
+    functions: Vec<Function>,
+    /// `String → StringId` reverse lookup for [`Self::get_string_id_by_name`].
+    ///
+    /// Built from `strings` at construction and after deserialization, so
+    /// the structure is purely additive on the wire (`InternsWire` carries
+    /// no reverse map). Single-ASCII and `StaticStrings` ids are NOT stored
+    /// here — those are resolved by the cheap branches at the top of
+    /// `get_string_id_by_name`.
+    #[serde(skip)]
+    string_id_by_name: AHashMap<String, StringId>,
+}
+
+/// Serialized form of [`Interns`]
+#[derive(serde::Deserialize)]
+struct InternsWire {
+    strings: Vec<WithHash<String>>,
+    bytes: Vec<WithHash<Vec<u8>>>,
+    long_ints: Vec<WithHash<BigInt>>,
+    functions: Vec<Function>,
+}
+
+impl From<Interns> for InternsWire {
+    fn from(interns: Interns) -> Self {
+        Self {
+            strings: interns.strings,
+            bytes: interns.bytes,
+            long_ints: interns.long_ints,
+            functions: interns.functions,
+        }
+    }
+}
+
+impl From<InternsWire> for Interns {
+    fn from(wire: InternsWire) -> Self {
+        let string_id_by_name = build_string_id_by_name(&wire.strings);
+        Self {
+            strings: wire.strings,
+            bytes: wire.bytes,
+            long_ints: wire.long_ints,
+            functions: wire.functions,
+            string_id_by_name,
+        }
+    }
+}
+
+/// Builds the `String → StringId` reverse map from the `strings` vector.
+///
+/// Used both at fresh [`Interns::new`] time and after deserialization. The
+/// ids start at [`INTERN_STRING_ID_OFFSET`] because slots `< OFFSET` are
+/// reserved for ASCII single-character strings and the [`StaticStrings`]
+/// table — those are handled by the cheap branches at the top of
+/// [`Interns::get_string_id_by_name`] and never enter this map.
+fn build_string_id_by_name(strings: &[WithHash<String>]) -> AHashMap<String, StringId> {
+    strings
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let id = StringId(
+                u32::try_from(INTERN_STRING_ID_OFFSET + index)
+                    .expect("StringId overflow while building reverse interns map"),
+            );
+            (entry.value().clone(), id)
+        })
+        .collect()
+}
+
+impl Interns {
+    pub fn new(interner: InternerBuilder, functions: Vec<Function>) -> Self {
+        // `InternerBuilder` already maintains the `String → StringId` map
+        // during the parse/prepare phase to deduplicate `intern` calls;
+        // we move it across so `Interns::get_string_id_by_name` doesn't
+        // have to rebuild the same table from `strings`.
+        Self {
+            strings: interner.strings,
+            bytes: interner.bytes,
+            long_ints: interner.long_ints,
+            functions,
+            string_id_by_name: interner.string_map,
+        }
+    }
+
+    /// Looks up a string by its `StringId`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `StringId` is invalid.
+    #[inline]
+    pub fn get_str(&self, id: StringId) -> &str {
+        get_str(&self.strings, id)
+    }
+
+    /// Looks up bytes by their `BytesId`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `BytesId` is invalid.
+    #[inline]
+    pub fn get_bytes(&self, id: BytesId) -> &[u8] {
+        self.bytes[id.index()].value()
+    }
+
+    /// Looks up a long integer by its `LongIntId`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `LongIntId` is invalid.
+    #[inline]
+    pub fn get_long_int(&self, id: LongIntId) -> &BigInt {
+        self.long_ints[id.index()].value()
+    }
+
+    /// Lookup a function by its `FunctionId`
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `FunctionId` is invalid.
+    #[inline]
+    pub fn get_function(&self, id: FunctionId) -> &Function {
+        self.functions.get(id.index()).expect("Function not found")
+    }
+
+    /// Returns the Python hash for an interned string.
+    ///
+    /// Dispatches by id range:
+    /// * ASCII (`id < 128`): looks up [`ASCII_HASHES`] (per-slot lazy);
+    ///   computes via [`hash_python_str`] on first use of that byte.
+    /// * Static (`id < INTERN_STRING_ID_OFFSET`): looks up [`STATIC_HASHES`]
+    ///   (per-slot lazy); computes from the variant's `&'static str` on
+    ///   first use of that variant.
+    /// * Interned (`id >= INTERN_STRING_ID_OFFSET`): reads the [`HashValue`]
+    ///   from the corresponding [`WithHash`] entry — populated eagerly at
+    ///   intern time.
+    ///
+    /// All three paths must agree with [`hash_python_str`] applied to the
+    /// underlying `&str` — interned and heap strings with equal contents
+    /// must hash identically.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `StringId` is invalid (same as [`Self::get_str`]).
+    #[inline]
+    pub fn str_hash(&self, id: StringId) -> HashValue {
+        if id.index() < ASCII_STRS.len() {
+            ASCII_HASHES.get_or_compute(id.index(), || hash_python_str(ASCII_STRS[id.index()]))
+        } else if let Some(intern_index) = id.index().checked_sub(INTERN_STRING_ID_OFFSET) {
+            self.strings[intern_index].hash()
+        } else {
+            let static_str = StaticStrings::from_string_id(id).expect("Invalid static string ID");
+            STATIC_HASHES.get_or_compute((static_str as usize) - STATIC_STRING_ID_OFFSET as usize, || {
+                hash_python_str(static_str.into())
+            })
+        }
+    }
+
+    /// Returns the Python hash for interned bytes.
+    ///
+    /// Reads the [`HashValue`] from the corresponding [`WithHash`] entry
+    /// (populated at intern time). Must agree with [`hash_python_bytes`]
+    /// applied to the underlying `&[u8]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `BytesId` is invalid.
+    #[inline]
+    pub fn bytes_hash(&self, id: BytesId) -> HashValue {
+        self.bytes[id.index()].hash()
+    }
+
+    /// Returns the Python hash for an interned long integer.
+    ///
+    /// Reads the [`HashValue`] from the corresponding [`WithHash`] entry
+    /// (populated at intern time). Must agree with [`hash_python_long_int`].
+    /// Note that interned long ints are only created for values that don't
+    /// fit in `i64` (see `parse.rs`), so the `to_i64()` fast path inside
+    /// `hash_python_long_int` is a defensive consistency guarantee rather
+    /// than a hot path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `LongIntId` is invalid.
+    #[inline]
+    pub fn long_int_hash(&self, id: LongIntId) -> HashValue {
+        self.long_ints[id.index()].hash()
+    }
+
+    /// Looks up the `StringId` for a string, checking ASCII, static strings, and interned strings.
+    ///
+    /// This is the reverse of [`Self::get_str`]: given a string, find its
+    /// `StringId`. The interned-string branch is O(1) via the
+    /// `string_id_by_name` reverse map (built once at construction /
+    /// deserialization), so the entire lookup stays O(1) regardless of how
+    /// many strings have been interned.
+    ///
+    /// Used when the host provides a name (e.g., from a `NameLookup` response,
+    /// [`MontyRepl::call_function`](crate::MontyRepl::call_function),
+    /// [`MontyRepl::has_function`](crate::MontyRepl::has_function), or input
+    /// injection) that was previously interned during preparation.
+    ///
+    /// Returns `None` if the string was never interned.
+    pub fn get_string_id_by_name(&self, s: &str) -> Option<StringId> {
+        // Single ASCII char and `StaticStrings` ids live in reserved slot
+        // ranges below `INTERN_STRING_ID_OFFSET`, never in the interned
+        // pool — keep the cheap branches at the top.
+        if s.len() == 1 {
+            return Some(StringId::from_ascii(s.as_bytes()[0]));
+        }
+        if let Ok(ss) = StaticStrings::from_str(s) {
+            return Some(ss.into());
+        }
+        self.string_id_by_name.get(s).copied()
+    }
+
+    /// Sets the compiled functions.
+    ///
+    /// This is called after compilation to populate the functions that were
+    /// compiled from `PreparedFunctionDef` nodes.
+    pub fn set_functions(&mut self, functions: Vec<Function>) {
+        self.functions = functions;
+    }
+
+    /// Returns a clone of the compiled function table.
+    ///
+    /// Used by REPL incremental compilation to preserve existing function IDs.
+    pub(crate) fn functions_clone(&self) -> Vec<Function> {
+        self.functions.clone()
+    }
+}

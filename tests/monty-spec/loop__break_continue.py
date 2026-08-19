@@ -1,0 +1,179 @@
+# === Basic break ===
+result = []
+for x in [1, 2, 3, 4, 5]:
+    if x == 3:
+        break
+    result.append(x)
+assert result == [1, 2]
+
+# === Break skips else ===
+flag = 0
+for x in [1, 2, 3]:
+    if x == 2:
+        break
+else:
+    flag = 1
+assert flag == 0
+
+# === No break runs else ===
+flag = 0
+for x in [1, 2, 3]:
+    pass
+else:
+    flag = 1
+assert flag == 1
+
+# === Basic continue ===
+result = []
+for x in [1, 2, 3, 4, 5]:
+    if x % 2 == 0:
+        continue
+    result.append(x)
+assert result == [1, 3, 5]
+
+# === Continue with else ===
+flag = 0
+for x in [1, 2, 3]:
+    if x == 2:
+        continue
+else:
+    flag = 1
+assert flag == 1
+
+# === Nested loops - break inner ===
+result = []
+for i in [1, 2, 3]:
+    for j in ['a', 'b', 'c']:
+        if j == 'b':
+            break
+        result.append((i, j))
+assert result == [(1, 'a'), (2, 'a'), (3, 'a')]
+
+# === Nested loops - continue inner ===
+result = []
+for i in [1, 2]:
+    for j in ['a', 'b', 'c']:
+        if j == 'b':
+            continue
+        result.append((i, j))
+assert result == [(1, 'a'), (1, 'c'), (2, 'a'), (2, 'c')]
+
+# === Break in nested with else on inner ===
+result = []
+for i in [1, 2]:
+    for j in [10, 20, 30]:
+        if j == 20:
+            break
+        result.append(j)
+    else:
+        result.append('inner-else')
+assert result == [10, 10]
+
+# === No break in inner runs inner else ===
+result = []
+for i in [1, 2]:
+    for j in [10, 20]:
+        result.append(j)
+    else:
+        result.append('inner-else')
+assert result == [10, 20, 'inner-else', 10, 20, 'inner-else']
+
+# === Continue does not affect else ===
+result = []
+for x in [1, 2, 3]:
+    if x == 2:
+        continue
+    result.append(x)
+else:
+    result.append('else')
+assert result == [1, 3, 'else']
+
+# === Empty loop with else ===
+flag = 0
+for x in []:
+    flag = 1
+else:
+    flag = 2
+assert flag == 2
+
+# === Break on first iteration ===
+result = []
+for x in [1, 2, 3]:
+    result.append('before')
+    break
+    result.append('after')  # unreachable
+assert result == ['before']
+
+
+# === Double break (unreachable second break) ===
+def double_break(value):
+    for i in range(0, 1):
+        break
+        break
+    return value
+
+
+assert double_break('hello') == 'hello'
+assert double_break(42) == 42
+
+
+# === Two breaks in different branches (both reachable) ===
+def two_breaks(items):
+    result = []
+    for x in items:
+        if x < 0:
+            result.append('negative')
+            break
+        if x > 100:
+            result.append('too big')
+            break
+        result.append(x)
+    return result
+
+
+assert two_breaks([1, 2, 3]) == [1, 2, 3]
+assert two_breaks([1, -1, 3]) == [1, 'negative']
+assert two_breaks([1, 200, 3]) == [1, 'too big']
+assert two_breaks([-5]) == ['negative']
+assert two_breaks([999]) == ['too big']
+
+
+# === Double continue (unreachable second continue) ===
+def double_continue(items):
+    out = []
+    for x in items:
+        out.append(x)
+        continue
+        continue
+    return out
+
+
+assert double_continue([1, 2, 3]) == [1, 2, 3]
+assert double_continue([]) == []
+
+# === Continue on every iteration ===
+result = []
+for x in [1, 2, 3]:
+    result.append(x)
+    continue
+    result.append('after')  # unreachable
+assert result == [1, 2, 3]
+
+# === StopIteration raised in a for body propagates, it does not end the loop ===
+log = []
+try:
+    for x in [1, 2, 3]:
+        log.append(x)
+        raise StopIteration
+except StopIteration:
+    log.append('propagated')
+assert log == [1, 'propagated']
+
+# === StopIteration raised in a while body propagates too ===
+log = []
+try:
+    while True:
+        raise StopIteration
+except StopIteration:
+    log.append('propagated')
+assert log == ['propagated']

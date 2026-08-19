@@ -1,17 +1,24 @@
-# Computerwelt — C# port of Bashkit
+# Computerwelt — a sandboxed shell and Python runtime for .NET
 
 ## What this repository is
 
-A ground-up **C# / .NET 10 port of [Bashkit](https://github.com/everruns/bashkit)** — an
-in-process, sandboxed bash interpreter with a virtual filesystem, designed to be embedded
-in host applications (notably as an LLM tool).
+A ground-up **C# / .NET 10 port of two Rust projects**, delivered as one library:
 
-The upstream Rust source is vendored read-only under **`.reference/bashkit/`** (CI/CD
-workflows and generated eval result blobs stripped). It is the *specification*: when
-behaviour is ambiguous, the Rust source is the answer.
+| Upstream | Vendored at | What it gives us |
+|---|---|---|
+| [Bashkit](https://github.com/everruns/bashkit) | `.reference/bashkit/` | in-process sandboxed **bash** with a virtual filesystem |
+| [Monty](https://github.com/pydantic/monty) (Pydantic) | `.reference/monty/` | a minimal, secure **Python** interpreter for running LLM-written code |
 
-Upstream is MIT licensed; so is this repository. `.reference/bashkit/NOTICE` and
-`.reference/bashkit/LICENSE` are preserved for attribution.
+They fit together the way they do upstream: Bashkit already exposes Monty as its
+`python` builtin, so porting both means `python script.py` works inside the same sandbox,
+against the same virtual filesystem, under the same resource limits — with no CPython, no
+container and no process.
+
+Both vendored trees are read-only and have CI/CD workflows and generated blobs stripped.
+They are the *specification*: when behaviour is ambiguous, the Rust source is the answer.
+
+Both upstreams are MIT licensed, as is this repository. `LICENSE` / `NOTICE` files are
+preserved under each vendored tree for attribution.
 
 ## Non-negotiable properties (these define "correct")
 
@@ -33,7 +40,9 @@ Bashkit's value is its security posture. The port must preserve all of it:
 
 ## Architecture
 
-Mirrors upstream module-for-module so the two trees can be diffed by eye.
+Mirrors upstream module-for-module so the trees can be diffed by eye.
+
+### Shell — `src/Bashkit/`
 
 | Upstream (`crates/bashkit/src/`) | Port (`src/Bashkit/`)     | Purpose |
 |----------------------------------|---------------------------|---------|
@@ -47,6 +56,23 @@ Mirrors upstream module-for-module so the two trees can be diffed by eye.
 | `network/`                       | `Network/`                | Allowlist, HTTP transport abstraction |
 | `tool.rs`, `tool_def.rs`         | `Tooling/`                | `BashTool` LLM tool contract |
 | `lib.rs`                         | `Bash.cs`, `BashBuilder.cs` | Public facade |
+
+### Python — `src/Monty/` (not started)
+
+Monty is a compiler plus a bytecode VM, not a tree walker, and the port keeps that shape:
+the speed and the snapshot-at-a-call-boundary feature both depend on it.
+
+| Upstream (`crates/monty/src/`) | Port (`src/Monty/`) | Purpose |
+|---|---|---|
+| `parse.rs`, `fstring.rs`, `expressions.rs` | `Parsing/` | Python source → AST |
+| `bytecode/` | `Compilation/` | AST → bytecode, scope and name resolution |
+| `run.rs`, `function.rs`, `heap/` | `Runtime/` | the VM, frames, the object heap and its GC |
+| `types/` | `Types/` | `int`, `str`, `list`, `dict`, `set`, `tuple`, `bytes`, … |
+| `builtins/` | `Builtins/` | `len`, `range`, `print`, `sorted`, … |
+| `modules/` | `Modules/` | the permitted stdlib subset |
+| `crates/monty-types/` | `Interop/` | host-facing object model and external functions |
+| `crates/monty-fs/` | — | reuses this repo's `IFileSystem`; the two sandboxes share one VFS |
+| `crates/monty-type-checking/` | — | out of scope: wraps `ty`, an external type checker |
 
 ### Rust → C# idiom map
 
@@ -77,23 +103,31 @@ Mirrors upstream module-for-module so the two trees can be diffed by eye.
 ## Layout
 
 ```
-Computerwelt.sln
+Computerwelt.slnx
 Directory.Build.props        shared TFM / analyzers / warnings-as-errors
 Directory.Packages.props     central package versions
 src/
-  Bashkit/                   the library
-  Bashkit.Cli/               a REPL / script runner over the library
+  Bashkit/                   the shell library
+  Bashkit.Cli/               a REPL / script runner over it
+  Monty/                     the Python library (not started)
 tests/
-  Bashkit.Tests/             unit tests (xUnit v3)
-  Bashkit.SpecTests/         conformance runner over `tests/spec/**/*.test.sh`
-  spec/                      spec cases (copied from upstream; the acceptance suite)
-.reference/bashkit/          vendored upstream Rust source (read-only)
+  Bashkit.Tests/             shell unit tests
+  Bashkit.SpecTests/         shell conformance runner over `tests/spec/**/*.test.sh`
+  Monty.SpecTests/           python conformance runner over `tests/monty-spec/*.py`
+  spec/                      shell acceptance corpus (from bashkit)
+  monty-spec/                python acceptance corpus (from monty)
+.reference/bashkit/          vendored bashkit source (read-only)
+.reference/monty/            vendored monty source (read-only)
 ```
 
-## The spec suite is the acceptance criterion
+## The spec suites are the acceptance criteria
 
-Upstream ships **2,650 golden test cases** in a language-agnostic format, copied to
-`tests/spec/`:
+Both upstreams ship golden corpora that transfer to the port unchanged, and each is the
+definition of "correct" for its half.
+
+### Shell — `tests/spec/`
+
+Bashkit ships **2,521 runnable cases** in a language-agnostic format:
 
 ```
 ### test_name
@@ -112,16 +146,38 @@ is **ratchet-based**: `tests/spec/baseline.json` records the pass count per file
 fails if any file regresses below its baseline. Raise the baseline when you make things
 pass — never lower it to make a build green.
 
+### Python — `tests/monty-spec/`
+
+Monty ships **568 `.py` fixtures**, copied verbatim. They need no harness format at all:
+each is ordinary Python whose body is `assert` statements, so a case passes when the file
+runs to completion without raising.
+
+```python
+# === Simple interpolation ===
+x = 'world'
+assert f'hello {x}' == 'hello world'
+```
+
+Some fixtures instead pin an expected traceback in a trailing docstring
+(`TRACEBACK:` …) or an expected exception on a comment (`# Raise=TypeError(...)`), which
+makes them error-message conformance tests. `# xfail=monty` marks a case upstream itself
+does not pass.
+
+`Monty.SpecTests` will run these under the same ratchet discipline.
+
 ```bash
 dotnet test                                   # everything
-dotnet test tests/Bashkit.SpecTests           # conformance only
-dotnet run --project tests/Bashkit.SpecTests -- report   # pass-rate breakdown
+dotnet test tests/Bashkit.SpecTests           # shell conformance only
+dotnet test tests/Monty.SpecTests             # python conformance only
 ```
 
 ## Working rules
 
 - **Read the Rust before writing the C#.** Upstream files carry the edge cases in
   comments and inline `#[cfg(test)]` blocks; those tests are free specification.
+  `.reference/monty/limitations/` additionally documents, per feature, exactly which
+  Python semantics Monty does and does not implement — port the documented subset, not
+  CPython.
 - **Port behaviour, not structure-for-its-own-sake.** Idiomatic C# is preferred where it
   does not change observable behaviour. Where it would, match Rust exactly.
 - **Every builtin lands with spec coverage.** If upstream has no spec case for a

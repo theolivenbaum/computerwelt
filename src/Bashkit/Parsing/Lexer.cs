@@ -258,6 +258,17 @@ public sealed class Lexer
                     continue;
                 }
 
+                // An extglob group — `@(a|b)`, `!(x)`, `*(y)` — is part of the word it is
+                // attached to. The lexer cannot know whether `extglob` is set, so it always
+                // keeps the group together; the pattern matcher decides what it means.
+                if (c == '(' && builder.Length > 0 && builder[^1] is '?' or '*' or '+' or '@' or '!')
+                {
+                    builder.Append('(');
+                    _position++;
+                    ConsumeBalanced(builder, '(', ')');
+                    continue;
+                }
+
                 break;
             }
 
@@ -293,7 +304,7 @@ public sealed class Lexer
                     continue;
 
                 case '$':
-                    ConsumeDollar(builder);
+                    ConsumeDollar(builder, insideDoubleQuotes: false);
                     continue;
 
                 default:
@@ -425,7 +436,7 @@ public sealed class Lexer
 
             if (c == '$')
             {
-                ConsumeDollar(builder);
+                ConsumeDollar(builder, insideDoubleQuotes: true);
                 continue;
             }
 
@@ -474,12 +485,27 @@ public sealed class Lexer
         _position++;
     }
 
-    private void ConsumeDollar(StringBuilder builder)
+    private void ConsumeDollar(StringBuilder builder, bool insideDoubleQuotes)
     {
         builder.Append('$');
         _position++;
 
         if (AtEnd)
+        {
+            return;
+        }
+
+        // `$$` is the pid parameter. Consuming it here stops the second `$` from being
+        // read as the start of another expansion — which, inside double quotes, would
+        // swallow the closing quote as if it opened a `$"..."` translation.
+        if (Current == '$')
+        {
+            builder.Append('$');
+            _position++;
+            return;
+        }
+
+        if (Current == '"' && insideDoubleQuotes)
         {
             return;
         }

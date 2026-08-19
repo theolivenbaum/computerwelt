@@ -1,4 +1,13 @@
-# Bashkit → C# port: task ledger
+# Computerwelt port: task ledger
+
+Two Rust upstreams are being ported into one .NET library:
+
+| Part | Upstream | Reference | Acceptance corpus |
+|---|---|---|---|
+| shell | [bashkit](https://github.com/everruns/bashkit) | `.reference/bashkit/` | `tests/spec/` (2,521 cases) |
+| python | [monty](https://github.com/pydantic/monty) | `.reference/monty/` | `tests/monty-spec/` (568 fixtures) |
+
+Phases 0–10 below cover the shell. Phases 11–17 cover the Python interpreter.
 
 Status legend: `[ ]` not started · `[~]` in progress / partial · `[x]` done
 
@@ -6,12 +15,14 @@ Upstream reference: `.reference/bashkit/crates/bashkit/src/`
 Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-scope
 `python` and `typescript` suites). Ratchet file: `tests/spec/baseline.json`.
 
-**Current state:** solution builds clean, 151 unit tests green,
-**1,578 / 2,521 conformance cases passing (62.6 %)**.
+**Current state — shell:** solution builds clean, 151 unit tests green,
+**1,694 / 2,521 conformance cases passing (67.2 %)**.
+
+**Current state — python:** not started. Corpus vendored, no code yet.
 
 | suite | passing |
 |---|---|
-| `bash` | 1,440 / 2,094 |
+| `bash` | 1,556 / 2,094 |
 | `grep` | 70 / 95 |
 | `sed` | 66 / 80 |
 | `jq` | 2 / 124 |
@@ -116,14 +127,14 @@ Upstream: `interpreter/` (~730 KB — the largest single area)
 - [x] Brace expansion — lists, numeric/alpha ranges with increment, nesting
 - [ ] Command substitution trailing-newline stripping + nested quoting edge cases
 - [x] `[[ ]]` conditional expressions incl. `=~` regex + `BASH_REMATCH`
-- [~] Arrays: indexed + associative + splat + append done; slicing and `${!arr[@]}` not
-- [~] `trap` records handlers; firing them on `EXIT`/`ERR`/`DEBUG`/`RETURN` is not done
+- [x] Arrays: indexed, associative, splat, append, slicing, `${!arr[@]}`, `${!prefix*}`
+- [~] `trap`: `EXIT` and `ERR` fire; `DEBUG` and `RETURN` do not
 - [ ] Job control simulation (`&`, `jobs`, `wait`, `%1`)
 - [~] `set -e` fires and is suppressed after `&&`/`||`/`!`; the full context list is unverified
 - [~] `set -x` emits `+ cmd` to stderr; `PS4` and structured `TraceEvent` not yet
 - [ ] Process substitution execution
 - [ ] `time` keyword, `coproc`
-- [ ] `IFS`-driven word splitting edge cases (upstream has 10 known-failing cases here)
+- [x] `IFS` field splitting with the whitespace / non-whitespace separator distinction
 
 ## Phase 6 — Builtins  (`src/Bashkit/Builtins/`)
 
@@ -163,7 +174,8 @@ place, along with `ShellHooks` for the builtins that call back into the shell
 ### Math / misc
 - [x] `expr` `env` `printenv`
 - [x] `sleep` `xargs` `tee` `id` `whoami` `hostname` `uname`
-- [ ] `bc` `numfmt` `semver` `timeout` `retry` `watch` `parallel` `date`
+- [x] `date` `timeout`
+- [ ] `bc` `numfmt` `semver` `retry` `watch` `parallel`
 - [ ] `clear` `assert` `verify` `dotenv` `glob` `log`
 
 ### Network (allowlist-gated)
@@ -219,7 +231,121 @@ Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 
 | Upstream area | Reason |
 |---|---|
-| `python` / `typescript` / `sqlite` builtins | Wrap third-party Rust engines (Monty, ZapCode, Turso) with no .NET counterpart |
+| bashkit `typescript` / `sqlite` builtins | Wrap third-party Rust engines (ZapCode, Turso) with no .NET counterpart |
 | `bashkit-capi`, `bashkit-wasm`, `bashkit-js`, `bashkit-python` | FFI/binding crates; .NET consumers use the library directly |
 | `bashkit-eval` | LLM benchmark harness, not runtime behaviour |
 | `bashkit-coreutils-port` | Rust-specific codegen tooling |
+| `monty-type-checking` | Wraps [`ty`](https://docs.astral.sh/ty/), an external type checker |
+| `monty-js`, `monty-python`, `monty-wasm-runtime`, `monty-proto` | Binding and transport crates |
+| `monty-typeshed` | Type stubs, only needed by the type checker |
+| CPython compatibility beyond Monty's documented subset | Monty deliberately omits inheritance, metaclasses, `match`, third-party packages and most of the stdlib. `.reference/monty/limitations/` is the contract; the port matches Monty, not CPython |
+
+---
+
+# Python interpreter (Monty port)
+
+Upstream reference: `.reference/monty/crates/monty/src/` (~139k lines of Rust).
+Acceptance suite: `tests/monty-spec/` — 568 `.py` fixtures whose bodies are `assert`
+statements, so a case passes when it runs to completion without raising. Fixtures with a
+trailing `TRACEBACK:` docstring or a `# Raise=` comment additionally pin the error
+message. `# xfail=monty` marks fixtures upstream itself does not pass.
+
+Monty compiles to bytecode and runs a VM. The port keeps that architecture: both the
+startup speed and the snapshot-at-a-call-boundary feature depend on it, and a tree-walking
+shortcut would foreclose them.
+
+## Phase 11 — Groundwork
+
+- [x] Vendor upstream into `.reference/monty/` (CI/CD stripped)
+- [x] Copy the 568-fixture corpus into `tests/monty-spec/`
+- [ ] `src/Monty/Monty.csproj` and `tests/Monty.SpecTests/`
+- [ ] Fixture parser: `assert`-only cases, `# Raise=`, `TRACEBACK:`, `# xfail=` directives
+- [ ] Ratchet runner + `tests/monty-spec/baseline.json`
+
+## Phase 12 — Front end  (`src/Monty/Parsing/`)
+
+Upstream: `parse.rs`, `expressions.rs`, `fstring.rs`, `source_map.rs`
+
+- [ ] Tokenizer: significant indentation, implicit line joining, string prefixes
+      (`r`, `b`, `f`, `rb`), numeric literals
+- [ ] Expression grammar with Python's precedence, comparison chaining, walrus,
+      conditional expressions, lambdas, starred and keyword arguments
+- [ ] Statement grammar: assignment and augmented assignment, `if`/`elif`/`else`,
+      `while`, `for`/`else`, `try`/`except`/`else`/`finally`, `with`, `def`, `class`,
+      `import`, `global`/`nonlocal`, `assert`, `del`, `raise`, `return`, `yield`
+- [ ] Comprehensions (list, set, dict, generator) with their own scope
+- [ ] f-strings: nested expressions, `!r`/`!s`/`!a`, format specs, `=` debug form
+- [ ] Type annotations parsed and retained (Monty accepts modern hints)
+- [ ] Source spans on every node — tracebacks quote the offending line
+- [ ] Parse-error messages matching CPython's, since fixtures compare them
+
+## Phase 13 — Compiler  (`src/Monty/Compilation/`)
+
+Upstream: `bytecode/` (620 KB — the largest single area)
+
+- [ ] Instruction set and the encoded chunk format
+- [ ] Scope resolution: locals, cells, frees, globals, `global`/`nonlocal`
+- [ ] Expression and statement lowering
+- [ ] Control-flow lowering: loops with `break`/`continue`/`else`, exception blocks,
+      `with` and its cleanup paths
+- [ ] Function objects: defaults, `*args`/`**kwargs`, keyword-only, closures
+- [ ] Class bodies as functions producing a namespace
+- [ ] Comprehension lowering into implicit functions
+- [ ] Generators and coroutines as resumable frames
+- [ ] Constant folding and the peepholes upstream applies
+- [ ] Compile-time limits: bytecode size, constant count, nesting depth
+
+## Phase 14 — Runtime  (`src/Monty/Runtime/`)
+
+Upstream: `run.rs`, `function.rs`, `heap/`, `heap_data.rs`, `resource_checks.rs`
+
+- [ ] The interpreter loop and its frame stack
+- [ ] Object heap with reference counting plus cycle collection
+- [ ] Exception raising, propagation, chaining (`__context__`, `__cause__`) and
+      traceback construction with source lines
+- [ ] `try`/`except`/`finally` unwinding, including `finally` over `return`
+- [ ] Generators, `yield from`, and the `asyncio` event loop upstream provides
+- [ ] Iterator protocol, context-manager protocol, descriptor basics
+- [ ] Resource limits: memory, stack depth, instruction count, wall clock — enforced
+      inside the loop, as the shell's budget is
+- [ ] `print` capture into stdout/stderr buffers rather than a real console
+
+## Phase 15 — Types and builtins  (`src/Monty/Types/`, `src/Monty/Builtins/`)
+
+Upstream: `types/` (1.1 MB), `builtins/` (188 KB)
+
+- [ ] `int` (arbitrary precision), `float`, `bool`, `complex`, `NoneType`
+- [ ] `str` with the full method set and `%`/`format` machinery
+- [ ] `bytes`, `bytearray`, `memoryview`
+- [ ] `list`, `tuple`, `dict` (insertion-ordered), `set`, `frozenset`, `range`, `slice`
+- [ ] User-defined classes — plain classes only; inheritance and metaclasses are
+      upstream limitations, not oversights
+- [ ] Exception hierarchy with CPython's message wording
+- [ ] Builtins: `len` `range` `print` `sorted` `enumerate` `zip` `map` `filter` `sum`
+      `min` `max` `abs` `all` `any` `repr` `str` `int` `float` `bool` `list` `dict`
+      `set` `tuple` `isinstance` `type` `getattr` `setattr` `hasattr` `iter` `next`
+      `reversed` `round` `divmod` `pow` `hash` `id` `chr` `ord` `bin` `hex` `oct`
+- [ ] Rich comparison, arithmetic and in-place dunder dispatch
+
+## Phase 16 — Standard library subset  (`src/Monty/Modules/`)
+
+Upstream: `modules/` — the permitted set and nothing more.
+
+- [ ] `math`, `json`, `re`, `datetime`
+- [ ] `collections` (`deque`, `Counter`, `defaultdict`, `namedtuple`, `OrderedDict`)
+- [ ] `itertools`, `dataclasses`, `typing`
+- [ ] `os` and `pathlib` — routed through this repo's `IFileSystem`, so Python and bash
+      see one filesystem
+- [ ] `sys`, `unicodedata`, `asyncio`
+
+## Phase 17 — Host integration
+
+Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.rs`
+
+- [ ] Host object model: converting between .NET values and Monty objects
+- [ ] External functions — the only route to anything outside the sandbox, mirroring how
+      Monty blocks filesystem, environment and network by default
+- [ ] Snapshot and resume at an external-call boundary
+- [ ] `PythonLimits` and a `MontyRunner` facade
+- [ ] Wire the `python` builtin into the shell, sharing the VFS, the budget and the
+      output buffers — the payoff for porting both halves

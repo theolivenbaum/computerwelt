@@ -24,6 +24,7 @@ public sealed class Interpreter
     private readonly IReadOnlyDictionary<string, IBuiltin> _builtins;
     private readonly StringBuilder _stderr = new();
     private readonly HashSet<string> _aliasesInProgress = new(StringComparer.Ordinal);
+    private bool _inTrap;
     private int _loopDepth;
 
     /// <summary>Creates an interpreter over the given state, filesystem and builtin table.</summary>
@@ -71,6 +72,7 @@ public sealed class Interpreter
         {
             cancellationToken.ThrowIfCancellationRequested();
             result = await ExecuteAsync(command, stdin, cancellationToken);
+            result = await ApplyErrTrapAsync(result, cancellationToken);
             stdout.Append(result.Stdout.ToString());
             AppendStderr(result.Stderr);
             State.LastExitCode = result.ExitCode;
@@ -149,6 +151,57 @@ public sealed class Interpreter
         };
     }
 
+    /// <summary>
+    /// Runs a trap handler, if one is set for <paramref name="signal"/>.
+    /// </summary>
+    /// <remarks>
+    /// Reentrancy is blocked: an <c>ERR</c> handler that itself fails would otherwise
+    /// re-trigger itself forever, and bash suppresses the same way.
+    /// </remarks>
+    public async ValueTask<ExecResult> RunTrapAsync(string signal, CancellationToken cancellationToken)
+    {
+        if (_inTrap || !State.Traps.TryGetValue(signal, out var handler) || handler.Length == 0)
+        {
+            return ExecResult.Success;
+        }
+
+        var savedExitCode = State.LastExitCode;
+        _inTrap = true;
+
+        try
+        {
+            var result = await RunFragmentAsync(handler, null, cancellationToken);
+            return result with { ControlFlow = ControlFlow.None };
+        }
+        finally
+        {
+            _inTrap = false;
+            State.LastExitCode = savedExitCode;
+        }
+    }
+
+    /// <summary>
+    /// Fires the <c>ERR</c> trap for a failed command. Uses the same suppression rules as
+    /// <c>set -e</c>: a command whose failure was explicitly tested does not count.
+    /// </summary>
+    private async ValueTask<ExecResult> ApplyErrTrapAsync(ExecResult result, CancellationToken cancellationToken)
+    {
+        if (result.ExitCode == 0 || result.ErrExitSuppressed || State.Traps.Count == 0)
+        {
+            return result;
+        }
+
+        var trap = await RunTrapAsync("ERR", cancellationToken);
+
+        return trap.Stdout.IsEmpty && trap.Stderr.IsEmpty
+            ? result
+            : result with
+            {
+                Stdout = StreamData.Concat(result.Stdout, trap.Stdout),
+                Stderr = StreamData.Concat(result.Stderr, trap.Stderr),
+            };
+    }
+
     private ExecResult DefineFunction(FunctionDef definition)
     {
         State.Functions[definition.Name] = definition;
@@ -173,6 +226,12 @@ public sealed class Interpreter
     private async ValueTask<ExecResult> ExecuteListAsync(CommandList list, StreamData? stdin, CancellationToken cancellationToken)
     {
         var left = await ExecuteAsync(list.Left, stdin, cancellationToken);
+
+        if (list.Operator == ListOperator.Sequence)
+        {
+            left = await ApplyErrTrapAsync(left, cancellationToken);
+        }
+
         State.LastExitCode = left.ExitCode;
 
         if (!left.ControlFlow.IsNone)
@@ -528,58 +587,85 @@ public sealed class Interpreter
     private async ValueTask<ExecResult> ExecuteCaseAsync(CaseCommand command, StreamData? stdin, CancellationToken cancellationToken)
     {
         var subject = await Expander.ExpandToStringAsync(command.Subject, cancellationToken);
+        var stdout = new StringBuilder();
+        var stderr = new StringBuilder();
+        var result = ExecResult.Success;
+        var index = 0;
 
-        for (var i = 0; i < command.Items.Count; i++)
+        while (index < command.Items.Count)
         {
-            var item = command.Items[i];
-            var matched = false;
-
-            foreach (var pattern in item.Patterns)
+            if (!await MatchesAnyAsync(command.Items[index], subject, cancellationToken))
             {
-                var text = await Expander.ExpandToPatternAsync(pattern, cancellationToken);
-                if (PatternMatcher.IsMatch(subject, text, State.Options.NoCaseMatch, State.Options.ExtGlob))
-                {
-                    matched = true;
-                    break;
-                }
-            }
-
-            if (!matched)
-            {
+                index++;
                 continue;
             }
 
-            var result = item.Body is null
-                ? ExecResult.Success
-                : await ExecuteAsync(item.Body, stdin, cancellationToken);
+            // A matched branch runs, and then its terminator decides what happens next:
+            // `;;` stops, `;&` runs the following body unconditionally, and `;;&` resumes
+            // pattern matching at the branch after this one.
+            var current = index;
 
-            switch (item.Terminator)
+            while (true)
             {
-                case CaseTerminator.FallThrough when i + 1 < command.Items.Count:
-                {
-                    var next = command.Items[i + 1];
-                    if (next.Body is not null)
-                    {
-                        var extra = await ExecuteAsync(next.Body, null, cancellationToken);
-                        result = extra with
-                        {
-                            Stdout = StreamData.Concat(result.Stdout, extra.Stdout),
-                            Stderr = StreamData.Concat(result.Stderr, extra.Stderr),
-                        };
-                    }
+                var item = command.Items[current];
 
-                    return result;
+                if (item.Body is not null)
+                {
+                    result = await ExecuteAsync(item.Body, stdin, cancellationToken);
+                    stdin = null;
+                    stdout.Append(result.Stdout.ToString());
+                    stderr.Append(result.Stderr.ToString());
+                    State.LastExitCode = result.ExitCode;
+
+                    // `break`, `continue` and `return` inside a branch abandon the whole
+                    // `case`, including any pending fall-through.
+                    if (!result.ControlFlow.IsNone)
+                    {
+                        return Build(stdout, stderr, result.ExitCode, result.ControlFlow);
+                    }
                 }
 
-                case CaseTerminator.ContinueMatching:
+                if (item.Terminator == CaseTerminator.FallThrough && current + 1 < command.Items.Count)
+                {
+                    current++;
                     continue;
+                }
 
-                default:
-                    return result;
+                break;
+            }
+
+            if (command.Items[current].Terminator == CaseTerminator.ContinueMatching)
+            {
+                index = current + 1;
+                continue;
+            }
+
+            return Build(stdout, stderr, result.ExitCode, ControlFlow.None);
+        }
+
+        return Build(stdout, stderr, stdout.Length > 0 || stderr.Length > 0 ? result.ExitCode : 0, ControlFlow.None);
+
+        static ExecResult Build(StringBuilder stdout, StringBuilder stderr, int exitCode, ControlFlow flow) => new()
+        {
+            Stdout = StreamData.FromText(stdout.ToString()),
+            Stderr = StreamData.FromText(stderr.ToString()),
+            ExitCode = exitCode,
+            ControlFlow = flow,
+        };
+    }
+
+    private async ValueTask<bool> MatchesAnyAsync(CaseItem item, string subject, CancellationToken cancellationToken)
+    {
+        foreach (var pattern in item.Patterns)
+        {
+            var text = await Expander.ExpandToPatternAsync(pattern, cancellationToken);
+            if (PatternMatcher.IsMatch(subject, text, State.Options.NoCaseMatch, State.Options.ExtGlob))
+            {
+                return true;
             }
         }
 
-        return ExecResult.Success;
+        return false;
     }
 
     private async ValueTask<ExecResult> ExecuteSubshellAsync(Subshell subshell, StreamData? stdin, CancellationToken cancellationToken)

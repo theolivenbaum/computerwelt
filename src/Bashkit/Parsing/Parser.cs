@@ -647,6 +647,15 @@ public sealed class Parser
         if (Current.Kind == TokenKind.Word && IsConditionalBinaryOperator(Current.Text))
         {
             var op = Advance().Text;
+
+            // `=~` takes a regular expression, whose `(`, `)` and `|` the lexer split into
+            // separate tokens. The operand is recovered from the raw source instead: it
+            // runs to the next whitespace, which is exactly where bash ends it too.
+            if (op == "=~")
+            {
+                return new ConditionalExpression.Binary(op, left, ReadRegexOperand());
+            }
+
             if (Current.Kind != TokenKind.Word)
             {
                 throw Unexpected($"expected an operand after `{op}'");
@@ -669,6 +678,32 @@ public sealed class Parser
         }
 
         return new ConditionalExpression.Value(left);
+    }
+
+    /// <summary>
+    /// Reads the operand of <c>=~</c> as the run of source characters up to the next
+    /// whitespace, rejoining tokens the lexer separated on regex metacharacters.
+    /// </summary>
+    private Word ReadRegexOperand()
+    {
+        if (AtEnd)
+        {
+            throw Unexpected("expected a regular expression after `=~'");
+        }
+
+        var first = Advance();
+        var end = first.Start + first.Length;
+
+        // Tokens that abut with no gap were one whitespace-delimited word in the source.
+        while (!AtEnd
+            && Current.Kind is not (TokenKind.Newline or TokenKind.Semicolon)
+            && Current.Start == end)
+        {
+            end = Current.Start + Current.Length;
+            _index++;
+        }
+
+        return WordParser.Parse(SourceBetween(first.Start, end));
     }
 
     private static bool IsConditionalBinaryOperator(string text) =>
@@ -917,7 +952,13 @@ public sealed class Parser
         return elements;
     }
 
-    /// <summary>Splits on unquoted whitespace, keeping quoted regions intact.</summary>
+    /// <summary>
+    /// Splits on unquoted whitespace, keeping quoted regions and expansions intact.
+    /// </summary>
+    /// <remarks>
+    /// Expansions must survive whole: <c>a=($(echo x y))</c> has one element at parse
+    /// time — the substitution — which only splits into two fields once it has run.
+    /// </remarks>
     private static List<string> SplitWords(string text)
     {
         var result = new List<string>();
@@ -955,6 +996,33 @@ public sealed class Parser
                 current.Append(text[i..(end + 1)]);
                 i = end;
                 continue;
+            }
+
+            if (c == '`')
+            {
+                var end = text.IndexOf('`', i + 1);
+                if (end < 0)
+                {
+                    end = text.Length - 1;
+                }
+
+                current.Append(text[i..(end + 1)]);
+                i = end;
+                continue;
+            }
+
+            if (c == '$' && i + 1 < text.Length && text[i + 1] is '(' or '{')
+            {
+                var open = text[i + 1];
+                var close = open == '(' ? ')' : '}';
+                var end = WordParser.FindBalanced(text, i + 1, open, close);
+
+                if (end > 0)
+                {
+                    current.Append(text[i..(end + 1)]);
+                    i = end;
+                    continue;
+                }
             }
 
             current.Append(c);

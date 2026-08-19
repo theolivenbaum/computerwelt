@@ -109,6 +109,20 @@ public sealed class Bash
             {
                 var result = await interpreter.RunAsync(parsed, options.Stdin, cancellationToken);
                 State.LastExitCode = result.ExitCode;
+
+                // The EXIT trap runs once the script is finished, whatever ended it, and
+                // its output is appended to the script's own.
+                var atExit = await interpreter.RunTrapAsync("EXIT", cancellationToken);
+
+                if (!atExit.Stdout.IsEmpty || !atExit.Stderr.IsEmpty)
+                {
+                    result = result with
+                    {
+                        Stdout = StreamData.Concat(result.Stdout, atExit.Stdout),
+                        Stderr = StreamData.Concat(result.Stderr, atExit.Stderr),
+                    };
+                }
+
                 return result;
             }
             catch (LimitExceededException e)

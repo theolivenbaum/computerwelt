@@ -34,9 +34,18 @@ public sealed class ConformanceTests(ITestOutputHelper output)
         var totalRun = 0;
         var totalPassed = 0;
         var totalSkipped = 0;
+        var allFailures = new List<SpecOutcome>();
+
+        var filter = Environment.GetEnvironmentVariable("BASHKIT_SPEC_FILTER");
 
         foreach (var (file, cases) in files.OrderBy(static p => p.Key, StringComparer.Ordinal))
         {
+            if (filter is { Length: > 0 } && !file.Contains(filter, StringComparison.OrdinalIgnoreCase))
+            {
+                current[file] = baseline.GetValueOrDefault(file, 0);
+                continue;
+            }
+
             var passed = 0;
             var failures = new List<SpecOutcome>();
 
@@ -59,6 +68,7 @@ public sealed class ConformanceTests(ITestOutputHelper output)
                 else
                 {
                     failures.Add(outcome);
+                    allFailures.Add(outcome);
                 }
             }
 
@@ -76,6 +86,15 @@ public sealed class ConformanceTests(ITestOutputHelper output)
             foreach (var failure in failures.Take(3))
             {
                 regressions.Append(failure.Describe()).Append("\n\n");
+            }
+        }
+
+        if (filter is { Length: > 0 })
+        {
+            foreach (var failure in allFailures.Take(int.TryParse(Environment.GetEnvironmentVariable("BASHKIT_SPEC_SHOW"), out var show) ? show : 10))
+            {
+                output.WriteLine(failure.Describe());
+                output.WriteLine(new string('-', 60));
             }
         }
 

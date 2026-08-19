@@ -126,7 +126,7 @@ public sealed class Expander
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (part is WordPart.Parameter { Name: "@" or "*" } splat && !splat.LengthOf)
+            if (part is WordPart.Parameter splat && IsSplat(splat))
             {
                 await AppendSplatAsync(fields, splat, splitting, cancellationToken);
                 continue;
@@ -316,21 +316,87 @@ public sealed class Expander
         await ValueTask.CompletedTask;
     }
 
+    /// <summary>
+    /// True for the forms that expand to a <i>list</i> rather than one value: <c>$@</c>,
+    /// <c>$*</c>, <c>${arr[@]}</c> and <c>${arr[*]}</c>. A length or index query on the same
+    /// syntax is a single value and must not take this path.
+    /// </summary>
+    private static bool IsSplat(WordPart.Parameter parameter) =>
+        !parameter.LengthOf
+        && !parameter.IndirectRef
+        && (parameter.Name is "@" or "*" || parameter.Index is "@" or "*");
+
     private IReadOnlyList<string> GetSplatValues(WordPart.Parameter parameter)
     {
-        if (parameter.Index is "@" or "*")
+        var values = parameter.Index is "@" or "*"
+            ? _state.Lookup(parameter.Name)?.Elements ?? []
+            : _state.Positional;
+
+        // `${arr[@]:offset:length}` slices the list, not each element.
+        if (parameter.Operation == ParameterOp.Substring && parameter.Argument is { } spec)
         {
-            return _state.Lookup(parameter.Name)?.Elements ?? [];
+            values = Slice(values, spec.LiteralText);
         }
 
-        return _state.Positional;
+        return values;
+    }
+
+    /// <summary>Applies an <c>offset[:length]</c> slice to a list of elements.</summary>
+    private IReadOnlyList<string> Slice(IReadOnlyList<string> values, string spec)
+    {
+        var (offsetText, lengthText) = SplitSubstringSpec(spec);
+        var offset = (int)ArithmeticEvaluator.Evaluate(_state, offsetText);
+
+        if (offset < 0)
+        {
+            offset = Math.Max(0, values.Count + offset);
+        }
+
+        if (offset >= values.Count)
+        {
+            return [];
+        }
+
+        if (lengthText is null)
+        {
+            return [.. values.Skip(offset)];
+        }
+
+        var length = (int)ArithmeticEvaluator.Evaluate(_state, lengthText);
+
+        if (length < 0)
+        {
+            var end = values.Count + length;
+            return end <= offset ? [] : [.. values.Skip(offset).Take(end - offset)];
+        }
+
+        return [.. values.Skip(offset).Take(length)];
     }
 
     private async ValueTask<List<string>> ExpandParameterAsync(WordPart.Parameter parameter, bool splitting, CancellationToken cancellationToken)
     {
-        // `${!prefix*}` lists variable names; `${!name}` is indirection.
         if (parameter.IndirectRef)
         {
+            // `${!arr[@]}` lists an array's subscripts rather than dereferencing.
+            if (parameter.Index is "@" or "*")
+            {
+                var keys = _state.Lookup(parameter.Name)?.Keys ?? [];
+                return [.. keys];
+            }
+
+            // `${!prefix*}` and `${!prefix@}` list the names of matching variables.
+            if (parameter.Name.EndsWith('*') || parameter.Name.EndsWith('@'))
+            {
+                var prefix = parameter.Name[..^1];
+                var names = _state.AllVariables()
+                    .Where(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal))
+                    .Select(static pair => pair.Key)
+                    .OrderBy(static name => name, StringComparer.Ordinal)
+                    .ToList();
+
+                return names;
+            }
+
             var target = _state.Get(parameter.Name);
             if (string.IsNullOrEmpty(target))
             {
@@ -692,7 +758,16 @@ public sealed class Expander
         return "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
     }
 
-    /// <summary>Splits <paramref name="text"/> on <c>IFS</c> and appends the fields.</summary>
+    /// <summary>
+    /// Splits <paramref name="text"/> on <c>IFS</c> and appends the resulting fields.
+    /// </summary>
+    /// <remarks>
+    /// POSIX distinguishes two kinds of <c>IFS</c> character. A run of <c>IFS</c>
+    /// <i>whitespace</i> is one delimiter and is stripped from both ends of the input;
+    /// a non-whitespace one always delimits, so a leading <c>_</c> with <c>IFS=_</c>
+    /// yields an empty first field. Collapsing the two — the obvious implementation —
+    /// gets `${#}` wrong for exactly the inputs scripts use this for.
+    /// </remarks>
     private void AppendSplit(List<FieldBuilder> fields, string text)
     {
         var ifs = _state.Ifs;
@@ -703,23 +778,29 @@ public sealed class Expander
             return;
         }
 
-        var whitespace = ifs.Where(char.IsWhiteSpace).ToArray();
-        var separators = ifs.Where(static c => !char.IsWhiteSpace(c)).ToArray();
+        bool IsWhitespaceSeparator(char c) => char.IsWhiteSpace(c) && ifs.Contains(c, StringComparison.Ordinal);
+        bool IsSeparator(char c) => ifs.Contains(c, StringComparison.Ordinal);
 
         var position = 0;
-        var first = true;
 
-        // Leading and trailing IFS whitespace is discarded; a non-whitespace IFS character
-        // always delimits, even when it produces an empty field.
-        while (position < text.Length && whitespace.Contains(text[position]))
+        // Leading IFS whitespace is discarded, but a leading non-whitespace separator is
+        // a real delimiter and opens an empty field.
+        while (position < text.Length && IsWhitespaceSeparator(text[position]))
         {
             position++;
         }
 
-        while (position < text.Length)
+        if (position >= text.Length)
+        {
+            return;
+        }
+
+        var first = true;
+
+        while (true)
         {
             var start = position;
-            while (position < text.Length && !ifs.Contains(text[position]))
+            while (position < text.Length && !IsSeparator(text[position]))
             {
                 position++;
             }
@@ -730,29 +811,35 @@ public sealed class Expander
             }
 
             fields[^1].Append(text[start..position], quoted: false);
+            fields[^1].MarkQuoted();
             first = false;
 
             if (position >= text.Length)
             {
-                break;
+                return;
             }
 
-            var sawSeparator = false;
-            while (position < text.Length && ifs.Contains(text[position]))
+            // One delimiter is: optional IFS whitespace, at most one non-whitespace
+            // separator, then optional IFS whitespace.
+            while (position < text.Length && IsWhitespaceSeparator(text[position]))
             {
-                if (separators.Contains(text[position]))
-                {
-                    if (sawSeparator)
-                    {
-                        // Two non-whitespace separators in a row delimit an empty field.
-                        fields.Add(new FieldBuilder());
-                        fields[^1].MarkQuoted();
-                    }
-
-                    sawSeparator = true;
-                }
-
                 position++;
+            }
+
+            if (position < text.Length && IsSeparator(text[position]) && !IsWhitespaceSeparator(text[position]))
+            {
+                position++;
+            }
+
+            while (position < text.Length && IsWhitespaceSeparator(text[position]))
+            {
+                position++;
+            }
+
+            // A trailing delimiter does not open another field.
+            if (position >= text.Length)
+            {
+                return;
             }
         }
     }

@@ -1,0 +1,10 @@
+{
+  "enabledPlugins": {
+    "codspeed@claude-plugins-official": true
+  },
+  "permissions": {
+    "ask": [
+      "Bash(git push:*)"
+    ]
+  }
+}

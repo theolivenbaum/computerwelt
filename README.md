@@ -1,8 +1,16 @@
 # Computerwelt
 
-A C# / .NET 10 port of [Bashkit](https://github.com/everruns/bashkit) — an in-process,
-sandboxed bash interpreter with a virtual filesystem, built to be embedded in host
-applications and handed to LLM agents as a tool.
+A sandboxed **shell and Python runtime for .NET 10** — a C# port of two Rust projects,
+built to be embedded in host applications and handed to LLM agents as a tool:
+
+- **[Bashkit](https://github.com/everruns/bashkit)** — an in-process bash interpreter with
+  a virtual filesystem
+- **[Monty](https://github.com/pydantic/monty)** (Pydantic) — a minimal, secure Python
+  interpreter for running LLM-written code
+
+They share one virtual filesystem and one resource budget, so `python script.py` inside a
+shell script runs in the same sandbox as everything around it — with no CPython, no
+container and no process.
 
 ```csharp
 var bash = Bash.CreateBuilder()
@@ -32,12 +40,14 @@ behaves identically on Linux, macOS and Windows.
 
 | Path | What it is |
 |---|---|
-| `src/Bashkit/` | the library |
+| `src/Bashkit/` | the shell library |
 | `src/Bashkit.Cli/` | a script runner and REPL over it |
-| `tests/Bashkit.Tests/` | unit tests |
-| `tests/Bashkit.SpecTests/` | conformance runner |
-| `tests/spec/` | 2,521 golden cases carried over from upstream |
-| `.reference/bashkit/` | the vendored Rust source, read-only, used as the specification |
+| `src/Monty/` | the Python library (not started) |
+| `tests/Bashkit.Tests/` | shell unit tests |
+| `tests/Bashkit.SpecTests/` | shell conformance runner |
+| `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
+| `tests/monty-spec/` | 568 Python fixtures carried over from monty |
+| `.reference/` | the vendored Rust sources, read-only, used as the specification |
 
 ## Building and testing
 
@@ -58,9 +68,12 @@ Never lower a baseline number to make a build green.
 
 ## Status
 
-The port is in progress. See [`todo.md`](todo.md) for the ledger and
-[`CLAUDE.md`](CLAUDE.md) for the architecture and the invariants that define "correct".
+The shell passes **1,694 of 2,521** conformance cases with 73 commands implemented. The
+Python interpreter has its corpus vendored but no code yet.
+
+See [`todo.md`](todo.md) for the ledger and [`CLAUDE.md`](CLAUDE.md) for the architecture
+and the invariants that define "correct".
 
 ## Licence
 
-MIT, matching upstream. Attribution is preserved in `.reference/bashkit/NOTICE`.
+MIT, matching both upstreams. Attribution is preserved under each vendored tree.

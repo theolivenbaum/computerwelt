@@ -362,6 +362,13 @@ public static class WordParser
             i++;
         }
 
+        // `${!prefix*}` and `${!prefix@}` list matching variable names, so the trailing
+        // sigil belongs to the name rather than being an operator.
+        if (indirect && i < body.Length && body[i] is '*' or '@' && i == body.Length - 1)
+        {
+            i++;
+        }
+
         var name = body[nameStart..i];
 
         string? index = null;

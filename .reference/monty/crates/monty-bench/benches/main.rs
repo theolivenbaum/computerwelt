@@ -1,0 +1,607 @@
+// Use codspeed-criterion-compat when running on CodSpeed (CI), real criterion otherwise (for flamegraphs)
+#[cfg(not(codspeed))]
+use std::ffi::CString;
+use std::time::Duration;
+
+#[cfg(codspeed)]
+use codspeed_criterion_compat::{Bencher, Criterion, black_box, criterion_group, criterion_main};
+#[cfg(not(codspeed))]
+use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
+use monty::MontyRun;
+use monty_types::{CompileOptions, MontyObject, PrintWriter, ResourceLimits, ResourceTracker};
+#[cfg(all(not(codspeed), unix))]
+use pprof::criterion::{Output, PProfProfiler};
+// CPython benchmarks are only run locally, not on CodSpeed CI (requires Python + pyo3 setup)
+#[cfg(not(codspeed))]
+use pyo3::prelude::*;
+
+// The real worker allocator, so the interpreter benchmarks can price it:
+// `cargo bench -p monty-bench --bench main --features worker-alloc` against a
+// plain run measures what the ceiling costs on real workloads. No ceiling is
+// armed — the cost is in the counting, not the comparison.
+#[cfg(feature = "worker-alloc")]
+#[global_allocator]
+static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
+
+/// Runs a benchmark using the Monty interpreter.
+/// Parses once, then benchmarks repeated execution.
+fn run_monty(bench: &mut Bencher, code: &str, expected: i64) {
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let r = ex.run_no_limits(vec![]).unwrap();
+    let int_value: i64 = r.as_ref().try_into().unwrap();
+    assert_eq!(int_value, expected);
+
+    bench.iter(|| {
+        let r = ex.run_no_limits(vec![]).unwrap();
+        let int_value: i64 = r.as_ref().try_into().unwrap();
+        black_box(int_value);
+    });
+}
+
+/// Runs a benchmark using the Monty interpreter with a single string input bound to `DATA`.
+/// Parses once, then benchmarks repeated execution with the same input.
+fn run_monty_with_data(bench: &mut Bencher, code: &str, data: &str, expected: i64) {
+    let ex = MontyRun::new(
+        code.to_owned(),
+        "test.py",
+        vec!["DATA".to_owned()],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let make_input = || vec![MontyObject::String(data.to_owned())];
+    let r = ex.run_no_limits(make_input()).unwrap();
+    let int_value: i64 = r.as_ref().try_into().unwrap();
+    assert_eq!(int_value, expected);
+
+    bench.iter(|| {
+        let r = ex.run_no_limits(make_input()).unwrap();
+        let int_value: i64 = r.as_ref().try_into().unwrap();
+        black_box(int_value);
+    });
+}
+
+/// Runs a benchmark with production-shaped resource limits armed (generous
+/// budgets that never trip), measuring the amortized limit-checking path
+/// sandboxes actually run rather than the no-limits fast path.
+fn run_monty_limits(bench: &mut Bencher, code: &str, expected: i64) {
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let limits = ResourceLimits::default()
+        .max_duration(Duration::from_mins(10))
+        .max_memory(1 << 40);
+    let run = |limits: &ResourceLimits| {
+        let r = ex
+            .run(vec![], ResourceTracker::new(limits.clone()), PrintWriter::Stdout)
+            .unwrap();
+        let int_value: i64 = r.as_ref().try_into().unwrap();
+        int_value
+    };
+    assert_eq!(run(&limits), expected);
+    bench.iter(|| black_box(run(&limits)));
+}
+
+/// Runs a benchmark using CPython.
+/// Wraps code in main(), parses once, then benchmarks repeated execution.
+#[cfg(not(codspeed))]
+fn run_cpython(bench: &mut Bencher, code: &str, expected: i64) {
+    Python::attach(|py| {
+        let wrapped = wrap_for_cpython(code);
+        let code_cstr = CString::new(wrapped).expect("Invalid C string in code");
+        let fun: Py<PyAny> = PyModule::from_code(py, &code_cstr, c"test.py", c"main")
+            .unwrap()
+            .getattr("main")
+            .unwrap()
+            .into();
+
+        let r_py = fun.call0(py).unwrap();
+        let r: i64 = r_py.extract(py).unwrap();
+        assert_eq!(r, expected);
+
+        bench.iter(|| {
+            let r_py = fun.call0(py).unwrap();
+            let r: i64 = r_py.extract(py).unwrap();
+            black_box(r);
+        });
+    });
+}
+
+/// Runs a benchmark using CPython with a single string argument bound to `DATA`.
+/// Wraps code in `def main(DATA):`, parses once, then benchmarks repeated execution.
+#[cfg(not(codspeed))]
+fn run_cpython_with_data(bench: &mut Bencher, code: &str, data: &str, expected: i64) {
+    Python::attach(|py| {
+        let wrapped = wrap_for_cpython_with_param(code, "DATA");
+        let code_cstr = CString::new(wrapped).expect("Invalid C string in code");
+        let fun: Py<PyAny> = PyModule::from_code(py, &code_cstr, c"test.py", c"main")
+            .unwrap()
+            .getattr("main")
+            .unwrap()
+            .into();
+
+        let r_py = fun.call1(py, (data,)).unwrap();
+        let r: i64 = r_py.extract(py).unwrap();
+        assert_eq!(r, expected);
+
+        bench.iter(|| {
+            let r_py = fun.call1(py, (data,)).unwrap();
+            let r: i64 = r_py.extract(py).unwrap();
+            black_box(r);
+        });
+    });
+}
+
+/// Like [`wrap_for_cpython`] but produces `def main(<param>):` so a single argument can be passed.
+#[cfg(not(codspeed))]
+fn wrap_for_cpython_with_param(code: &str, param: &str) -> String {
+    let base = wrap_for_cpython(code);
+    // Replace the first "def main():" header with one that takes `param`.
+    base.replacen("def main():", &format!("def main({param}):"), 1)
+}
+
+/// Wraps code in a main() function for CPython execution.
+/// Indents each line and converts the last expression to a return statement.
+#[cfg(not(codspeed))]
+fn wrap_for_cpython(code: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut last_expr = String::new();
+
+    for line in code.lines() {
+        // Skip test metadata comments
+        if line.starts_with("# Return=") || line.starts_with("# Raise=") || line.starts_with("# skip=") {
+            continue;
+        }
+        // Track the last non-empty, non-comment line as potential return expression
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            last_expr = line.to_string();
+        }
+        lines.push(format!("    {line}"));
+    }
+
+    // Replace last expression with return statement
+    if let Some(last) = lines.iter().rposition(|l| l.trim() == last_expr.trim()) {
+        lines[last] = format!("    return {}", last_expr.trim());
+    }
+
+    format!("def main():\n{}", lines.join("\n"))
+}
+
+const ADD_TWO: &str = "1 + 2";
+
+const LOOP_MOD_13: &str = "
+v = ''
+for i in range(1_000):
+    if i % 13 == 0:
+        v += 'x'
+len(v)
+";
+
+/// Comprehensive benchmark exercising most supported Python features.
+/// Code is shared with test_cases/bench__kitchen_sink.py
+const KITCHEN_SINK: &str = include_str!("../../monty/test_cases/bench__kitchen_sink.py");
+
+const FUNC_CALL_KWARGS: &str = "
+def add(a, b=2):
+    return a + b
+
+add(a=1)
+";
+
+/// Builtin-method argument binding benchmark: a tight loop of cheap calls whose
+/// cost is dominated by `#[derive(FromArgs)]` dispatch (positional fill, kwarg
+/// matching, defaults) rather than the operations themselves. Guards the
+/// FromArgs binding path against regressions.
+const BUILTIN_ARGS: &str = "
+r = 0
+for i in range(10_000):
+    s = 'ab'.replace('a', 'b')
+    t = 'x'.encode('utf-8', 'strict')
+    u = sorted([3, 1, 2], reverse=False)
+    r += len(s) + len(t) + len(u)
+r
+";
+
+const LIST_APPEND_STR: &str = "
+a = []
+for i in range(100_000):
+    a.append(str(i))
+len(a)
+";
+
+const LIST_APPEND_INT: &str = "
+a = []
+for i in range(100_000):
+    a.append(i)
+sum(a)
+";
+
+const FIB_25: &str = "
+def fib(n):
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+fib(25)
+";
+
+/// List comprehension benchmark - creates 1000 elements.
+const LIST_COMP: &str = "len([x * 2 for x in range(1000)])";
+
+/// Dict comprehension benchmark - creates 500 unique keys (i // 2 deduplicates pairs).
+const DICT_COMP: &str = "len({i // 2: i * 2 for i in range(1000)})";
+
+/// Empty tuple creation benchmark - creates 100,000 empty tuples in a list.
+const EMPTY_TUPLES: &str = "len([() for _ in range(100_000)])";
+
+/// 2-tuple creation benchmark - creates 100,000 2-tuples in a list.
+const PAIR_TUPLES: &str = "len([(i, i + 1) for i in range(100_000)])";
+
+/// Container repr throughput over 1,000-element containers (half tracked
+/// strings, so per-item refcount bumps are priced). Guards the
+/// mutation-safe repr paths: live checked iteration for list/tuple/dict,
+/// snapshotting for deque/set/Counter, and the amortized time polls.
+const CONTAINER_REPR: &str = "
+from collections import Counter, deque
+
+words = [str(i) for i in range(500)]
+xs = words + list(range(500))
+tup = tuple(xs)
+d = {w: i for i, w in enumerate(words)}
+st = set(words)
+dq = deque(xs)
+c = Counter({w: i % 7 for i, w in enumerate(words)})
+
+n = 0
+for _ in range(20):
+    n += len(repr(xs)) + len(repr(tup)) + len(repr(d))
+    n += len(repr(st)) + len(repr(dq)) + len(repr(c))
+n
+";
+
+// --- Agent-workload benchmarks -------------------------------------------
+//
+// Monty's primary real-world use is "code mode" agents (pydantic-ai
+// CodeMode, the examples/ directory, pydantic/talks demos): LLM-written
+// Python that pulls rows out of a database/API via external functions,
+// aggregates them with plain dicts/lists, and formats a report. The
+// benchmarks below mirror those hot loops so regressions in the paths that
+// dominate real agent runs (str-keyed dict access, f-string formatting,
+// str parsing methods, datetime and re) show up in CI.
+
+/// Group-by aggregation over rows-of-dicts — the core loop of every
+/// data-analysis agent (group revenue by segment, rank, filter). Dominated
+/// by str-keyed dict get/insert, `sorted` with a lambda key, tuple
+/// unpacking, and a filtered generator-expression `sum`.
+const AGG_ROWS: &str = "
+regions = ['north', 'south', 'east', 'west']
+segments = ['consumer', 'smb', 'enterprise']
+channels = ['organic', 'paid', 'referral', 'email', 'social']
+rows = []
+for i in range(1_000):
+    rows.append({
+        'order_id': i,
+        'region': regions[i % 4],
+        'segment': segments[i % 3],
+        'channel': channels[i % 5],
+        'amount': (i * 37) % 500 + 1,
+        'quantity': i % 7 + 1,
+    })
+
+checksum = 0
+for _ in range(10):
+    revenue = {}
+    orders = {}
+    for row in rows:
+        key = row['region'] + '/' + row['segment']
+        value = row['amount'] * row['quantity']
+        revenue[key] = revenue.get(key, 0) + value
+        orders[key] = orders.get(key, 0) + 1
+    ranked = sorted(revenue.items(), key=lambda kv: kv[1], reverse=True)
+    top_key, top_revenue = ranked[0]
+    big = sum(1 for row in rows if row['amount'] > 400 and row['quantity'] >= 3)
+    checksum += top_revenue + big + top_revenue // orders[top_key]
+checksum
+";
+
+/// Report formatting with f-strings — how agents present results (markdown
+/// tables, aligned columns, percentages, thousands separators). Exercises
+/// the format mini-language (`fstring.rs`), float formatting, and
+/// `str.join` over a large list of tracked strings.
+const FSTRING_REPORT: &str = "
+total = 0.0
+lines = []
+for i in range(2_000):
+    name = 'product-' + str(i % 100)
+    price = (i * 7) % 300 + 0.99
+    share = (i % 100) / 100
+    total += price
+    lines.append(f'| {name:<14} | {price:>10.2f} | {share:>7.1%} | {i:06d} |')
+lines.append(f'total: {total:,.2f}')
+report = '\\n'.join(lines)
+len(report)
+";
+
+/// Line-oriented text parsing — the scraping/ETL shape (split lines, split
+/// fields, strip/lower/startswith/`in`, `int()` conversion). Measures str
+/// method throughput on real text rather than `FromArgs` binding (which
+/// `builtin_args` covers with tiny strings).
+const STR_PARSE: &str = "
+lines = []
+for i in range(500):
+    status = 'ACTIVE' if i % 3 else 'retired'
+    lines.append('  Widget-' + str(i) + ' ;  ' + str((i * 13) % 400) + ' ; ' + status + ' ; north-' + str(i % 7) + '  ')
+text = '\\n'.join(lines)
+
+count = 0
+total = 0
+for _ in range(10):
+    for line in text.split('\\n'):
+        parts = line.split(';')
+        name = parts[0].strip()
+        qty = int(parts[1].strip())
+        state = parts[2].strip().lower()
+        zone = parts[3].strip()
+        if state == 'active' and name.lower().startswith('widget') and 'north' in zone:
+            count += 1
+            total += qty
+count + total
+";
+
+/// Timestamp cohort analysis — parse ISO timestamps, bucket by weekday and
+/// `strftime` month key, subtract datetimes. The retention/day-of-week
+/// questions agents get asked constantly; covers `fromisoformat`,
+/// `strftime`, `weekday`, and timedelta arithmetic.
+const DATETIME_OPS: &str = "
+import datetime
+
+stamps = []
+for i in range(500):
+    stamps.append(f'2024-{i % 12 + 1:02d}-{i % 28 + 1:02d}T{i % 24:02d}:{i % 60:02d}:00')
+
+start = datetime.datetime(2024, 1, 1)
+weekday_counts = [0, 0, 0, 0, 0, 0, 0]
+cohorts = {}
+total_days = 0
+for _ in range(4):
+    for s in stamps:
+        dt = datetime.datetime.fromisoformat(s)
+        weekday_counts[dt.weekday()] += 1
+        cohorts[dt.strftime('%Y-%m')] = cohorts.get(dt.strftime('%Y-%m'), 0) + 1
+        total_days += (dt - start).days
+weekend = weekday_counts[5] + weekday_counts[6]
+total_days + weekend + len(cohorts)
+";
+
+/// Regex extraction over a large string — `finditer` with group capture and
+/// `re.split`. The engine is fancy-regex, but Monty's wrapper (match-object
+/// allocation, group extraction into tracked strings) is what this guards.
+const RE_EXTRACT: &str = "
+import re
+
+parts = []
+for i in range(300):
+    parts.append('name=item' + str(i) + ' qty=' + str(i % 50) + ' price=' + str((i * 7) % 900))
+text = ' '.join(parts)
+
+pattern = re.compile(r'qty=(\\d+) price=(\\d+)')
+total = 0
+for _ in range(5):
+    for m in pattern.finditer(text):
+        total += int(m.group(1)) + int(m.group(2))
+    words = re.split(r'\\s+', text)
+    total += len(words)
+total
+";
+
+/// Single-collection latency benchmark.
+///
+/// 50,000 self-referencing lists (each `a; a.append(a)` forms a cycle that ref
+/// counting alone cannot free).
+///
+/// The trailing `0` exists so the runner's `i64` extraction sees a known value:
+/// Monty's `gc.collect()` always returns `0` but CPython returns the count of
+/// unreachable objects collected, which we don't care to assert on.
+const GC_COLLECT: &str = "
+import gc
+gc.disable()
+for _ in range(50_000):
+    a = []
+    a.append(a)
+gc.collect()
+0
+";
+
+/// JSON payload used by the `json_loads` / `json_dumps` benchmarks.
+/// Sourced from `medium_response.json` (a jiter bench fixture).
+const JSON_MEDIUM: &str = include_str!("medium_response.json");
+
+/// Parses a ~2 KB JSON document into a Python object 1,000 times per Monty run.
+/// Looping inside Monty amortises per-call VM/import/input-binding overhead so the
+/// measurement reflects steady-state parse cost rather than startup.
+/// Returns the number of top-level keys (2) as the verification value.
+const JSON_LOADS: &str = "
+import json
+r = 0
+for _ in range(1_000):
+    r = len(json.loads(DATA))
+r
+";
+
+/// Parses JSON then serialises it back to a string 1,000 times per Monty run.
+/// Loop sits inside Monty for the same reason as `JSON_LOADS`.
+/// Returns the length of the final serialised output so the result can be verified.
+const JSON_DUMPS: &str = "
+import json
+obj = json.loads(DATA)
+r = 0
+for _ in range(1_000):
+    r = len(json.dumps(obj))
+r
+";
+
+/// Benchmarks end-to-end execution (parsing + running) using Monty.
+/// This is different from other benchmarks as it includes parsing in the loop.
+fn end_to_end_monty(bench: &mut Bencher) {
+    bench.iter(|| {
+        let ex = MontyRun::new(
+            black_box("1 + 2").to_owned(),
+            "test.py",
+            vec![],
+            CompileOptions::default(),
+        )
+        .unwrap();
+        let r = ex.run_no_limits(vec![]).unwrap();
+        let int_value: i64 = r.as_ref().try_into().unwrap();
+        black_box(int_value);
+    });
+}
+
+/// Parses 1,000 repetitions of `x = 1` to track the cost of Monty's Ruff-AST → Monty-AST
+/// conversion pass on many trivial statements. A scaled-down version of the `latency.py`
+/// workload (which uses 100,000 lines) — kept small enough for criterion while still
+/// large enough that per-statement conversion cost dominates fixed overhead.
+fn parse_1k_assigns(bench: &mut Bencher) {
+    let code: String = "x = 1\n".repeat(1_000);
+    bench.iter(|| {
+        let ex = MontyRun::new(black_box(code.clone()), "test.py", vec![], CompileOptions::default()).unwrap();
+        black_box(ex);
+    });
+}
+
+/// Benchmarks end-to-end execution (parsing + running) using CPython.
+/// This is different from other benchmarks as it includes parsing in the loop.
+#[cfg(not(codspeed))]
+fn end_to_end_cpython(bench: &mut Bencher) {
+    Python::attach(|py| {
+        bench.iter(|| {
+            let fun: Py<PyAny> =
+                PyModule::from_code(py, black_box(c"def main():\n  return 1 + 2"), c"test.py", c"main")
+                    .unwrap()
+                    .getattr("main")
+                    .unwrap()
+                    .into();
+            let r_py = fun.call0(py).unwrap();
+            let r: i64 = r_py.extract(py).unwrap();
+            black_box(r);
+        });
+    });
+}
+
+/// Configures all benchmarks in a single group.
+fn criterion_benchmark(c: &mut Criterion) {
+    c.bench_function("add_two__monty", |b| run_monty(b, ADD_TWO, 3));
+    #[cfg(not(codspeed))]
+    c.bench_function("add_two__cpython", |b| run_cpython(b, ADD_TWO, 3));
+
+    c.bench_function("loop_mod_13__monty", |b| run_monty(b, LOOP_MOD_13, 77));
+    c.bench_function("loop_mod_13_limits__monty", |b| run_monty_limits(b, LOOP_MOD_13, 77));
+    #[cfg(not(codspeed))]
+    c.bench_function("loop_mod_13__cpython", |b| run_cpython(b, LOOP_MOD_13, 77));
+
+    c.bench_function("end_to_end__monty", end_to_end_monty);
+    c.bench_function("parse_1k_assigns__monty", parse_1k_assigns);
+    #[cfg(not(codspeed))]
+    c.bench_function("end_to_end__cpython", end_to_end_cpython);
+
+    c.bench_function("kitchen_sink__monty", |b| run_monty(b, KITCHEN_SINK, 373));
+    c.bench_function("kitchen_sink_limits__monty", |b| run_monty_limits(b, KITCHEN_SINK, 373));
+    #[cfg(not(codspeed))]
+    c.bench_function("kitchen_sink__cpython", |b| run_cpython(b, KITCHEN_SINK, 373));
+
+    c.bench_function("func_call_kwargs__monty", |b| run_monty(b, FUNC_CALL_KWARGS, 3));
+    #[cfg(not(codspeed))]
+    c.bench_function("func_call_kwargs__cpython", |b| run_cpython(b, FUNC_CALL_KWARGS, 3));
+
+    c.bench_function("builtin_args__monty", |b| run_monty(b, BUILTIN_ARGS, 60_000));
+    #[cfg(not(codspeed))]
+    c.bench_function("builtin_args__cpython", |b| run_cpython(b, BUILTIN_ARGS, 60_000));
+
+    c.bench_function("list_append_str__monty", |b| run_monty(b, LIST_APPEND_STR, 100_000));
+    #[cfg(not(codspeed))]
+    c.bench_function("list_append_str__cpython", |b| run_cpython(b, LIST_APPEND_STR, 100_000));
+
+    c.bench_function("list_append_int__monty", |b| {
+        run_monty(b, LIST_APPEND_INT, 4_999_950_000);
+    });
+    #[cfg(not(codspeed))]
+    c.bench_function("list_append_int__cpython", |b| {
+        run_cpython(b, LIST_APPEND_INT, 4_999_950_000);
+    });
+
+    c.bench_function("fib__monty", |b| run_monty(b, FIB_25, 75_025));
+    #[cfg(not(codspeed))]
+    c.bench_function("fib__cpython", |b| run_cpython(b, FIB_25, 75_025));
+
+    c.bench_function("list_comp__monty", |b| run_monty(b, LIST_COMP, 1000));
+    #[cfg(not(codspeed))]
+    c.bench_function("list_comp__cpython", |b| run_cpython(b, LIST_COMP, 1000));
+
+    c.bench_function("dict_comp__monty", |b| run_monty(b, DICT_COMP, 500));
+    #[cfg(not(codspeed))]
+    c.bench_function("dict_comp__cpython", |b| run_cpython(b, DICT_COMP, 500));
+
+    c.bench_function("empty_tuples__monty", |b| run_monty(b, EMPTY_TUPLES, 100_000));
+    #[cfg(not(codspeed))]
+    c.bench_function("empty_tuples__cpython", |b| run_cpython(b, EMPTY_TUPLES, 100_000));
+
+    c.bench_function("pair_tuples__monty", |b| run_monty(b, PAIR_TUPLES, 100_000));
+    #[cfg(not(codspeed))]
+    c.bench_function("pair_tuples__cpython", |b| run_cpython(b, PAIR_TUPLES, 100_000));
+
+    c.bench_function("container_repr__monty", |b| run_monty(b, CONTAINER_REPR, 628_320));
+    #[cfg(not(codspeed))]
+    c.bench_function("container_repr__cpython", |b| run_cpython(b, CONTAINER_REPR, 628_320));
+
+    c.bench_function("json_loads__monty", |b| {
+        run_monty_with_data(b, JSON_LOADS, JSON_MEDIUM, 2);
+    });
+    #[cfg(not(codspeed))]
+    c.bench_function("json_loads__cpython", |b| {
+        run_cpython_with_data(b, JSON_LOADS, JSON_MEDIUM, 2);
+    });
+
+    c.bench_function("json_dumps__monty", |b| {
+        run_monty_with_data(b, JSON_DUMPS, JSON_MEDIUM, 1815);
+    });
+    #[cfg(not(codspeed))]
+    c.bench_function("json_dumps__cpython", |b| {
+        run_cpython_with_data(b, JSON_DUMPS, JSON_MEDIUM, 1815);
+    });
+
+    c.bench_function("agg_rows__monty", |b| run_monty(b, AGG_ROWS, 909_800));
+    #[cfg(not(codspeed))]
+    c.bench_function("agg_rows__cpython", |b| run_cpython(b, AGG_ROWS, 909_800));
+
+    c.bench_function("fstring_report__monty", |b| run_monty(b, FSTRING_REPORT, 102_017));
+    #[cfg(not(codspeed))]
+    c.bench_function("fstring_report__cpython", |b| run_cpython(b, FSTRING_REPORT, 102_017));
+
+    c.bench_function("str_parse__monty", |b| run_monty(b, STR_PARSE, 655_040));
+    #[cfg(not(codspeed))]
+    c.bench_function("str_parse__cpython", |b| run_cpython(b, STR_PARSE, 655_040));
+
+    c.bench_function("datetime_ops__monty", |b| run_monty(b, DATETIME_OPS, 360_100));
+    #[cfg(not(codspeed))]
+    c.bench_function("datetime_ops__cpython", |b| run_cpython(b, DATETIME_OPS, 360_100));
+
+    c.bench_function("re_extract__monty", |b| run_monty(b, RE_EXTRACT, 652_500));
+    #[cfg(not(codspeed))]
+    c.bench_function("re_extract__cpython", |b| run_cpython(b, RE_EXTRACT, 652_500));
+
+    c.bench_function("gc_collect__monty", |b| run_monty(b, GC_COLLECT, 0));
+    #[cfg(not(codspeed))]
+    c.bench_function("gc_collect__cpython", |b| run_cpython(b, GC_COLLECT, 0));
+}
+
+// Use pprof flamegraph profiler when running locally on Unix (not on CodSpeed or Windows)
+#[cfg(all(not(codspeed), unix))]
+criterion_group!(
+    name = benches;
+    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = criterion_benchmark
+);
+
+// Use default config on CodSpeed or Windows (pprof is Unix-only)
+#[cfg(any(codspeed, not(unix)))]
+criterion_group!(benches, criterion_benchmark);
+
+criterion_main!(benches);
