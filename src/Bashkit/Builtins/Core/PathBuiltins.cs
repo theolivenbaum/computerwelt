@@ -164,9 +164,18 @@ public sealed class LnBuiltin : IBuiltin
         var target = cursor.Operands[0];
         var linkPath = context.ResolvePath(cursor.Operands[1]);
 
-        // Linking into a directory keeps the target's name.
         if (await CpBuiltin.IsDirectoryAsync(context, linkPath, cancellationToken))
         {
+            // `-f` asks for the destination to be replaced, and replacing a directory that
+            // has children would orphan them: there is no unlink-on-last-reference here to
+            // keep them reachable.
+            if (force && (await context.FileSystem.ReadDirectoryAsync(linkPath, cancellationToken)).Count > 0)
+            {
+                return ExecResult.Error(
+                    $"ln: cannot overwrite directory '{cursor.Operands[1]}'\n", ExitCodes.Failure);
+            }
+
+            // Otherwise linking into a directory keeps the target's name.
             linkPath = linkPath.Join(VPath.Parse(target).FileName);
         }
 

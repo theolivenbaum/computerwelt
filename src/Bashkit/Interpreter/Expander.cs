@@ -112,8 +112,16 @@ public sealed class Expander
         if (braceExpanded is not null)
         {
             var expanded = new List<string>();
+
             foreach (var text in braceExpanded)
             {
+                // An empty alternative is still a word: `echo {,a}` prints two.
+                if (text.Length == 0)
+                {
+                    expanded.Add(string.Empty);
+                    continue;
+                }
+
                 expanded.AddRange(await ExpandToFieldsAsync(WordParser.Parse(text), splitting, cancellationToken));
             }
 

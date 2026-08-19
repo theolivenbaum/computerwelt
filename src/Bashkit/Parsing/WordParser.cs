@@ -303,7 +303,9 @@ public static class WordParser
         }
 
         // $'...' — ANSI-C quoting, decoded here because its escapes are not shell escapes.
-        if (next == '\'')
+        // Neither this nor $"..." applies inside double quotes, where `"$"` is a literal
+        // dollar followed by the closing quote.
+        if (next == '\'' && !quoted)
         {
             // A backslash-escaped quote does not end the string: `$'it\'s'` is one word.
             var end = index + 2;
@@ -319,7 +321,7 @@ public static class WordParser
         }
 
         // $"..." asks for a locale translation, which in a sandbox is the string itself.
-        if (next == '"')
+        if (next == '"' && !quoted)
         {
             Flush();
             return ParseDoubleQuoted(raw, index + 2, parts) - index;
