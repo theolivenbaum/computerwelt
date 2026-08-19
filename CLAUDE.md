@@ -71,7 +71,7 @@ the speed and the snapshot-at-a-call-boundary feature both depend on it.
 | `builtins/` | `Builtins/` | `len`, `range`, `print`, `sorted`, … |
 | `modules/` | `Modules/` | the permitted stdlib subset |
 | `crates/monty-types/` | `Interop/` | host-facing object model and external functions |
-| `crates/monty-fs/` | — | reuses this repo's `IFileSystem`; the two sandboxes share one VFS |
+| `crates/monty-fs/` | `Computerwelt/PythonFileSystem` | `os`, `os.path` and `open` over this repo's `IFileSystem`, so both sandboxes share one VFS |
 | `crates/monty-type-checking/` | — | out of scope: wraps `ty`, an external type checker |
 
 ### Rust → C# idiom map
@@ -108,12 +108,15 @@ Directory.Build.props        shared TFM / analyzers / warnings-as-errors
 Directory.Packages.props     central package versions
 src/
   Bashkit/                   the shell library
-  Bashkit.Cli/               a REPL / script runner over it
-  Monty/                     the Python library (not started)
+  Monty/                     the Python library
+  Computerwelt/              the two joined: `python` as a shell command over one VFS
+  Computerwelt.Cli/          a REPL / script runner over the whole product
+  Monty.Cli/                 a Python-only runner, for isolating that half
 tests/
   Bashkit.Tests/             shell unit tests
   Bashkit.SpecTests/         shell conformance runner over `tests/spec/**/*.test.sh`
   Monty.SpecTests/           python conformance runner over `tests/monty-spec/*.py`
+  Computerwelt.Tests/        integration: both interpreters over one filesystem
   spec/                      shell acceptance corpus (from bashkit)
   monty-spec/                python acceptance corpus (from monty)
 .reference/bashkit/          vendored bashkit source (read-only)

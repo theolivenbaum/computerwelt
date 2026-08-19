@@ -8,9 +8,8 @@ built to be embedded in host applications and handed to LLM agents as a tool:
 - **[Monty](https://github.com/pydantic/monty)** (Pydantic) — a minimal, secure Python
   interpreter for running LLM-written code
 
-They share one virtual filesystem and one resource budget, so `python script.py` inside a
-shell script runs in the same sandbox as everything around it — with no CPython, no
-container and no process.
+They share one virtual filesystem, so `python script.py` inside a shell script runs in the
+same sandbox as everything around it — with no CPython, no container and no process.
 
 ```csharp
 var bash = Bash.CreateBuilder()
@@ -25,6 +24,18 @@ Console.WriteLine(result.Stdout);   // HELLO
 ```csharp
 var python = new MontyRunner().Run("print(sum(x * x for x in range(5)))");
 Console.WriteLine(python.Stdout);   // 30
+```
+
+Or both at once, over one filesystem:
+
+```csharp
+var bash = Bash.CreateBuilder().WithPython().Build();
+
+await bash.ExecAsync("""
+    echo '17 4 42' > /data.txt
+    python -c "print(max(int(x) for x in open('/data.txt').read().split()))"
+    """);
+// 42
 ```
 
 ## What "sandboxed" means here
@@ -46,10 +57,12 @@ behaves identically on Linux, macOS and Windows.
 | Path | What it is |
 |---|---|
 | `src/Bashkit/` | the shell library |
-| `src/Bashkit.Cli/` | a script runner and REPL over it |
+| `src/Computerwelt.Cli/` | a script runner and REPL over the whole product |
 | `src/Monty/` | the Python library |
-| `src/Monty.Cli/` | a script runner over it |
+| `src/Computerwelt/` | the two joined: `python` as a shell command over one filesystem |
+| `src/Monty.Cli/` | a Python-only runner |
 | `tests/Monty.SpecTests/` | Python conformance runner |
+| `tests/Computerwelt.Tests/` | integration: both interpreters over one filesystem |
 | `tests/Bashkit.Tests/` | shell unit tests |
 | `tests/Bashkit.SpecTests/` | shell conformance runner |
 | `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
@@ -80,7 +93,8 @@ Never lower a baseline number to make a build green.
 | shell | **1,694 / 2,521** | 73 commands implemented |
 | python | **371 / 558** | parser, bytecode compiler, VM, types, builtins, 9 stdlib modules, dunders |
 
-The two halves do not yet share a filesystem; that is the last step of the Python port.
+The two halves share one virtual filesystem: `src/Computerwelt/` adds `python` as a shell
+command whose `os`, `os.path` and `open` are backed by the shell's `IFileSystem`.
 
 See [`todo.md`](todo.md) for the ledger and [`CLAUDE.md`](CLAUDE.md) for the architecture
 and the invariants that define "correct".

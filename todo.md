@@ -219,7 +219,7 @@ Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 
 ## Phase 9 — Hosting surfaces
 
-- [x] `Bashkit.Cli` — run a script, `-c`, REPL
+- [x] `Computerwelt.Cli` — run a script, `-c`, REPL, with `python` available
 - [ ] NuGet packaging metadata, symbols, deterministic build
 - [ ] Public API surface tests (`PublicAPI.Shipped.txt`)
 - [ ] Benchmarks (`BenchmarkDotNet`) mirroring `crates/bashkit-bench`
@@ -367,11 +367,16 @@ Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.
 
 - [x] `ExecutionLimits` and the `MontyRunner` facade
 - [x] `Monty.Cli` — run a script or `-c` source
+- [x] `Computerwelt.Cli` — the product driver, shell plus `python`
 - [x] External functions — the only route to anything outside the sandbox, mirroring how
       Monty blocks filesystem, environment and network by default
 - [x] `PyDataclass` — the record shape the host boundary passes structured values in
 - [ ] Host object model: converting between .NET values and Monty objects
 - [ ] Async external functions (`async_call`, `async_fail`)
 - [ ] Snapshot and resume at an external-call boundary
-- [ ] Wire the `python` builtin into the shell, sharing the VFS, the budget and the
-      output buffers — the payoff for porting both halves
+- [x] Wire the `python` builtin into the shell, sharing the VFS — the payoff for porting
+      both halves. `src/Computerwelt/` adds `python` / `python3` as shell commands, with
+      `os`, `os.path` and `open` backed by the shell's `IFileSystem`, and 12 integration
+      tests covering both directions plus the isolation guarantees.
+- [ ] Share the *budget* too: Python currently gets its own instruction limit rather than
+      drawing on the shell's `ExecutionBudget`
