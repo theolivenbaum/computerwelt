@@ -43,6 +43,9 @@ public static class AsyncioModule
 
             return new PyFuture(() =>
             {
+                // The same awaitable listed twice is one piece of work with two results,
+                // not two runs of the same coroutine.
+                var settled = new Dictionary<PyObject, PyObject>(ReferenceEqualityComparer.Instance);
                 var results = new List<PyObject>(awaited.Length);
 
                 foreach (var awaitable in awaited)
@@ -53,7 +56,13 @@ public static class AsyncioModule
                             "An asyncio.Future, a coroutine or an awaitable is required"));
                     }
 
-                    results.Add(machine.Await(awaitable));
+                    if (!settled.TryGetValue(awaitable, out var result))
+                    {
+                        result = machine.Await(awaitable);
+                        settled[awaitable] = result;
+                    }
+
+                    results.Add(result);
                 }
 
                 return new PyList(results);

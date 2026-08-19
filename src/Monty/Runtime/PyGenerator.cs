@@ -115,6 +115,7 @@ public sealed class PyFuture : PyObject
 {
     private Func<PyObject>? _pending;
     private PyObject? _value;
+    private PyRaise? _failure;
 
     /// <summary>Creates a future that has already settled.</summary>
     public PyFuture(PyObject value) => _value = value;
@@ -138,10 +139,26 @@ public sealed class PyFuture : PyObject
     /// </remarks>
     public PyObject Resolve()
     {
+        if (_failure is { } failed)
+        {
+            throw failed;
+        }
+
         if (_pending is { } work)
         {
             _pending = null;
-            _value = work();
+
+            try
+            {
+                _value = work();
+            }
+            catch (PyRaise raise)
+            {
+                // A future that failed stays failed: awaiting it again reports the same
+                // error rather than retrying work that already ran.
+                _failure = raise;
+                throw;
+            }
         }
 
         return _value!;

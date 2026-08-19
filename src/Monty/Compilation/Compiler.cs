@@ -853,8 +853,10 @@ public sealed class Compiler
                 EmitStore(name, handler.Line);
             }
 
-            Emit(OpCode.EndHandler, 0, handler.Line);
+            // The exception stays current for the whole handler, so a bare `raise` inside
+            // it re-raises what was caught; it is cleared only on the way out.
             CompileStatements(handler.Body);
+            Emit(OpCode.EndHandler, 0, handler.Line);
             handlerExits.Add(Emit(OpCode.Jump, 0, handler.Line));
 
             if (nextHandler is { } jump)
