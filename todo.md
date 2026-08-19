@@ -18,12 +18,13 @@ Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-
 **Current state — shell:** solution builds clean, 151 unit tests green,
 **1,694 / 2,521 conformance cases passing (67.2 %)**.
 
-**Current state — python:** tokenizer, parser, bytecode compiler, VM, core types and
-builtins are in place. **304 / 558 fixtures passing (54.5 %)** on the first pass.
+**Current state — python:** tokenizer, parser, bytecode compiler, VM, core types,
+builtins, six stdlib modules and the external-function boundary are in place.
+**353 / 558 fixtures passing (63.3 %)**.
 
-Largest remaining gaps: 65 fixtures need stdlib modules, 45 hit missing names, 32 are real
-semantic differences, 17 are parser gaps, and 26 are outright interpreter bugs (host
-exceptions escaping as `OverflowException` / `IndexOutOfRangeException`).
+Largest remaining gaps: 59 real semantic differences, 37 fixtures needing `re`,
+`datetime`, `dataclasses`, `os`/`pathlib` or `asyncio`, 20 pinning tracebacks the port
+does not format yet, and 16 where a host exception still escapes.
 
 | suite | passing |
 |---|---|
@@ -282,7 +283,7 @@ Upstream: `parse.rs`, `expressions.rs`, `fstring.rs`, `source_map.rs`
 - [x] f-strings: nested expressions, `!r`/`!s`/`!a`, format specs, `=` debug form
 - [x] Type annotations parsed (and, as Monty does at runtime, ignored)
 - [x] Source line and column on every node
-- [ ] Remaining parser gaps — 17 fixtures still fail to parse
+- [ ] Remaining parser gaps — 7 fixtures still fail to parse
 - [ ] Parse-error messages matching CPython's, since fixtures compare them
 - [ ] `match` statements — an upstream limitation, tracked but not required
 
@@ -347,12 +348,15 @@ Upstream: `types/` (1.1 MB), `builtins/` (188 KB)
 
 Upstream: `modules/` — the permitted set and nothing more.
 
-- [ ] `math`, `json`, `re`, `datetime` — 65 fixtures blocked on these
-- [ ] `collections` (`deque`, `Counter`, `defaultdict`, `namedtuple`, `OrderedDict`)
-- [ ] `itertools`, `dataclasses`, `typing`
+- [x] `math`, `json`, `sys`, `typing`, `__future__`
+- [x] `collections` (`Counter`, `defaultdict`, `namedtuple`, `OrderedDict`, `deque`)
+- [x] `itertools`
+- [ ] `re`, `datetime`, `dataclasses` — 37 fixtures blocked on these
 - [ ] `os` and `pathlib` — routed through this repo's `IFileSystem`, so Python and bash
       see one filesystem
-- [ ] `sys`, `unicodedata`, `asyncio`
+- [ ] `unicodedata`, `asyncio`
+- [~] `itertools.count` and `repeat` are bounded rather than infinite, since results are
+      materialized rather than lazy
 
 ## Phase 17 — Host integration
 
@@ -360,9 +364,11 @@ Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.
 
 - [x] `ExecutionLimits` and the `MontyRunner` facade
 - [x] `Monty.Cli` — run a script or `-c` source
-- [ ] Host object model: converting between .NET values and Monty objects
-- [ ] External functions — the only route to anything outside the sandbox, mirroring how
+- [x] External functions — the only route to anything outside the sandbox, mirroring how
       Monty blocks filesystem, environment and network by default
+- [x] `PyDataclass` — the record shape the host boundary passes structured values in
+- [ ] Host object model: converting between .NET values and Monty objects
+- [ ] Async external functions (`async_call`, `async_fail`)
 - [ ] Snapshot and resume at an external-call boundary
 - [ ] Wire the `python` builtin into the shell, sharing the VFS, the budget and the
       output buffers — the payoff for porting both halves

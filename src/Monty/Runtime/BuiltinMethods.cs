@@ -13,6 +13,7 @@ public static class BuiltinMethods
         PyStr => BindString(target, name),
         PyList => BindList(machine, target, name),
         PyDict => BindDict(machine, target, name),
+        Modules.PyDefaultDict defaults => BindDict(machine, defaults.Entries, name),
         PySet => BindSet(target, name),
         PyTuple => BindTuple(target, name),
         PyBytes => BindBytes(target, name),
@@ -23,6 +24,28 @@ public static class BuiltinMethods
 
     private static PyBoundMethod Method(string name, PyObject receiver, Func<PyObject, PyObject[], PyDict?, PyObject> implementation) =>
         new(name, receiver, implementation);
+
+    /// <summary>
+    /// Wraps a method that needs at least <paramref name="minimum"/> arguments, so a
+    /// missing one becomes a <c>TypeError</c> rather than a host index error.
+    /// </summary>
+    private static PyBoundMethod Method(
+        string name,
+        PyObject receiver,
+        int minimum,
+        Func<PyObject, PyObject[], PyDict?, PyObject> implementation) =>
+        new(name, receiver, (self, arguments, keywords) =>
+        {
+            if (arguments.Length < minimum)
+            {
+                // Sequence and mapping methods word this differently, matching CPython.
+                throw new PyRaise(PyErrors.TypeError(self is PyList or PyTuple or PyStr or PySet
+                    ? $"{self.TypeName}.{name}() takes exactly {(minimum == 1 ? "one argument" : minimum + " arguments")} ({arguments.Length} given)"
+                    : $"{name} expected at least {minimum} argument{(minimum == 1 ? string.Empty : "s")}, got {arguments.Length}"));
+            }
+
+            return implementation(self, arguments, keywords);
+        });
 
     private static string Text(PyObject value, string method, int position) =>
         value is PyStr text
@@ -118,7 +141,7 @@ public static class BuiltinMethods
                 });
 
             case "join":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var separator = ((PyStr)self).Value;
                     var builder = new StringBuilder();
@@ -145,7 +168,7 @@ public static class BuiltinMethods
                 });
 
             case "replace":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 2, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var from = Text(arguments[0], name, 1);
@@ -178,7 +201,7 @@ public static class BuiltinMethods
                 });
 
             case "startswith" or "endswith":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var prefixes = arguments[0] is PyTuple tuple
@@ -199,7 +222,7 @@ public static class BuiltinMethods
                 });
 
             case "find" or "rfind" or "index" or "rindex":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var needle = Text(arguments[0], name, 1);
@@ -225,7 +248,7 @@ public static class BuiltinMethods
                 });
 
             case "count":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var needle = Text(arguments[0], name, 1);
@@ -282,7 +305,7 @@ public static class BuiltinMethods
                 return Predicate(receiver, name, static text => text.Length > 0 && text == TitleCase(text));
 
             case "zfill":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var width = Int(arguments[0], "width");
@@ -299,7 +322,7 @@ public static class BuiltinMethods
                 });
 
             case "ljust" or "rjust" or "center":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var width = Int(arguments[0], "width");
@@ -325,7 +348,7 @@ public static class BuiltinMethods
                 });
 
             case "removeprefix" or "removesuffix":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var affix = Text(arguments[0], name, 1);
@@ -341,7 +364,7 @@ public static class BuiltinMethods
                 });
 
             case "partition" or "rpartition":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, 1, (self, arguments, _) =>
                 {
                     var text = ((PyStr)self).Value;
                     var separator = Text(arguments[0], name, 1);
@@ -473,21 +496,21 @@ public static class BuiltinMethods
         switch (name)
         {
             case "append":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     ((PyList)self).Items.Add(arguments[0]);
                     return PyNone.Instance;
                 });
 
             case "extend":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     ((PyList)self).Items.AddRange(VirtualMachine.RequireIterable(arguments[0]));
                     return PyNone.Instance;
                 });
 
             case "insert":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 2, static (self, arguments, _) =>
                 {
                     var items = ((PyList)self).Items;
                     var index = Int(arguments[0], "index");
@@ -516,7 +539,7 @@ public static class BuiltinMethods
                 });
 
             case "remove":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var items = ((PyList)self).Items;
                     var index = items.FindIndex(item => item.PyEquals(arguments[0]));
@@ -541,7 +564,7 @@ public static class BuiltinMethods
                 return Method(name, receiver, static (self, _, _) => new PyList([.. ((PyList)self).Items]));
 
             case "index":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var items = ((PyList)self).Items;
                     var index = items.FindIndex(item => item.PyEquals(arguments[0]));
@@ -552,7 +575,7 @@ public static class BuiltinMethods
                 });
 
             case "count":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                     new PyInt(((PyList)self).Items.Count(item => item.PyEquals(arguments[0]))));
 
             case "reverse":
@@ -584,7 +607,7 @@ public static class BuiltinMethods
         switch (name)
         {
             case "get":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                     ((PyDict)self).TryGetValue(arguments[0], out var value)
                         ? value
                         : arguments.Length > 1 ? arguments[1] : PyNone.Instance);
@@ -602,7 +625,7 @@ public static class BuiltinMethods
                     new PyList([.. ((PyDict)self).Entries.Select(static e => (PyObject)new PyTuple([e.Key, e.Value]))]));
 
             case "pop":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var dict = (PyDict)self;
 
@@ -634,7 +657,7 @@ public static class BuiltinMethods
                 });
 
             case "setdefault":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var dict = (PyDict)self;
 
@@ -706,21 +729,21 @@ public static class BuiltinMethods
         switch (name)
         {
             case "add":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     ((PySet)self).Add(arguments[0]);
                     return PyNone.Instance;
                 });
 
             case "discard":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     ((PySet)self).Remove(arguments[0]);
                     return PyNone.Instance;
                 });
 
             case "remove":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                     ((PySet)self).Remove(arguments[0])
                         ? PyNone.Instance
                         : throw new PyRaise(PyErrors.KeyError(arguments[0])));
@@ -780,7 +803,7 @@ public static class BuiltinMethods
                 });
 
             case "symmetric_difference":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var left = (PySet)self;
                     var right = new PySet(VirtualMachine.RequireIterable(arguments[0]));
@@ -790,21 +813,21 @@ public static class BuiltinMethods
                 });
 
             case "issubset":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var other = new PySet(VirtualMachine.RequireIterable(arguments[0]));
                     return PyBool.Of(((PySet)self).Items.All(other.Contains));
                 });
 
             case "issuperset":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var set = (PySet)self;
                     return PyBool.Of(VirtualMachine.RequireIterable(arguments[0]).All(set.Contains));
                 });
 
             case "isdisjoint":
-                return Method(name, receiver, static (self, arguments, _) =>
+                return Method(name, receiver, 1, static (self, arguments, _) =>
                 {
                     var set = (PySet)self;
                     return PyBool.Of(!VirtualMachine.RequireIterable(arguments[0]).Any(set.Contains));
@@ -850,10 +873,10 @@ public static class BuiltinMethods
 
     private static PyObject? BindTuple(PyObject receiver, string name) => name switch
     {
-        "count" => Method(name, receiver, static (self, arguments, _) =>
+        "count" => Method(name, receiver, 1, static (self, arguments, _) =>
             new PyInt(((PyTuple)self).Items.Count(item => item.PyEquals(arguments[0])))),
 
-        "index" => Method(name, receiver, static (self, arguments, _) =>
+        "index" => Method(name, receiver, 1, static (self, arguments, _) =>
         {
             var items = ((PyTuple)self).Items;
 

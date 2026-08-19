@@ -25,6 +25,17 @@ public sealed class MontyRunner
     /// <summary>Modules the host makes importable, by name.</summary>
     public Dictionary<string, PyObject> Modules { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Functions the host exposes to the sandbox, by name.
+    /// </summary>
+    /// <remarks>
+    /// This is the only route out. A script cannot open a file, read an environment
+    /// variable or make a request except through a function the host put here, which is
+    /// what makes the sandbox's outward surface a list the host wrote.
+    /// </remarks>
+    public Dictionary<string, Func<PyObject[], PyObject>> ExternalFunctions { get; } =
+        new(StringComparer.Ordinal);
+
     /// <summary>Runs <paramref name="source"/> and reports what happened.</summary>
     public RunResult Run(string source, string fileName = "<stdin>")
     {
@@ -41,9 +52,21 @@ public sealed class MontyRunner
             builtins.Set(key, value);
         }
 
+        foreach (var (name, module) in Monty.Modules.StandardLibrary.Create(machine))
+        {
+            machine.Modules[name] = module;
+        }
+
+        // Host-supplied modules override the standard set, so an embedder can substitute
+        // its own implementation of a name.
         foreach (var (name, module) in Modules)
         {
             machine.Modules[name] = module;
+        }
+
+        foreach (var (name, implementation) in ExternalFunctions)
+        {
+            globals.Set(new PyStr(name), new PyBuiltinFunction(name, implementation));
         }
 
         globals.Set(new PyStr("__name__"), new PyStr("__main__"));

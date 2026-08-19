@@ -244,7 +244,9 @@ public sealed class PyFloat : PyObject
 
     /// <inheritdoc />
     public override BigInteger PyHash() =>
-        double.IsInteger(Value) && Math.Abs(Value) < 1e18 ? new BigInteger(Value) : new BigInteger(Value.GetHashCode());
+        double.IsFinite(Value) && double.IsInteger(Value) && Math.Abs(Value) < 1e18
+            ? new BigInteger(Value)
+            : new BigInteger(Value.GetHashCode());
 
     /// <inheritdoc />
     public override int? PyCompare(PyObject other) => other switch

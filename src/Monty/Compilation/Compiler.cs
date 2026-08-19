@@ -243,6 +243,7 @@ public sealed class Compiler
 
         if (_nonlocalDeclarations.Contains(name))
         {
+            RegisterCellChain(name);
             return Binding.Cell;
         }
 
@@ -260,13 +261,49 @@ public sealed class Compiler
         // A name bound in an enclosing function is captured; otherwise it is a global.
         for (var scope = _parent; scope is not null; scope = scope._parent)
         {
-            if (scope._isFunctionScope && scope._locals.Contains(name))
+            if (!scope._isFunctionScope || !scope._locals.Contains(name))
             {
-                return Binding.Cell;
+                continue;
             }
+
+            RegisterCellChain(name);
+            return Binding.Cell;
         }
 
         return Binding.Global;
+    }
+
+    /// <summary>
+    /// Marks <paramref name="name"/> as a cell in every scope from the one that defines it
+    /// down to this one.
+    /// </summary>
+    /// <remarks>
+    /// Without this the defining scope would store only to its local slot, and the
+    /// capturing scope would read a cell nobody ever wrote. Registering the whole chain is
+    /// what makes the variable shared rather than copied.
+    /// </remarks>
+    private void RegisterCellChain(string name)
+    {
+        Compiler? definer = null;
+
+        for (var scope = _parent; scope is not null; scope = scope._parent)
+        {
+            if (scope._isFunctionScope && (scope._locals.Contains(name) || scope._code.CellNames.Contains(name)))
+            {
+                definer = scope;
+                break;
+            }
+        }
+
+        for (var link = this; link is not null; link = link._parent)
+        {
+            link.CellSlot(name);
+
+            if (ReferenceEquals(link, definer))
+            {
+                break;
+            }
+        }
     }
 
     private void EmitLoad(string name, int line)

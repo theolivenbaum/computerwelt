@@ -71,7 +71,19 @@ public sealed class ConformanceTests(ITestOutputHelper output)
 
         try
         {
-            result = new MontyRunner().Run(fixture.Source, fixture.Name);
+            var runner = new MontyRunner();
+
+            // Fixtures marked `# call-external` exercise the host boundary, and upstream's
+            // harness supplies the same named functions.
+            if (fixture.Source.Contains("# call-external", StringComparison.Ordinal))
+            {
+                foreach (var (name, implementation) in ExternalFunctions.Create())
+                {
+                    runner.ExternalFunctions[name] = implementation;
+                }
+            }
+
+            result = runner.Run(fixture.Source, fixture.Name);
         }
         catch (Exception e)
         {
@@ -127,7 +139,7 @@ public sealed class ConformanceTests(ITestOutputHelper output)
 
         if (Environment.GetEnvironmentVariable("MONTY_SHOW_FAILURES") == "1")
         {
-            foreach (var (name, reason) in failures.OrderBy(static f => f.Key, StringComparer.Ordinal).Take(40))
+            foreach (var (name, reason) in failures.OrderBy(static f => f.Key, StringComparer.Ordinal))
             {
                 output.WriteLine($"  {name}: {reason}");
             }

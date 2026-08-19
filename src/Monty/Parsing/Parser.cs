@@ -752,8 +752,17 @@ public sealed class Parser
         return At(new ClassDef(name, bases, ParseBlock(), decorators), token);
     }
 
+    /// <summary>
+    /// Parses a formal parameter list up to <paramref name="terminator"/>.
+    /// </summary>
+    /// <remarks>
+    /// A lambda's list ends at <c>:</c>, and a lambda parameter cannot be annotated — so
+    /// treating <c>:</c> as an annotation there would swallow the body.
+    /// </remarks>
     private ParameterList ParseParameterList(string terminator)
     {
+        var allowAnnotations = terminator != ":";
+
         var positional = new List<Parameter>();
         var keywordOnly = new List<Parameter>();
         string? varArgs = null;
@@ -801,7 +810,7 @@ public sealed class Parser
             }
 
             var name = Advance().Text;
-            var annotation = Match(":") ? ParseExpression() : null;
+            var annotation = allowAnnotations && Match(":") ? ParseExpression() : null;
             var defaultValue = Match("=") ? ParseExpression() : null;
 
             (afterStar ? keywordOnly : positional).Add(new Parameter(name, defaultValue, annotation));

@@ -41,6 +41,9 @@ public sealed class VirtualMachine
     /// <summary>The builtin namespace, searched after globals.</summary>
     public PyDict Builtins { get; }
 
+    /// <summary>The resource caps this machine enforces.</summary>
+    public ExecutionLimits Limits => _limits;
+
     /// <summary>Everything the program wrote to standard output.</summary>
     public string Stdout => _stdout.ToString();
 
@@ -82,6 +85,9 @@ public sealed class VirtualMachine
 
             case PyClass type:
                 return Instantiate(type, arguments, keywords);
+
+            case Modules.NamedTupleFactory factory:
+                return factory.Instantiate(arguments, keywords);
 
             case PyExceptionType exceptionType:
             {

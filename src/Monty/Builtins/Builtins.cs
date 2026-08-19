@@ -24,9 +24,31 @@ public static class BuiltinNamespace
         void DefinePositional(string name, Func<PyObject[], PyObject> implementation) =>
             builtins.Set(new PyStr(name), new PyBuiltinFunction(name, implementation));
 
+        // Builtins that dereference a fixed number of arguments declare it, so a missing
+        // one becomes a TypeError rather than a host index error escaping to the script.
+        void DefineArity(string name, int minimum, int maximum, Func<PyObject[], PyObject> implementation) =>
+            builtins.Set(new PyStr(name), new PyBuiltinFunction(name, arguments =>
+            {
+                if (arguments.Length < minimum || arguments.Length > maximum)
+                {
+                    throw new PyRaise(PyErrors.TypeError(minimum == maximum
+                        ? $"{name}() takes exactly {(minimum == 1 ? "one argument" : minimum + " arguments")} ({arguments.Length} given)"
+                        : arguments.Length < minimum
+                            ? $"{name} expected at least {minimum} argument{(minimum == 1 ? string.Empty : "s")}, got {arguments.Length}"
+                            : $"{name} expected at most {maximum} argument{(maximum == 1 ? string.Empty : "s")}, got {arguments.Length}"));
+                }
+
+                return implementation(arguments);
+            }));
+
         builtins.Set(new PyStr("None"), PyNone.Instance);
         builtins.Set(new PyStr("True"), PyBool.True);
         builtins.Set(new PyStr("False"), PyBool.False);
+        builtins.Set(new PyStr("Ellipsis"), PyEllipsis.Instance);
+
+        // Assertions are always enabled in the sandbox, so `__debug__` is always true.
+        builtins.Set(new PyStr("__debug__"), PyBool.True);
+        builtins.Set(new PyStr("NotImplemented"), NotImplementedSingleton.Instance);
 
         foreach (var (name, type) in PyExceptionType.Registry)
         {
@@ -41,11 +63,11 @@ public static class BuiltinNamespace
             return PyNone.Instance;
         });
 
-        DefinePositional("len", arguments =>
+        DefineArity("len", 1, 1, arguments =>
             new PyInt(arguments[0].Length()
                 ?? throw new PyRaise(PyErrors.TypeError($"object of type '{arguments[0].TypeName}' has no len()"))));
 
-        DefinePositional("repr", static arguments => new PyStr(arguments[0].Repr()));
+        DefineArity("repr", 1, 1, static arguments => new PyStr(arguments[0].Repr()));
 
         DefinePositional("str", static arguments =>
             new PyStr(arguments.Length == 0 ? string.Empty : arguments[0].Display()));
@@ -68,6 +90,13 @@ public static class BuiltinNamespace
 
         DefinePositional("frozenset", static arguments => new PySet(
             arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0])));
+
+        DefineArity("slice", 1, 3, static arguments => arguments.Length switch
+        {
+            1 => new PySlice(null, arguments[0], null),
+            2 => new PySlice(arguments[0], arguments[1], null),
+            _ => new PySlice(arguments[0], arguments[1], arguments[2]),
+        });
 
         Define("dict", static (arguments, keywords) =>
         {
@@ -103,7 +132,7 @@ public static class BuiltinNamespace
             return dict;
         });
 
-        DefinePositional("range", static arguments => arguments.Length switch
+        DefineArity("range", 1, 3, static arguments => arguments.Length switch
         {
             1 => new PyRange(0, RequireInt(arguments[0], "range"), 1),
             2 => new PyRange(RequireInt(arguments[0], "range"), RequireInt(arguments[1], "range"), 1),
@@ -111,7 +140,7 @@ public static class BuiltinNamespace
             _ => throw new PyRaise(PyErrors.TypeError($"range expected at most 3 arguments, got {arguments.Length}")),
         });
 
-        DefinePositional("enumerate", static arguments =>
+        DefineArity("enumerate", 1, 2, static arguments =>
         {
             var start = arguments.Length > 1 ? RequireInt(arguments[1], "enumerate") : BigInteger.Zero;
             var items = new List<PyObject>();
@@ -146,7 +175,7 @@ public static class BuiltinNamespace
             return new PyIterator(rows);
         });
 
-        DefinePositional("map", arguments =>
+        DefineArity("map", 2, int.MaxValue, arguments =>
         {
             var function = arguments[0];
             var sequences = arguments.Skip(1).Select(static a => VirtualMachine.RequireIterable(a).ToList()).ToList();
@@ -161,7 +190,7 @@ public static class BuiltinNamespace
             return new PyIterator(results);
         });
 
-        DefinePositional("filter", arguments =>
+        DefineArity("filter", 2, 2, arguments =>
         {
             var predicate = arguments[0];
             var results = new List<PyObject>();
@@ -181,16 +210,19 @@ public static class BuiltinNamespace
         });
 
         Define("sorted", (arguments, keywords) =>
-            new PyList(Sorting.Sort(machine, VirtualMachine.RequireIterable(arguments[0]), keywords)));
+        {
+            Arity.AtLeast("sorted", arguments, 1);
+            return new PyList(Sorting.Sort(machine, VirtualMachine.RequireIterable(arguments[0]), keywords));
+        });
 
-        DefinePositional("reversed", static arguments =>
+        DefineArity("reversed", 1, 1, static arguments =>
         {
             var items = VirtualMachine.RequireIterable(arguments[0]).ToList();
             items.Reverse();
             return new PyIterator(items);
         });
 
-        DefinePositional("sum", static arguments =>
+        DefineArity("sum", 1, 2, static arguments =>
         {
             PyObject total = arguments.Length > 1 ? arguments[1] : new PyInt(0);
 
@@ -205,20 +237,20 @@ public static class BuiltinNamespace
         Define("min", (arguments, keywords) => Extreme(machine, arguments, keywords, smallest: true));
         Define("max", (arguments, keywords) => Extreme(machine, arguments, keywords, smallest: false));
 
-        DefinePositional("abs", static arguments => arguments[0] switch
+        DefineArity("abs", 1, 1, static arguments => arguments[0] switch
         {
             PyInt integer => new PyInt(BigInteger.Abs(integer.Value)),
             PyFloat number => new PyFloat(Math.Abs(number.Value)),
             var other => throw new PyRaise(PyErrors.TypeError($"bad operand type for abs(): '{other.TypeName}'")),
         });
 
-        DefinePositional("all", static arguments =>
+        DefineArity("all", 1, 1, static arguments =>
             PyBool.Of(VirtualMachine.RequireIterable(arguments[0]).All(static item => item.IsTruthy())));
 
-        DefinePositional("any", static arguments =>
+        DefineArity("any", 1, 1, static arguments =>
             PyBool.Of(VirtualMachine.RequireIterable(arguments[0]).Any(static item => item.IsTruthy())));
 
-        DefinePositional("round", static arguments =>
+        DefineArity("round", 1, 2, static arguments =>
         {
             var digits = arguments.Length > 1 ? (int)RequireInt(arguments[1], "round") : 0;
 
@@ -235,27 +267,27 @@ public static class BuiltinNamespace
             };
         });
 
-        DefinePositional("divmod", static arguments => new PyTuple([
+        DefineArity("divmod", 2, 2, static arguments => new PyTuple([
             Operators.Binary("//", arguments[0], arguments[1]),
             Operators.Binary("%", arguments[0], arguments[1]),
         ]));
 
-        DefinePositional("pow", static arguments =>
+        DefineArity("pow", 2, 3, static arguments =>
         {
             var result = Operators.Binary("**", arguments[0], arguments[1]);
 
             return arguments.Length > 2 ? Operators.Binary("%", result, arguments[2]) : result;
         });
 
-        DefinePositional("hash", static arguments => new PyInt(arguments[0].PyHash()));
+        DefineArity("hash", 1, 1, static arguments => new PyInt(arguments[0].PyHash()));
 
-        DefinePositional("id", static arguments =>
+        DefineArity("id", 1, 1, static arguments =>
             new PyInt(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(arguments[0])));
 
-        DefinePositional("chr", static arguments =>
+        DefineArity("chr", 1, 1, static arguments =>
             new PyStr(char.ConvertFromUtf32((int)RequireInt(arguments[0], "chr"))));
 
-        DefinePositional("ord", static arguments =>
+        DefineArity("ord", 1, 1, static arguments =>
         {
             var text = arguments[0].Display();
 
@@ -265,28 +297,28 @@ public static class BuiltinNamespace
                     $"ord() expected a character, but string of length {text.Length} found"));
         });
 
-        DefinePositional("bin", static arguments =>
+        DefineArity("bin", 1, 1, static arguments =>
             Prefixed(RequireInt(arguments[0], "bin"), 2, "0b"));
 
-        DefinePositional("hex", static arguments =>
+        DefineArity("hex", 1, 1, static arguments =>
             Prefixed(RequireInt(arguments[0], "hex"), 16, "0x"));
 
-        DefinePositional("oct", static arguments =>
+        DefineArity("oct", 1, 1, static arguments =>
             Prefixed(RequireInt(arguments[0], "oct"), 8, "0o"));
 
-        DefinePositional("isinstance", static arguments => PyBool.Of(IsInstance(arguments[0], arguments[1])));
+        DefineArity("isinstance", 2, 2, static arguments => PyBool.Of(IsInstance(arguments[0], arguments[1])));
 
-        DefinePositional("issubclass", static arguments => PyBool.Of(
+        DefineArity("issubclass", 2, 2, static arguments => PyBool.Of(
             arguments[0] is PyExceptionType left && arguments[1] is PyExceptionType right && left.IsSubclassOf(right)));
 
-        DefinePositional("type", static arguments => new PyStr(arguments[0].TypeName));
+        DefineArity("type", 1, 1, static arguments => new PyStr(arguments[0].TypeName));
 
-        DefinePositional("iter", static arguments =>
+        DefineArity("iter", 1, 2, static arguments =>
             arguments[0] is PyIterator or PyGenerator
                 ? arguments[0]
                 : new PyIterator(VirtualMachine.RequireIterable(arguments[0])));
 
-        DefinePositional("next", static arguments =>
+        DefineArity("next", 1, 2, static arguments =>
         {
             var value = arguments[0] switch
             {
@@ -304,7 +336,7 @@ public static class BuiltinNamespace
             return arguments.Length > 1 ? arguments[1] : throw new PyRaise(PyErrors.StopIteration());
         });
 
-        DefinePositional("getattr", arguments =>
+        DefineArity("getattr", 2, 3, arguments =>
         {
             var value = Runtime.Attributes.TryGet(machine, arguments[0], arguments[1].Display());
 
@@ -318,7 +350,7 @@ public static class BuiltinNamespace
                 : throw new PyRaise(PyErrors.AttributeError(arguments[0].TypeName, arguments[1].Display()));
         });
 
-        DefinePositional("setattr", static arguments =>
+        DefineArity("setattr", 3, 3, static arguments =>
         {
             var name = arguments[1].Display();
 
@@ -327,12 +359,12 @@ public static class BuiltinNamespace
                 : throw new PyRaise(PyErrors.AttributeError(arguments[0].TypeName, name));
         });
 
-        DefinePositional("hasattr", arguments =>
+        DefineArity("hasattr", 2, 2, arguments =>
             PyBool.Of(Runtime.Attributes.TryGet(machine, arguments[0], arguments[1].Display()) is not null));
 
-        DefinePositional("callable", static arguments => PyBool.Of(arguments[0] is PyCallable or PyExceptionType));
+        DefineArity("callable", 1, 1, static arguments => PyBool.Of(arguments[0] is PyCallable or PyExceptionType));
 
-        DefinePositional("format", static arguments =>
+        DefineArity("format", 1, 2, static arguments =>
             new PyStr(StringFormatter.Format(arguments[0], arguments.Length > 1 ? arguments[1].Display() : string.Empty)));
 
         return builtins;
@@ -411,6 +443,8 @@ public static class BuiltinNamespace
             "set" or "frozenset" => value is PySet,
             "bytes" => value is PyBytes,
             "range" => value is PyRange,
+            "slice" => value is PySlice,
+            "object" => true,
             _ => false,
         };
     }
@@ -428,6 +462,22 @@ public static class BuiltinNamespace
         _ => throw new PyRaise(PyErrors.TypeError(
             $"'{value.TypeName}' object cannot be interpreted as an integer")),
     };
+}
+
+/// <summary>The <c>NotImplemented</c> singleton returned by unsupported dunder operations.</summary>
+internal sealed class NotImplementedSingleton : PyObject
+{
+    private NotImplementedSingleton()
+    {
+    }
+
+    public static NotImplementedSingleton Instance { get; } = new();
+
+    public override string TypeName => "NotImplementedType";
+
+    public override string Repr() => "NotImplemented";
+
+    public override bool PyEquals(PyObject other) => other is NotImplementedSingleton;
 }
 
 /// <summary>Exposes the radix formatter without widening its visibility further.</summary>

@@ -167,11 +167,19 @@ public static class Operators
             return useFloat ? new PyFloat(a * b) : new PyInt(AsInt(left) * AsInt(right));
         }
 
-        // Sequence repetition: `'ab' * 3`, `[0] * 4`.
-        var (sequence, count) = left is PyInt ? (right, AsInt(left)) : (left, right is PyInt ? AsInt(right) : BigInteger.MinusOne);
+        // Sequence repetition: `'ab' * 3`, `[0] * 4`. A negative count yields empty.
+        var (sequence, count) = left is PyInt
+            ? (right, BigInteger.Max(0, AsInt(left)))
+            : (left, right is PyInt ? BigInteger.Max(0, AsInt(right)) : BigInteger.MinusOne);
 
         if (count >= 0)
         {
+            if (count > 100_000_000)
+            {
+                throw new PyRaise(new PyException(
+                    PyExceptionType.OverflowError, "cannot fit 'int' into an index-sized integer"));
+            }
+
             var repeats = (int)BigInteger.Max(0, count);
 
             switch (sequence)
