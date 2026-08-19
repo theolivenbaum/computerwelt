@@ -18,7 +18,12 @@ Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-
 **Current state — shell:** solution builds clean, 151 unit tests green,
 **1,694 / 2,521 conformance cases passing (67.2 %)**.
 
-**Current state — python:** not started. Corpus vendored, no code yet.
+**Current state — python:** tokenizer, parser, bytecode compiler, VM, core types and
+builtins are in place. **304 / 558 fixtures passing (54.5 %)** on the first pass.
+
+Largest remaining gaps: 65 fixtures need stdlib modules, 45 hit missing names, 32 are real
+semantic differences, 17 are parser gaps, and 26 are outright interpreter bugs (host
+exceptions escaping as `OverflowException` / `IndexOutOfRangeException`).
 
 | suite | passing |
 |---|---|
@@ -258,40 +263,44 @@ shortcut would foreclose them.
 
 - [x] Vendor upstream into `.reference/monty/` (CI/CD stripped)
 - [x] Copy the 568-fixture corpus into `tests/monty-spec/`
-- [ ] `src/Monty/Monty.csproj` and `tests/Monty.SpecTests/`
-- [ ] Fixture parser: `assert`-only cases, `# Raise=`, `TRACEBACK:`, `# xfail=` directives
-- [ ] Ratchet runner + `tests/monty-spec/baseline.json`
+- [x] `src/Monty/`, `src/Monty.Cli/` and `tests/Monty.SpecTests/`
+- [x] Fixture parser: `assert`-only cases, `# Raise=`, `TRACEBACK:`, `# xfail=` directives
+- [x] Ratchet runner + `tests/monty-spec/baseline.json`
 
 ## Phase 12 — Front end  (`src/Monty/Parsing/`)
 
 Upstream: `parse.rs`, `expressions.rs`, `fstring.rs`, `source_map.rs`
 
-- [ ] Tokenizer: significant indentation, implicit line joining, string prefixes
+- [x] Tokenizer: significant indentation, implicit line joining, string prefixes
       (`r`, `b`, `f`, `rb`), numeric literals
-- [ ] Expression grammar with Python's precedence, comparison chaining, walrus,
+- [x] Expression grammar with Python's precedence, comparison chaining, walrus,
       conditional expressions, lambdas, starred and keyword arguments
-- [ ] Statement grammar: assignment and augmented assignment, `if`/`elif`/`else`,
+- [x] Statement grammar: assignment and augmented assignment, `if`/`elif`/`else`,
       `while`, `for`/`else`, `try`/`except`/`else`/`finally`, `with`, `def`, `class`,
       `import`, `global`/`nonlocal`, `assert`, `del`, `raise`, `return`, `yield`
-- [ ] Comprehensions (list, set, dict, generator) with their own scope
-- [ ] f-strings: nested expressions, `!r`/`!s`/`!a`, format specs, `=` debug form
-- [ ] Type annotations parsed and retained (Monty accepts modern hints)
-- [ ] Source spans on every node — tracebacks quote the offending line
+- [x] Comprehensions (list, set, dict, generator) with their own scope
+- [x] f-strings: nested expressions, `!r`/`!s`/`!a`, format specs, `=` debug form
+- [x] Type annotations parsed (and, as Monty does at runtime, ignored)
+- [x] Source line and column on every node
+- [ ] Remaining parser gaps — 17 fixtures still fail to parse
 - [ ] Parse-error messages matching CPython's, since fixtures compare them
+- [ ] `match` statements — an upstream limitation, tracked but not required
 
 ## Phase 13 — Compiler  (`src/Monty/Compilation/`)
 
 Upstream: `bytecode/` (620 KB — the largest single area)
 
-- [ ] Instruction set and the encoded chunk format
-- [ ] Scope resolution: locals, cells, frees, globals, `global`/`nonlocal`
-- [ ] Expression and statement lowering
-- [ ] Control-flow lowering: loops with `break`/`continue`/`else`, exception blocks,
+- [x] Instruction set (60 opcodes) and the `CodeObject` container
+- [x] Scope resolution: locals, cells, globals, `global`/`nonlocal`, with the pre-pass
+      that makes a name local throughout a function that assigns it anywhere
+- [x] Expression and statement lowering
+- [x] Control-flow lowering: loops with `break`/`continue`/`else`, exception blocks,
       `with` and its cleanup paths
-- [ ] Function objects: defaults, `*args`/`**kwargs`, keyword-only, closures
-- [ ] Class bodies as functions producing a namespace
-- [ ] Comprehension lowering into implicit functions
-- [ ] Generators and coroutines as resumable frames
+- [x] Function objects: defaults, `*args`/`**kwargs`, keyword-only, closures, decorators
+- [x] Class bodies as functions producing a namespace
+- [x] Comprehension lowering into implicit functions
+- [~] Generators lower to `Yield`/`YieldFrom`; coroutines do not
+- [ ] Non-constant default values (currently rejected at compile time)
 - [ ] Constant folding and the peepholes upstream applies
 - [ ] Compile-time limits: bytecode size, constant count, nesting depth
 
@@ -299,39 +308,46 @@ Upstream: `bytecode/` (620 KB — the largest single area)
 
 Upstream: `run.rs`, `function.rs`, `heap/`, `heap_data.rs`, `resource_checks.rs`
 
-- [ ] The interpreter loop and its frame stack
-- [ ] Object heap with reference counting plus cycle collection
-- [ ] Exception raising, propagation, chaining (`__context__`, `__cause__`) and
-      traceback construction with source lines
-- [ ] `try`/`except`/`finally` unwinding, including `finally` over `return`
-- [ ] Generators, `yield from`, and the `asyncio` event loop upstream provides
-- [ ] Iterator protocol, context-manager protocol, descriptor basics
-- [ ] Resource limits: memory, stack depth, instruction count, wall clock — enforced
-      inside the loop, as the shell's budget is
-- [ ] `print` capture into stdout/stderr buffers rather than a real console
+- [x] The interpreter loop, its frame stack and its block stack
+- [x] Exception raising, propagation, chaining (`__context__`, `__cause__`) and
+      traceback construction
+- [x] `try`/`except`/`finally` unwinding
+- [x] Iterator protocol and context-manager protocol
+- [x] `print` capture into stdout/stderr buffers rather than a real console
+- [~] Resource limits: instruction count and recursion depth enforced; memory and wall
+      clock are not
+- [~] Generators run on a second, suspendable loop, so a generator holds a live
+      enumerator rather than a serializable frame — this is what blocks snapshotting
+- [ ] `yield`'s value being sent back in (`gen.send`)
+- [ ] `asyncio` and real coroutines
+- [ ] Object heap with cycle collection (currently the .NET GC)
+- [ ] Tracebacks quoting the offending source line
 
 ## Phase 15 — Types and builtins  (`src/Monty/Types/`, `src/Monty/Builtins/`)
 
 Upstream: `types/` (1.1 MB), `builtins/` (188 KB)
 
-- [ ] `int` (arbitrary precision), `float`, `bool`, `complex`, `NoneType`
-- [ ] `str` with the full method set and `%`/`format` machinery
-- [ ] `bytes`, `bytearray`, `memoryview`
-- [ ] `list`, `tuple`, `dict` (insertion-ordered), `set`, `frozenset`, `range`, `slice`
-- [ ] User-defined classes — plain classes only; inheritance and metaclasses are
+- [x] `int` (arbitrary precision), `float`, `bool`, `NoneType`, `Ellipsis`
+- [x] `str` with 40 methods, plus the `%` and format mini-languages
+- [x] `bytes`, `list`, `tuple`, `dict` (insertion-ordered), `set`, `range`, `slice`
+- [x] User-defined classes — plain classes only; inheritance and metaclasses are
       upstream limitations, not oversights
-- [ ] Exception hierarchy with CPython's message wording
-- [ ] Builtins: `len` `range` `print` `sorted` `enumerate` `zip` `map` `filter` `sum`
+- [x] Exception hierarchy with CPython's message wording
+- [ ] `complex`, `bytearray`, `memoryview`, `frozenset` as a distinct type
+- [ ] Dunder protocol dispatch on user classes (`__eq__`, `__len__`, `__iter__`, …)
+- [x] Builtins: `len` `range` `print` `sorted` `enumerate` `zip` `map` `filter` `sum`
       `min` `max` `abs` `all` `any` `repr` `str` `int` `float` `bool` `list` `dict`
-      `set` `tuple` `isinstance` `type` `getattr` `setattr` `hasattr` `iter` `next`
-      `reversed` `round` `divmod` `pow` `hash` `id` `chr` `ord` `bin` `hex` `oct`
-- [ ] Rich comparison, arithmetic and in-place dunder dispatch
+      `set` `tuple` `isinstance` `issubclass` `type` `getattr` `setattr` `hasattr`
+      `callable` `iter` `next` `reversed` `round` `divmod` `pow` `hash` `id` `chr`
+      `ord` `bin` `hex` `oct` `format` `bytes` `frozenset`
+- [x] Arithmetic with Python's semantics: floor division toward negative infinity,
+      modulo taking the divisor's sign, `**` promoting to float on a negative exponent
 
 ## Phase 16 — Standard library subset  (`src/Monty/Modules/`)
 
 Upstream: `modules/` — the permitted set and nothing more.
 
-- [ ] `math`, `json`, `re`, `datetime`
+- [ ] `math`, `json`, `re`, `datetime` — 65 fixtures blocked on these
 - [ ] `collections` (`deque`, `Counter`, `defaultdict`, `namedtuple`, `OrderedDict`)
 - [ ] `itertools`, `dataclasses`, `typing`
 - [ ] `os` and `pathlib` — routed through this repo's `IFileSystem`, so Python and bash
@@ -342,10 +358,11 @@ Upstream: `modules/` — the permitted set and nothing more.
 
 Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.rs`
 
+- [x] `ExecutionLimits` and the `MontyRunner` facade
+- [x] `Monty.Cli` — run a script or `-c` source
 - [ ] Host object model: converting between .NET values and Monty objects
 - [ ] External functions — the only route to anything outside the sandbox, mirroring how
       Monty blocks filesystem, environment and network by default
 - [ ] Snapshot and resume at an external-call boundary
-- [ ] `PythonLimits` and a `MontyRunner` facade
 - [ ] Wire the `python` builtin into the shell, sharing the VFS, the budget and the
       output buffers — the payoff for porting both halves

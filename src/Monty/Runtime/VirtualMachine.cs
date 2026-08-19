@@ -1,0 +1,1197 @@
+using System.Numerics;
+using System.Text;
+using Monty.Compilation;
+
+namespace Monty.Runtime;
+
+/// <summary>
+/// The bytecode interpreter.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A stack machine with a separate block stack for <c>try</c>, <c>finally</c> and context
+/// managers. Python exceptions travel as <see cref="PyRaise"/>, so a raise inside a nested
+/// C# call — an operator, a builtin, a comparison — unwinds to the enclosing frame's
+/// handler without any explicit error propagation in the loop.
+/// </para>
+/// <para>
+/// Resource limits are charged inside the loop rather than checked around it: a script that
+/// spins in a tight loop must still terminate.
+/// </para>
+/// </remarks>
+public sealed class VirtualMachine
+{
+    private readonly ExecutionLimits _limits;
+    private readonly StringBuilder _stdout = new();
+    private readonly StringBuilder _stderr = new();
+    private long _instructionCount;
+    private int _depth;
+
+    /// <summary>Creates a machine with the given limits and module globals.</summary>
+    public VirtualMachine(PyDict globals, PyDict builtins, ExecutionLimits? limits = null)
+    {
+        Globals = globals;
+        Builtins = builtins;
+        _limits = limits ?? ExecutionLimits.Default;
+    }
+
+    /// <summary>The module namespace.</summary>
+    public PyDict Globals { get; }
+
+    /// <summary>The builtin namespace, searched after globals.</summary>
+    public PyDict Builtins { get; }
+
+    /// <summary>Everything the program wrote to standard output.</summary>
+    public string Stdout => _stdout.ToString();
+
+    /// <summary>Everything the program wrote to standard error.</summary>
+    public string Stderr => _stderr.ToString();
+
+    /// <summary>Modules the host has made importable.</summary>
+    public Dictionary<string, PyObject> Modules { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Frames currently executing, innermost last. Used to build tracebacks.</summary>
+    internal List<Frame> CallStack { get; } = [];
+
+    /// <summary>Writes to the captured standard output.</summary>
+    public void Write(string text) => _stdout.Append(text);
+
+    /// <summary>Writes to the captured standard error.</summary>
+    public void WriteError(string text) => _stderr.Append(text);
+
+    /// <summary>Runs a module's code object.</summary>
+    public PyObject RunModule(CodeObject code)
+    {
+        var frame = new Frame(code, Globals, [], []);
+        return Execute(frame);
+    }
+
+    /// <summary>Calls any callable with positional and keyword arguments.</summary>
+    public PyObject Call(PyObject callable, PyObject[] arguments, PyDict? keywords = null)
+    {
+        switch (callable)
+        {
+            case PyBuiltinFunction builtin:
+                return builtin.Invoke(arguments, keywords);
+
+            case PyBoundMethod method:
+                return method.Invoke(arguments, keywords);
+
+            case PyFunction function:
+                return CallFunction(function, arguments, keywords);
+
+            case PyClass type:
+                return Instantiate(type, arguments, keywords);
+
+            case PyExceptionType exceptionType:
+            {
+                var message = arguments.Length > 0 ? arguments[0].Display() : string.Empty;
+                return new PyException(exceptionType, message, arguments);
+            }
+
+            default:
+                throw new PyRaise(PyErrors.TypeError($"'{callable.TypeName}' object is not callable"));
+        }
+    }
+
+    private PyObject Instantiate(PyClass type, PyObject[] arguments, PyDict? keywords)
+    {
+        var instance = new PyInstance(type);
+
+        if (type.GetAttribute("__init__") is PyFunction initializer)
+        {
+            CallFunction(initializer.Bind(instance), arguments, keywords);
+        }
+        else if (arguments.Length > 0)
+        {
+            throw new PyRaise(PyErrors.TypeError($"{type.Name}() takes no arguments"));
+        }
+
+        return instance;
+    }
+
+    private PyObject CallFunction(PyFunction function, PyObject[] arguments, PyDict? keywords)
+    {
+        if (++_depth > _limits.MaxRecursionDepth)
+        {
+            _depth--;
+            throw new PyRaise(new PyException(
+                PyExceptionType.RecursionError, "maximum recursion depth exceeded"));
+        }
+
+        try
+        {
+            var locals = BindArguments(function, arguments, keywords);
+            var cells = BuildCells(function, locals);
+            var frame = new Frame(function.Code, function.Globals, locals, cells);
+
+            if (function.Code.IsGenerator)
+            {
+                // A generator call runs nothing yet; it materializes lazily on iteration.
+                return new PyGenerator(this, frame);
+            }
+
+            return Execute(frame);
+        }
+        finally
+        {
+            _depth--;
+        }
+    }
+
+    private Dictionary<string, PyCell> BuildCells(PyFunction function, PyObject?[] locals)
+    {
+        var cells = new Dictionary<string, PyCell>(function.Closure, StringComparer.Ordinal);
+
+        // A local this function's body reads through a cell must be shared, not copied,
+        // so nested closures observe later assignments.
+        foreach (var name in function.Code.CellNames)
+        {
+            if (cells.ContainsKey(name))
+            {
+                continue;
+            }
+
+            var cell = new PyCell();
+            var slot = function.Code.LocalNames.IndexOf(name);
+
+            if (slot >= 0 && slot < locals.Length)
+            {
+                cell.Value = locals[slot];
+            }
+
+            cells[name] = cell;
+        }
+
+        return cells;
+    }
+
+    /// <summary>Binds call arguments to parameter slots, applying defaults and packing varargs.</summary>
+    private PyObject?[] BindArguments(PyFunction function, PyObject[] arguments, PyDict? keywords)
+    {
+        var code = function.Code;
+        var parameters = code.Parameters;
+        var locals = new PyObject?[Math.Max(code.LocalNames.Count, 1)];
+
+        var positional = new List<PyObject>(arguments);
+
+        if (function.BoundSelf is { } instance)
+        {
+            positional.Insert(0, instance);
+        }
+
+        var bound = new HashSet<string>(StringComparer.Ordinal);
+        var declared = parameters.Parameters;
+
+        var supplied = Math.Min(positional.Count, declared.Count);
+
+        for (var i = 0; i < supplied; i++)
+        {
+            locals[code.LocalNames.IndexOf(declared[i].Name)] = positional[i];
+            bound.Add(declared[i].Name);
+        }
+
+        var extra = positional.Skip(declared.Count).ToList();
+
+        if (parameters.VarArgs is { } varArgs)
+        {
+            locals[code.LocalNames.IndexOf(varArgs)] = new PyTuple(extra);
+        }
+        else if (extra.Count > 0)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{code.Name}() takes {declared.Count} positional arguments but {positional.Count} were given"));
+        }
+
+        var leftoverKeywords = new PyDict();
+
+        if (keywords is not null)
+        {
+            foreach (var (key, value) in keywords.Entries)
+            {
+                var name = key.Display();
+                var slot = code.LocalNames.IndexOf(name);
+                var isParameter = declared.Any(p => p.Name == name) || parameters.KeywordOnly.Any(p => p.Name == name);
+
+                if (isParameter && slot >= 0)
+                {
+                    if (!bound.Add(name))
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            $"{code.Name}() got multiple values for argument '{name}'"));
+                    }
+
+                    locals[slot] = value;
+                    continue;
+                }
+
+                if (parameters.KeywordArgs is null)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"{code.Name}() got an unexpected keyword argument '{name}'"));
+                }
+
+                leftoverKeywords.Set(key, value);
+            }
+        }
+
+        if (parameters.KeywordArgs is { } keywordArgs)
+        {
+            locals[code.LocalNames.IndexOf(keywordArgs)] = leftoverKeywords;
+        }
+
+        foreach (var parameter in declared.Concat(parameters.KeywordOnly))
+        {
+            if (bound.Contains(parameter.Name))
+            {
+                continue;
+            }
+
+            var slot = code.LocalNames.IndexOf(parameter.Name);
+
+            if (code.Defaults.TryGetValue(parameter.Name, out var defaultValue))
+            {
+                locals[slot] = defaultValue;
+                continue;
+            }
+
+            throw new PyRaise(PyErrors.TypeError(
+                $"{code.Name}() missing 1 required positional argument: '{parameter.Name}'"));
+        }
+
+        return locals;
+    }
+
+    /// <summary>One activation record.</summary>
+    internal sealed class Frame
+    {
+        public Frame(CodeObject code, PyDict globals, PyObject?[] locals, Dictionary<string, PyCell> cells)
+        {
+            Code = code;
+            Globals = globals;
+            Locals = locals.Length >= code.LocalNames.Count
+                ? locals
+                : [.. locals, .. new PyObject?[code.LocalNames.Count - locals.Length]];
+            Cells = cells;
+        }
+
+        public CodeObject Code { get; }
+
+        public PyDict Globals { get; }
+
+        public PyObject?[] Locals { get; }
+
+        public Dictionary<string, PyCell> Cells { get; }
+
+        public List<PyObject> Stack { get; } = [];
+
+        public List<Block> Blocks { get; } = [];
+
+        public int InstructionPointer { get; set; }
+
+        public PyException? CurrentException { get; set; }
+
+        public int CurrentLine { get; set; }
+
+        public void Push(PyObject value) => Stack.Add(value);
+
+        public PyObject Pop()
+        {
+            var value = Stack[^1];
+            Stack.RemoveAt(Stack.Count - 1);
+            return value;
+        }
+
+        public PyObject Peek(int depth = 0) => Stack[^(depth + 1)];
+    }
+
+    /// <summary>An entry on the block stack.</summary>
+    internal readonly record struct Block(BlockKind Kind, int Handler, int StackDepth);
+
+    /// <summary>What a block protects.</summary>
+    internal enum BlockKind
+    {
+        Except,
+        Finally,
+        With,
+    }
+
+    /// <summary>A control transfer that is not an exception: a return out of a frame.</summary>
+    private sealed class ReturnSignal(PyObject value) : Exception
+    {
+        public PyObject Value { get; } = value;
+    }
+
+    /// <summary>
+    /// Runs a frame until it reaches a <c>yield</c> or finishes. Returns true when a yield
+    /// was reached, leaving the frame suspended for the generator to resume.
+    /// </summary>
+    internal bool RunUntilYield(Frame frame)
+    {
+        while (frame.InstructionPointer < frame.Code.Instructions.Count)
+        {
+            var instruction = frame.Code.Instructions[frame.InstructionPointer];
+
+            if (instruction.OpCode is OpCode.Yield or OpCode.YieldFrom)
+            {
+                return true;
+            }
+
+            frame.InstructionPointer++;
+            frame.CurrentLine = instruction.Line;
+
+            if (++_instructionCount > _limits.MaxInstructions)
+            {
+                throw new PyRaise(PyErrors.RuntimeError("instruction limit exceeded"));
+            }
+
+            try
+            {
+                if (Step(frame, instruction, out _))
+                {
+                    return false;
+                }
+            }
+            catch (PyRaise raise)
+            {
+                if (!Unwind(frame, raise.Exception))
+                {
+                    RecordTraceback(raise.Exception, frame);
+                    throw;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Runs a frame to completion and returns its result.</summary>
+    internal PyObject Execute(Frame frame)
+    {
+        CallStack.Add(frame);
+
+        try
+        {
+            while (true)
+            {
+                if (frame.InstructionPointer >= frame.Code.Instructions.Count)
+                {
+                    return PyNone.Instance;
+                }
+
+                if (++_instructionCount > _limits.MaxInstructions)
+                {
+                    throw new PyRaise(PyErrors.RuntimeError("instruction limit exceeded"));
+                }
+
+                var instruction = frame.Code.Instructions[frame.InstructionPointer++];
+                frame.CurrentLine = instruction.Line;
+
+                try
+                {
+                    if (Step(frame, instruction, out var result))
+                    {
+                        return result;
+                    }
+                }
+                catch (PyRaise raise)
+                {
+                    if (!Unwind(frame, raise.Exception))
+                    {
+                        RecordTraceback(raise.Exception, frame);
+                        throw;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            CallStack.RemoveAt(CallStack.Count - 1);
+        }
+    }
+
+    private void RecordTraceback(PyException exception, Frame frame) =>
+        exception.Traceback.Insert(0, new TracebackFrame(frame.Code.Name, frame.CurrentLine, null));
+
+    /// <summary>
+    /// Finds a handler for <paramref name="exception"/> in the frame's block stack and
+    /// transfers control to it. Returns false when the frame has no handler.
+    /// </summary>
+    private static bool Unwind(Frame frame, PyException exception)
+    {
+        while (frame.Blocks.Count > 0)
+        {
+            var block = frame.Blocks[^1];
+            frame.Blocks.RemoveAt(frame.Blocks.Count - 1);
+
+            if (block.Kind == BlockKind.With)
+            {
+                // The context manager's exit is on the stack; drop it and keep unwinding.
+                if (frame.Stack.Count > block.StackDepth)
+                {
+                    frame.Stack.RemoveRange(block.StackDepth, frame.Stack.Count - block.StackDepth);
+                }
+
+                continue;
+            }
+
+            if (frame.Stack.Count > block.StackDepth)
+            {
+                frame.Stack.RemoveRange(block.StackDepth, frame.Stack.Count - block.StackDepth);
+            }
+
+            // An exception raised while handling another records the first as its context.
+            if (frame.CurrentException is { } previous && !ReferenceEquals(previous, exception))
+            {
+                exception.Context ??= previous;
+            }
+
+            frame.CurrentException = exception;
+            frame.InstructionPointer = block.Handler;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Executes one instruction. Returns true when the frame is finished, with
+    /// <paramref name="result"/> set to its return value.
+    /// </summary>
+    private bool Step(Frame frame, Instruction instruction, out PyObject result)
+    {
+        result = PyNone.Instance;
+        var code = frame.Code;
+
+        switch (instruction.OpCode)
+        {
+            case OpCode.Nop:
+                return false;
+
+            case OpCode.LoadConst:
+                frame.Push(code.Constants[instruction.Operand]);
+                return false;
+
+            case OpCode.LoadLocal:
+            {
+                var value = frame.Locals[instruction.Operand];
+
+                if (value is null)
+                {
+                    // A cell may hold it when the name is also captured by a closure.
+                    var name = code.LocalNames[instruction.Operand];
+
+                    if (frame.Cells.TryGetValue(name, out var cell) && cell.Value is { } cellValue)
+                    {
+                        frame.Push(cellValue);
+                        return false;
+                    }
+
+                    throw new PyRaise(PyErrors.UnboundLocalError(name));
+                }
+
+                frame.Push(value);
+                return false;
+            }
+
+            case OpCode.StoreLocal:
+            {
+                var value = frame.Pop();
+                frame.Locals[instruction.Operand] = value;
+
+                // Keep a captured local's cell in step, so closures see the new value.
+                var name = code.LocalNames[instruction.Operand];
+                if (frame.Cells.TryGetValue(name, out var cell))
+                {
+                    cell.Value = value;
+                }
+
+                return false;
+            }
+
+            case OpCode.DeleteLocal:
+                frame.Locals[instruction.Operand] = null;
+                return false;
+
+            case OpCode.LoadGlobal:
+            {
+                var name = code.Names[instruction.Operand];
+                var key = new PyStr(name);
+
+                if (frame.Globals.TryGetValue(key, out var value))
+                {
+                    frame.Push(value);
+                    return false;
+                }
+
+                if (Builtins.TryGetValue(key, out var builtin))
+                {
+                    frame.Push(builtin);
+                    return false;
+                }
+
+                throw new PyRaise(PyErrors.NameError(name));
+            }
+
+            case OpCode.StoreGlobal:
+                frame.Globals.Set(new PyStr(code.Names[instruction.Operand]), frame.Pop());
+                return false;
+
+            case OpCode.DeleteGlobal:
+                if (!frame.Globals.Remove(new PyStr(code.Names[instruction.Operand])))
+                {
+                    throw new PyRaise(PyErrors.NameError(code.Names[instruction.Operand]));
+                }
+
+                return false;
+
+            case OpCode.LoadCell:
+            {
+                var name = code.CellNames[instruction.Operand];
+
+                if (!frame.Cells.TryGetValue(name, out var cell) || cell.Value is null)
+                {
+                    throw new PyRaise(PyErrors.UnboundLocalError(name));
+                }
+
+                frame.Push(cell.Value);
+                return false;
+            }
+
+            case OpCode.StoreCell:
+            {
+                var name = code.CellNames[instruction.Operand];
+
+                if (!frame.Cells.TryGetValue(name, out var cell))
+                {
+                    cell = new PyCell();
+                    frame.Cells[name] = cell;
+                }
+
+                cell.Value = frame.Pop();
+                return false;
+            }
+
+            case OpCode.LoadAttr:
+            {
+                var target = frame.Pop();
+                var name = code.Names[instruction.Operand];
+                frame.Push(Attributes.Get(this, target, name));
+                return false;
+            }
+
+            case OpCode.StoreAttr:
+            {
+                var target = frame.Pop();
+                var value = frame.Pop();
+                var name = code.Names[instruction.Operand];
+
+                if (!target.SetAttribute(name, value))
+                {
+                    throw new PyRaise(PyErrors.AttributeError(target.TypeName, name));
+                }
+
+                return false;
+            }
+
+            case OpCode.LoadSubscript:
+            {
+                var index = frame.Pop();
+                var target = frame.Pop();
+                frame.Push(target.GetItem(index));
+                return false;
+            }
+
+            case OpCode.StoreSubscript:
+            {
+                var index = frame.Pop();
+                var target = frame.Pop();
+                var value = frame.Pop();
+                target.SetItem(index, value);
+                return false;
+            }
+
+            case OpCode.DeleteSubscript:
+            {
+                var index = frame.Pop();
+                frame.Pop().DeleteItem(index);
+                return false;
+            }
+
+            case OpCode.BinaryOp:
+            {
+                var right = frame.Pop();
+                var left = frame.Pop();
+                frame.Push(Operators.Binary(code.Names[instruction.Operand], left, right));
+                return false;
+            }
+
+            case OpCode.UnaryOp:
+                frame.Push(Operators.Unary(code.Names[instruction.Operand], frame.Pop()));
+                return false;
+
+            case OpCode.CompareOp:
+            {
+                var right = frame.Pop();
+                var left = frame.Pop();
+                frame.Push(Operators.Compare(code.Names[instruction.Operand], left, right));
+                return false;
+            }
+
+            case OpCode.BuildList:
+                frame.Push(new PyList(PopMany(frame, instruction.Operand)));
+                return false;
+
+            case OpCode.BuildTuple:
+            {
+                // A -1 operand means "convert the list on top", used after unpacking.
+                if (instruction.Operand < 0)
+                {
+                    var list = (PyList)frame.Pop();
+                    frame.Push(new PyTuple(list.Items));
+                    return false;
+                }
+
+                frame.Push(new PyTuple(PopMany(frame, instruction.Operand)));
+                return false;
+            }
+
+            case OpCode.BuildSet:
+                frame.Push(new PySet(PopMany(frame, instruction.Operand)));
+                return false;
+
+            case OpCode.BuildMap:
+            {
+                var pairs = PopMany(frame, instruction.Operand * 2);
+                var dict = new PyDict();
+
+                for (var i = 0; i < pairs.Count; i += 2)
+                {
+                    dict.Set(pairs[i], pairs[i + 1]);
+                }
+
+                frame.Push(dict);
+                return false;
+            }
+
+            case OpCode.BuildSlice:
+            {
+                var step = frame.Pop();
+                var stop = frame.Pop();
+                var start = frame.Pop();
+                frame.Push(new PySlice(start, stop, step));
+                return false;
+            }
+
+            case OpCode.BuildString:
+            {
+                var pieces = PopMany(frame, instruction.Operand);
+                var builder = new StringBuilder();
+
+                foreach (var piece in pieces)
+                {
+                    builder.Append(piece.Display());
+                }
+
+                frame.Push(new PyStr(builder.ToString()));
+                return false;
+            }
+
+            case OpCode.FormatValue:
+            {
+                var spec = frame.Pop();
+                var value = frame.Pop();
+
+                var converted = (char)instruction.Operand switch
+                {
+                    'r' => new PyStr(value.Repr()),
+                    's' => new PyStr(value.Display()),
+                    'a' => new PyStr(value.Repr()),
+                    _ => value,
+                };
+
+                var specText = spec is PyNone ? string.Empty : spec.Display();
+                frame.Push(new PyStr(StringFormatter.Format(converted, specText)));
+                return false;
+            }
+
+            case OpCode.ListAppend:
+            {
+                var value = frame.Pop();
+                ((PyList)frame.Peek(instruction.Operand - 1)).Items.Add(value);
+                return false;
+            }
+
+            case OpCode.ListExtend:
+            {
+                var iterable = frame.Pop();
+                var target = (PyList)frame.Peek(instruction.Operand - 1);
+                target.Items.AddRange(RequireIterable(iterable));
+                return false;
+            }
+
+            case OpCode.SetAdd:
+            {
+                var value = frame.Pop();
+                ((PySet)frame.Peek(instruction.Operand - 1)).Add(value);
+                return false;
+            }
+
+            case OpCode.SetUpdate:
+            {
+                var iterable = frame.Pop();
+                var target = (PySet)frame.Peek(instruction.Operand - 1);
+
+                foreach (var item in RequireIterable(iterable))
+                {
+                    target.Add(item);
+                }
+
+                return false;
+            }
+
+            case OpCode.MapPut:
+            {
+                var value = frame.Pop();
+                var key = frame.Pop();
+                ((PyDict)frame.Peek(instruction.Operand - 2)).Set(key, value);
+                return false;
+            }
+
+            case OpCode.MapUpdate:
+            {
+                var mapping = frame.Pop();
+                var target = (PyDict)frame.Peek(instruction.Operand - 1);
+
+                if (mapping is not PyDict source)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"argument after ** must be a mapping, not {mapping.TypeName}"));
+                }
+
+                foreach (var (key, value) in source.Entries)
+                {
+                    target.Set(key, value);
+                }
+
+                return false;
+            }
+
+            case OpCode.Pop:
+                frame.Pop();
+                return false;
+
+            case OpCode.Duplicate:
+            {
+                // A non-zero operand duplicates the top N values as a group.
+                var count = Math.Max(1, instruction.Operand);
+                var values = new PyObject[count];
+
+                for (var i = 0; i < count; i++)
+                {
+                    values[i] = frame.Peek(count - 1 - i);
+                }
+
+                foreach (var value in values)
+                {
+                    frame.Push(value);
+                }
+
+                return false;
+            }
+
+            case OpCode.Swap:
+            {
+                var top = frame.Pop();
+                var second = frame.Pop();
+                frame.Push(top);
+                frame.Push(second);
+                return false;
+            }
+
+            case OpCode.RotateThree:
+            {
+                var top = frame.Pop();
+                var second = frame.Pop();
+                var third = frame.Pop();
+                frame.Push(top);
+                frame.Push(third);
+                frame.Push(second);
+                return false;
+            }
+
+            case OpCode.Jump:
+                frame.InstructionPointer = instruction.Operand;
+                return false;
+
+            case OpCode.JumpIfFalse:
+                if (!frame.Pop().IsTruthy())
+                {
+                    frame.InstructionPointer = instruction.Operand;
+                }
+
+                return false;
+
+            case OpCode.JumpIfTrue:
+                if (frame.Pop().IsTruthy())
+                {
+                    frame.InstructionPointer = instruction.Operand;
+                }
+
+                return false;
+
+            case OpCode.JumpIfFalseOrPop:
+                if (!frame.Peek().IsTruthy())
+                {
+                    frame.InstructionPointer = instruction.Operand;
+                }
+                else
+                {
+                    frame.Pop();
+                }
+
+                return false;
+
+            case OpCode.JumpIfTrueOrPop:
+                if (frame.Peek().IsTruthy())
+                {
+                    frame.InstructionPointer = instruction.Operand;
+                }
+                else
+                {
+                    frame.Pop();
+                }
+
+                return false;
+
+            case OpCode.GetIterator:
+            {
+                var iterable = frame.Pop();
+                frame.Push(iterable is PyIterator or PyGenerator ? iterable : new PyIterator(RequireIterable(iterable)));
+                return false;
+            }
+
+            case OpCode.ForIterate:
+            {
+                var iterator = frame.Peek();
+                var next = iterator switch
+                {
+                    PyIterator sequence => sequence.Next(),
+                    PyGenerator generator => generator.Next(),
+                    _ => throw new PyRaise(PyErrors.TypeError($"'{iterator.TypeName}' object is not an iterator")),
+                };
+
+                if (next is null)
+                {
+                    frame.Pop();
+                    frame.InstructionPointer = instruction.Operand;
+                    return false;
+                }
+
+                frame.Push(next);
+                return false;
+            }
+
+            case OpCode.UnpackSequence:
+            {
+                var values = RequireIterable(frame.Pop()).ToList();
+
+                if (values.Count != instruction.Operand)
+                {
+                    throw new PyRaise(PyErrors.ValueError(values.Count < instruction.Operand
+                        ? $"not enough values to unpack (expected {instruction.Operand}, got {values.Count})"
+                        : $"too many values to unpack (expected {instruction.Operand})"));
+                }
+
+                // Pushed in reverse so the first target pops first.
+                for (var i = values.Count - 1; i >= 0; i--)
+                {
+                    frame.Push(values[i]);
+                }
+
+                return false;
+            }
+
+            case OpCode.UnpackStarred:
+            {
+                var starIndex = instruction.Operand >> 16;
+                var total = instruction.Operand & 0xFFFF;
+                var values = RequireIterable(frame.Pop()).ToList();
+                var after = total - starIndex - 1;
+
+                if (values.Count < total - 1)
+                {
+                    throw new PyRaise(PyErrors.ValueError(
+                        $"not enough values to unpack (expected at least {total - 1}, got {values.Count})"));
+                }
+
+                var unpacked = new List<PyObject>(total);
+                unpacked.AddRange(values.Take(starIndex));
+                unpacked.Add(new PyList(values.Skip(starIndex).Take(values.Count - starIndex - after).ToList()));
+                unpacked.AddRange(values.Skip(values.Count - after));
+
+                for (var i = unpacked.Count - 1; i >= 0; i--)
+                {
+                    frame.Push(unpacked[i]);
+                }
+
+                return false;
+            }
+
+            case OpCode.Call:
+            {
+                var arguments = PopMany(frame, instruction.Operand).ToArray();
+                var callable = frame.Pop();
+                frame.Push(Call(callable, arguments));
+                return false;
+            }
+
+            case OpCode.CallKeyword:
+            {
+                var keywords = (PyDict)frame.Pop();
+                var positional = (PyList)frame.Pop();
+                var callable = frame.Pop();
+                frame.Push(Call(callable, [.. positional.Items], keywords.Count > 0 ? keywords : null));
+                return false;
+            }
+
+            case OpCode.Return:
+                result = frame.Pop();
+                return true;
+
+            case OpCode.Yield:
+                throw new PyRaise(PyErrors.RuntimeError("yield outside a generator"));
+
+            case OpCode.YieldFrom:
+                throw new PyRaise(PyErrors.RuntimeError("yield from outside a generator"));
+
+            case OpCode.MakeFunction:
+            {
+                var nested = code.NestedCode[instruction.Operand];
+                frame.Push(new PyFunction(nested, frame.Cells, frame.Globals));
+                return false;
+            }
+
+            case OpCode.MakeClass:
+            {
+                var body = (PyFunction)frame.Pop();
+                var name = frame.Pop().Display();
+
+                // The class body runs in its own frame; its locals become the namespace.
+                var members = RunClassBody(body);
+                frame.Push(new PyClass(name, members));
+                return false;
+            }
+
+            case OpCode.Raise:
+                DoRaise(frame, instruction.Operand);
+                return false;
+
+            case OpCode.SetupExcept:
+                frame.Blocks.Add(new Block(BlockKind.Except, instruction.Operand, frame.Stack.Count));
+                return false;
+
+            case OpCode.SetupFinally:
+                frame.Blocks.Add(new Block(BlockKind.Finally, instruction.Operand, frame.Stack.Count));
+                return false;
+
+            case OpCode.PopBlock:
+                if (frame.Blocks.Count > 0)
+                {
+                    frame.Blocks.RemoveAt(frame.Blocks.Count - 1);
+                }
+
+                return false;
+
+            case OpCode.PushCurrentException:
+                frame.Push(frame.CurrentException ?? (PyObject)PyNone.Instance);
+                return false;
+
+            case OpCode.MatchException:
+            {
+                var expected = frame.Pop();
+                var actual = frame.CurrentException;
+
+                if (actual is null)
+                {
+                    frame.Push(PyBool.False);
+                    return false;
+                }
+
+                frame.Push(PyBool.Of(MatchesExceptionType(actual, expected)));
+                return false;
+            }
+
+            case OpCode.EndHandler:
+                frame.CurrentException = null;
+                return false;
+
+            case OpCode.ReRaise:
+                if (frame.CurrentException is { } pending)
+                {
+                    frame.CurrentException = null;
+                    throw new PyRaise(pending);
+                }
+
+                return false;
+
+            case OpCode.SetupWith:
+            {
+                var manager = frame.Pop();
+                var enter = Attributes.Get(this, manager, "__enter__");
+                var exit = Attributes.Get(this, manager, "__exit__");
+
+                frame.Push(exit);
+                frame.Blocks.Add(new Block(BlockKind.With, -1, frame.Stack.Count));
+                frame.Push(Call(enter, []));
+                return false;
+            }
+
+            case OpCode.ExitWith:
+            {
+                if (frame.Blocks.Count > 0 && frame.Blocks[^1].Kind == BlockKind.With)
+                {
+                    frame.Blocks.RemoveAt(frame.Blocks.Count - 1);
+                }
+
+                var exit = frame.Pop();
+                Call(exit, [PyNone.Instance, PyNone.Instance, PyNone.Instance]);
+                return false;
+            }
+
+            case OpCode.ImportName:
+            {
+                var name = code.Names[instruction.Operand];
+
+                if (!Modules.TryGetValue(name, out var module))
+                {
+                    throw new PyRaise(PyErrors.ModuleNotFound(name));
+                }
+
+                frame.Push(module);
+                return false;
+            }
+
+            case OpCode.ImportFrom:
+            {
+                var module = frame.Pop();
+                var name = code.Names[instruction.Operand];
+
+                frame.Push(module.GetAttribute(name)
+                    ?? throw new PyRaise(new PyException(
+                        PyExceptionType.ImportError, $"cannot import name '{name}'")));
+
+                return false;
+            }
+
+            case OpCode.Assert:
+            {
+                var message = instruction.Operand == 1 ? frame.Pop().Display() : string.Empty;
+                throw new PyRaise(PyErrors.AssertionError(message));
+            }
+
+            default:
+                throw new PyRaise(PyErrors.RuntimeError($"unimplemented opcode {instruction.OpCode}"));
+        }
+    }
+
+    private PyDict RunClassBody(PyFunction body)
+    {
+        var locals = new PyObject?[body.Code.LocalNames.Count];
+        var frame = new Frame(body.Code, body.Globals, locals, new Dictionary<string, PyCell>(body.Closure, StringComparer.Ordinal));
+
+        Execute(frame);
+
+        var members = new PyDict();
+
+        for (var i = 0; i < frame.Code.LocalNames.Count; i++)
+        {
+            if (frame.Locals[i] is { } value)
+            {
+                members.Set(new PyStr(frame.Code.LocalNames[i]), value);
+            }
+        }
+
+        // A class body at module scope stores into globals, so pick those up too.
+        foreach (var name in frame.Code.Names)
+        {
+            if (frame.Globals.TryGetValue(new PyStr(name), out var value) && !members.Contains(new PyStr(name)))
+            {
+                _ = value;
+            }
+        }
+
+        return members;
+    }
+
+    private static bool MatchesExceptionType(PyException actual, PyObject expected) => expected switch
+    {
+        PyExceptionType type => actual.IsInstanceOf(type),
+        PyTuple tuple => tuple.Items.Any(item => MatchesExceptionType(actual, item)),
+        PyClass => false,
+        _ => false,
+    };
+
+    private void DoRaise(Frame frame, int argumentCount)
+    {
+        if (argumentCount == 0)
+        {
+            throw new PyRaise(frame.CurrentException
+                ?? PyErrors.RuntimeError("No active exception to reraise"));
+        }
+
+        PyException? cause = null;
+
+        if (argumentCount == 2)
+        {
+            cause = ToException(frame.Pop());
+        }
+
+        var exception = ToException(frame.Pop());
+        exception.Cause = cause;
+        exception.Context ??= frame.CurrentException;
+
+        throw new PyRaise(exception);
+    }
+
+    private PyException ToException(PyObject value) => value switch
+    {
+        PyException exception => exception,
+        PyExceptionType type => new PyException(type, string.Empty),
+        _ => throw new PyRaise(PyErrors.TypeError("exceptions must derive from BaseException")),
+    };
+
+    private static List<PyObject> PopMany(Frame frame, int count)
+    {
+        if (count <= 0)
+        {
+            return [];
+        }
+
+        var start = frame.Stack.Count - count;
+        var values = frame.Stack.GetRange(start, count);
+        frame.Stack.RemoveRange(start, count);
+        return values;
+    }
+
+    internal static IEnumerable<PyObject> RequireIterable(PyObject value) =>
+        value.Iterate()
+        ?? (value as PyGenerator)?.Iterate()
+        ?? throw new PyRaise(PyErrors.TypeError($"'{value.TypeName}' object is not iterable"));
+}
+
+/// <summary>Per-run resource caps.</summary>
+public sealed record ExecutionLimits
+{
+    /// <summary>The defaults.</summary>
+    public static ExecutionLimits Default { get; } = new();
+
+    /// <summary>Maximum bytecode instructions executed. Default 50 million.</summary>
+    public long MaxInstructions { get; init; } = 50_000_000;
+
+    /// <summary>Maximum Python call depth. Default 200.</summary>
+    public int MaxRecursionDepth { get; init; } = 200;
+
+    /// <summary>Maximum characters written to stdout and stderr. Default 10 MB.</summary>
+    public int MaxOutputCharacters { get; init; } = 10_000_000;
+}

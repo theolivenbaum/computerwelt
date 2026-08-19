@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Monty</RootNamespace>
+    <AssemblyName>Monty</AssemblyName>
+    <PackageId>Computerwelt.Monty</PackageId>
+    <Description>Minimal, secure Python interpreter for running LLM-written code. C# port of the Rust monty crate.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Monty.SpecTests" />
+    <InternalsVisibleTo Include="Monty.Tests" />
+  </ItemGroup>
+
+</Project>

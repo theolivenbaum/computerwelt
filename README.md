@@ -22,6 +22,11 @@ var result = await bash.ExecAsync("echo hello | tr a-z A-Z");
 Console.WriteLine(result.Stdout);   // HELLO
 ```
 
+```csharp
+var python = new MontyRunner().Run("print(sum(x * x for x in range(5)))");
+Console.WriteLine(python.Stdout);   // 30
+```
+
 ## What "sandboxed" means here
 
 - **No process spawning.** Every command is a managed implementation. There is no `PATH`
@@ -42,7 +47,9 @@ behaves identically on Linux, macOS and Windows.
 |---|---|
 | `src/Bashkit/` | the shell library |
 | `src/Bashkit.Cli/` | a script runner and REPL over it |
-| `src/Monty/` | the Python library (not started) |
+| `src/Monty/` | the Python library |
+| `src/Monty.Cli/` | a script runner over it |
+| `tests/Monty.SpecTests/` | Python conformance runner |
 | `tests/Bashkit.Tests/` | shell unit tests |
 | `tests/Bashkit.SpecTests/` | shell conformance runner |
 | `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
@@ -68,8 +75,12 @@ Never lower a baseline number to make a build green.
 
 ## Status
 
-The shell passes **1,694 of 2,521** conformance cases with 73 commands implemented. The
-Python interpreter has its corpus vendored but no code yet.
+| | conformance | notes |
+|---|---|---|
+| shell | **1,694 / 2,521** | 73 commands implemented |
+| python | **304 / 558** | tokenizer, parser, bytecode compiler, VM, core types, builtins |
+
+The two halves do not yet share a filesystem; that is the last step of the Python port.
 
 See [`todo.md`](todo.md) for the ledger and [`CLAUDE.md`](CLAUDE.md) for the architecture
 and the invariants that define "correct".
