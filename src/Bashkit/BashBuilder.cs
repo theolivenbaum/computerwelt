@@ -232,6 +232,7 @@ public sealed class BashBuilder
         Register(new AwkBuiltin("gawk"));
         Register(new AwkBuiltin("mawk"));
         Register(new JqBuiltin());
+        Register(new YqBuiltin());
         Register(new CutBuiltin());
         Register(new TrBuiltin());
         Register(new NlBuiltin());
