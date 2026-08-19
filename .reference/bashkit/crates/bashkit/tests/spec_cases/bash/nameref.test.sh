@@ -1,0 +1,320 @@
+# Nameref tests
+# Inspired by Oils spec/nameref.test.sh
+# https://github.com/oilshell/oil/blob/master/spec/nameref.test.sh
+
+### nameref_pass_array_by_ref
+# pass array by reference
+show_value() {
+  local -n array_name=$1
+  local idx=$2
+  echo "${array_name[$idx]}"
+}
+shadock=(ga bu zo meu)
+show_value shadock 2
+### expect
+zo
+### end
+
+### nameref_mutate_array
+# mutate array by reference
+set1() {
+  local -n array_name=$1
+  local val=$2
+  array_name[1]=$val
+}
+shadock=(a b c d)
+set1 shadock ZZZ
+echo ${shadock[@]}
+### expect
+a ZZZ c d
+### end
+
+### nameref_assoc_array
+# pass assoc array by reference
+show_value() {
+  local -n array_name=$1
+  local idx=$2
+  echo "${array_name[$idx]}"
+}
+declare -A days=([monday]=eggs [tuesday]=bread [sunday]=jam)
+show_value days sunday
+### expect
+jam
+### end
+
+### nameref_local_dynamic_scope
+# pass local array by reference via dynamic scoping
+### bash_diff: nameref + local array by reference
+show_value() {
+  local -n array_name=$1
+  local idx=$2
+  echo "${array_name[$idx]}"
+}
+caller() {
+  local shadock=(ga bu zo meu)
+  show_value shadock 2
+}
+caller
+### expect
+zo
+### end
+
+### nameref_flag_n_plus_n
+# flag -n and +n for typeset
+x=foo
+ref=x
+echo ref=$ref
+typeset -n ref
+echo ref=$ref
+x=bar
+echo ref=$ref
+typeset +n ref
+echo ref=$ref
+### expect
+ref=x
+ref=foo
+ref=bar
+ref=x
+### end
+
+### nameref_mutate_through
+# mutating through nameref: ref=
+x=XX
+y=YY
+ref=y
+typeset -n ref
+echo ref=$ref
+ref=XXXX
+echo ref=$ref
+echo y=$y
+### expect
+ref=YY
+ref=XXXX
+y=XXXX
+### end
+
+### nameref_bang_inverts
+# flag -n combined ${!ref} -- bash INVERTS
+foo=FOO
+x=foo
+ref=x
+echo "!ref=${!ref}"
+typeset -n ref
+echo ref=$ref
+echo "!ref=${!ref}"
+### expect
+!ref=foo
+ref=foo
+!ref=x
+### end
+
+### nameref_unset
+# unset through nameref unsets the target
+x=X
+typeset -n ref=x
+echo ref=$ref
+unset ref
+echo "ref=$ref"
+echo "x=$x"
+### expect
+ref=X
+ref=
+x=
+### end
+
+### nameref_chain
+# Chain of namerefs
+x=foo
+typeset -n ref=x
+typeset -n ref_to_ref=ref
+echo ref_to_ref=$ref_to_ref
+echo ref=$ref
+### expect
+ref_to_ref=foo
+ref=foo
+### end
+
+### nameref_dynamic_scope
+# Dynamic scope with namerefs
+f3() {
+  local -n ref=$1
+  ref=x
+}
+f2() {
+  f3 "$@"
+}
+f1() {
+  local F1=F1
+  echo F1=$F1
+  f2 F1
+  echo F1=$F1
+}
+f1
+### expect
+F1=F1
+F1=x
+### end
+
+### nameref_change_reference
+# change reference itself
+x=XX
+y=YY
+typeset -n ref=x
+echo ref=$ref
+typeset -n ref=y
+echo ref=$ref
+ref=z
+echo x=$x
+echo y=$y
+### expect
+ref=XX
+ref=YY
+x=XX
+y=z
+### end
+
+### nameref_array_element
+# a[2] in nameref
+typeset -n ref='a[2]'
+a=(zero one two three)
+echo ref=$ref
+### expect
+ref=two
+### end
+
+### nameref_mutate_array_element
+# mutate through nameref: ref[0]=
+array=(X Y Z)
+typeset -n ref=array
+ref[0]=xx
+echo ${array[@]}
+### expect
+xx Y Z
+### end
+
+### nameref_local_basic
+# local -n basic usage
+x=hello
+f() {
+  local -n r=x
+  echo $r
+  r=world
+}
+f
+echo $x
+### expect
+hello
+world
+### end
+
+### nameref_nounset_basic
+# basic nameref under set -u (issue #834)
+set -u
+target="hello"
+declare -n ref=target
+echo "${ref}"
+### expect
+hello
+### end
+
+### nameref_nounset_local_n
+# local -n inside function under set -u
+set -u
+val="world"
+f() {
+  local -n r=$1
+  echo "$r"
+}
+f val
+### expect
+world
+### end
+
+### nameref_nounset_array
+# nameref to array under set -u
+set -u
+arr=(one two three)
+declare -n ref=arr
+echo "${ref[1]}"
+### expect
+two
+### end
+
+### nameref_nounset_write_through
+# nameref write-through under set -u
+set -u
+target="before"
+declare -n ref=target
+ref="after"
+echo "$target"
+### expect
+after
+### end
+
+### nameref_nounset_harness
+# harness pattern: set -euo pipefail with nameref function
+set -euo pipefail
+get_value() {
+  local -n out=$1
+  out="computed"
+}
+result=""
+get_value result
+echo "$result"
+### expect
+computed
+### end
+
+### nameref_assoc_default_value
+# ${ref[key]:-default} through nameref to assoc array (issue #801)
+declare -A m=([x]=1 [y]=2)
+f() {
+  local -n ref="$1"
+  echo "${ref[x]:-EMPTY}"
+  echo "${ref[y]:-EMPTY}"
+  echo "${ref[z]:-EMPTY}"
+}
+f m
+### expect
+1
+2
+EMPTY
+### end
+
+### nameref_assoc_replacement
+# ${ref[key]:+alt} through nameref to assoc array
+declare -A m=([a]=val)
+f() {
+  local -n ref="$1"
+  echo "${ref[a]:+found}"
+  echo "${ref[missing]:+found}"
+}
+f m
+### expect
+found
+
+### end
+
+### nameref_assoc_subscript_at_default
+# ${ref[@]:-default} through nameref to assoc array
+declare -A m=([k]=v)
+f() {
+  local -n ref="$1"
+  echo "${ref[@]:-EMPTY}"
+}
+f m
+### expect
+v
+### end
+
+### nameref_assoc_subscript_at_empty
+# ${ref[@]:-default} through nameref to empty assoc array
+declare -A m
+f() {
+  local -n ref="$1"
+  echo "${ref[@]:-EMPTY}"
+}
+f m
+### expect
+EMPTY
+### end

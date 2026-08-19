@@ -1,0 +1,516 @@
+# Bashkit Compatibility Scorecard
+
+> Feature parity tracking for bash and common tools
+
+**See also:**
+- [API Documentation](https://docs.rs/bashkit) - Full API reference
+- [Custom Builtins Guide](./custom_builtins.md) - Extending Bashkit with custom commands
+- [Threat Model](./threat-model.md) - Security considerations
+
+**Legend:** ✅ Implemented | ⚠️ Partial | ❌ Not implemented | N/A Security exclusion
+
+## POSIX Shell Compliance
+
+Bashkit provides substantial compliance with IEEE Std 1003.1-2024 (POSIX.1-2024)
+Shell Command Language. See [knowledge/operations/limitations.md](../../../knowledge/operations/limitations.md)
+for detailed compliance status.
+
+| POSIX Category | Status |
+|----------------|--------|
+| Reserved Words (16) | Full compliance |
+| Special Parameters (8) | Full compliance |
+| Special Built-ins (15) | 14/15 implemented |
+| Word Expansions | Substantial compliance |
+| Redirections | Full compliance |
+| Compound Commands | Full compliance |
+
+**Security Exclusions**: `exec` is intentionally not implemented
+for sandbox security reasons. See the compliance spec for details.
+
+## Quick Status
+
+| Group | Count |
+|-------|-------|
+| Always-on builtins | 142 |
+| Feature-gated builtins (`jq`, `git`, `ssh`/`scp`/`sftp`, `python`/`python3`, `sqlite`/`sqlite3`, `ts`/`typescript`/`node`/`deno`/`bun`) | 14 |
+| **Total** | **156** |
+
+---
+
+## Builtins Reference
+
+### Implemented
+
+| Builtin | Flags/Features | Notes |
+|---------|----------------|-------|
+| `echo` | `-n`, `-e`, `-E` | Basic escape sequences |
+| `printf` | `%s`, `%d`, `%u`, `%x`, `%o`, `%f`, width/precision | GNU-style integer precision; repeats format for multiple args |
+| `cat` | (none) | Concatenate files/stdin |
+| `true` | - | Exit 0 |
+| `false` | - | Exit 1 |
+| `exit` | `[N]` | Exit with code |
+| `cd` | `[dir]` | Change directory |
+| `pwd` | - | Print working directory |
+| `test` | `-f`, `-d`, `-e`, `-z`, `-n`, `-eq`, `-ne`, `-lt`, `-gt`, `-le`, `-ge` | Conditionals |
+| `[` | (same as test) | Alias for test |
+| `export` | `VAR=value` | Export variables |
+| `read` | `VAR` | Read line into variable |
+| `set` | `-e`, `+e`, positional | Set options and positional params |
+| `unset` | `VAR` | Unset variable |
+| `shift` | `[N]` | Shift positional params |
+| `local` | `VAR=value` | Local variables |
+| `source` | `file [args]` | Source script; loads functions/variables, PATH search, positional params |
+| `.` | `file [args]` | Alias for source |
+| `/path/to/script.sh` | `[args]` | Execute script by absolute/relative path (shebang stripped, call frame) |
+| `$PATH` search | `cmd [args]` | Search `$PATH` dirs for executable scripts (after builtins) |
+| `break` | `[N]` | Break from loop |
+| `continue` | `[N]` | Continue loop |
+| `return` | `[N]` | Return from function |
+| `:` | - | POSIX null utility (no-op) |
+| `eval` | `command...` | POSIX construct and execute command |
+| `readonly` | `VAR[=value]`, `-p` | POSIX mark variable read-only |
+| `times` | - | POSIX display process times |
+| `grep` | `-i`, `-v`, `-c`, `-n`, `-E`, `-q` | Pattern matching |
+| `rg` | `-i/-S/-s`, `-n/-N`, `--column`, `-b/--byte-offset`, `--vimgrep`, basic `--json`, `--stats`, `--null`, `-c`, `--count-matches`, `--include-zero`, `-l`, `--files-with-matches`, `--files-without-match`, `--files`, `-F`, `-w`, `-x`, `-a/--text`, `--binary`, `-m`, `-M/--max-columns`, `--max-columns-preview`, `--max-depth`, `-A`, `-B`, `-C`, separator flags, `--heading/--no-heading`, `--sort/--sortr`, `--path-separator`, `-g/--glob`, `--ignore-file`, `.ignore`/`.gitignore`, `--no-ignore*`, `--require-git/--no-require-git`, `-u/--unrestricted`, `--messages/--no-messages`, `-t/--type`, `-T/--type-not`, `--type-add`, `--type-clear`, `--type-list`, `--hidden/--no-hidden`, `-o`, `-q`, `-e`, `-f`, `-E/--encoding` (`auto`, `none`, UTF-8, UTF-16LE/BE), `-r`, `--passthru`, `--trim`, `-H/-I`, `--no-config`, `--line-buffered`, `--block-buffered`, `--mmap/--no-mmap`, `-P/--pcre2`, `--no-pcre2`, `--engine`, `--auto-hybrid-regex`, `--no-auto-hybrid-regex`, `--help`, `--version` | Recursive ripgrep-style search |
+| `sed` | `s///[g]`, `d`, `p`, `q`, `a`, `i`, `c`, `h/H/g/G/x`, `-E`, `-n`, `!` | Stream editing |
+| `awk` | `'{print}'`, `-F`, `-v`, loops, arrays, increment, ternary | Text processing |
+| `jq` | `.field`, `.[n]`, pipes, file args, `-r`, `-c`, `-n`, `-s`, `-S`, `-e`, `-j`, `--tab`, `--arg`, `--argjson`, `-V`, combined flags | JSON processing |
+| `sleep` | `N`, `N.N` | Pause execution (max 60s) |
+| `head` | `-n N`, `-N` | First N lines (default 10) |
+| `tail` | `-n N`, `-N` | Last N lines (default 10) |
+| `basename` | `NAME [SUFFIX]` | Strip directory from path |
+| `dirname` | `NAME` | Strip last path component |
+| `mkdir` | `-p` | Create directories |
+| `rm` | `-rf` | Remove files/directories |
+| `cp` | `-r` | Copy files |
+| `mv` | - | Move/rename files |
+| `touch` | - | Create empty files |
+| `chmod` | `MODE` | Change permissions (octal only) |
+| `wc` | `-l`, `-w`, `-c` | Count lines/words/bytes |
+| `sort` | `-r`, `-n`, `-u` | Sort lines |
+| `uniq` | `-c`, `-d`, `-u` | Filter duplicate lines |
+| `cut` | `-d DELIM`, `-f FIELDS` | Extract fields |
+| `tr` | `-d`, character ranges | Translate/delete chars |
+| `date` | `+FORMAT`, `-u`, `-R`, `-I`, `-r`, `-d`/`--date` (relative, compound, epoch) | Display/format date with sandboxed IANA timezone support |
+| `wait` | `[JOB_ID...]` | Wait for background jobs |
+| `curl` | `-s`, `-o`, `-X`, `-d`/`--data`, `--data-raw`, `--data-binary`, `--data-urlencode`, `-G`/`--get`, `-H`, `-I`, `-f`, `-L`, `-w`, `--compressed`, `-u`, `-A`, `-e`, `-v`, `-m` | HTTP client (requires http_client feature) |
+| `wget` | `-q`, `-O`, `--spider`, `--header`, `-U`, `--post-data`, `-t` | Download files (requires http_client feature) |
+| `time` | `[-p] [-f FORMAT] [-o FILE] [-a] [-v] [--] PIPELINE` | Reserved-word timing; elapsed/status/Bashkit counters are truthful, host CPU/RSS fields say `unavailable` |
+| `timeout` | `DURATION COMMAND` | Run with time limit (stub) |
+| `ls` | `-l`, `-a`, `-h`, `-1`, `-R`, `-t`, `-F`, `-C`, `-d` | List directory contents |
+| `find` | `-name`, `-type`, `-maxdepth`, `-print` | Search for files |
+| `rmdir` | `-p` | Remove empty directories |
+| `xargs` | `-I`, `-n`, `-d` | Build commands from stdin |
+| `tee` | `-a` | Write to files and stdout |
+| `watch` | `INTERVAL COMMAND` | Execute periodically (virtual mode) |
+| `file` | (none) | Detect file type via magic bytes |
+| `less` | (none) | View file (behaves like cat in virtual mode) |
+| `stat` | `-c FORMAT` | Display file metadata |
+| `tar` | `-c`, `-x`, `-t`, `-v`, `-f`, `-z`/`--gzip`, `-j`/`--bzip2` | Archive operations; auto-detects gzip/bzip2 while reading |
+| `gzip` | `-d`, `-k`, `-f` | Compress files |
+| `gunzip` | `-k`, `-f` | Decompress files |
+| `bzip2` | `-c`, `-d`, `-z`, `-k`, `-f` | Compress or decompress bzip2 streams/files |
+| `bunzip2` | `-c`, `-k`, `-f` | Decompress bzip2 streams/files |
+| `bzcat` | | Decompress bzip2 streams/files to stdout |
+| `env` | `[VAR=val]` | Print/modify environment |
+| `printenv` | `[VAR]` | Print environment variables |
+| `history` | (none) | Command history (limited in virtual mode) |
+| `hostname` | (none) | Display virtual hostname |
+| `uname` | `-a`, `-s`, `-n`, `-r`, `-v`, `-m`, `-o` | System info |
+| `whoami` | (none) | Display virtual username |
+| `id` | `-u`, `-g`, `-n` | User/group IDs |
+| `nl` | `-b`, `-n`, `-s`, `-i`, `-v`, `-w` | Number lines of files |
+| `paste` | `-d`, `-s` | Merge lines of files |
+| `column` | `-t`, `-s`, `-o` | Columnate lists |
+| `comm` | `-1`, `-2`, `-3` | Compare two sorted files |
+| `diff` | `-u`, `-q`/`--brief` | Compare files line by line |
+| `strings` | `-n`, `-t`, `-a` | Find printable strings in binary data |
+| `od` | `-A`, `-t`, `-N`, `-j` | Octal/hex dump |
+| `xxd` | `-l`, `-s`, `-c`, `-g`, `-p` | Hex dump |
+| `hexdump` | `-C`, `-n`, `-s` | Display file in hex+ASCII |
+
+#### `time` reports
+
+`time` wraps a shell pipeline, so groups, functions, redirects, nested shells,
+and pipeline status behave as shell syntax rather than utility arguments. `-p`
+uses the POSIX layout. `-f` supports elapsed seconds (`%e`), elapsed
+hours/minutes/seconds (`%E`), exit status (`%x`), literal percent (`%%`), and
+Bashkit counters (`%{commands}`, `%{loops}`, `%{work_units}`). GNU host-process
+fields such as `%U`, `%S`, `%P`, and `%M` return `unavailable`; Bashkit never
+attributes the embedding process's CPU or memory to a wrapped command.
+
+`-v` reports the same available data with labels. `-o FILE` atomically replaces
+the report file in the VFS; `-a -o FILE` appends. Wrapped stdout and stderr are
+unchanged. Hardened profiles expose elapsed time in 100 ms lower-bound buckets.
+
+#### `date` timezone contract
+
+`date` defaults to UTC when the shell environment has no `TZ`; it never reads
+the host process timezone. A valid IANA identifier or alias in `TZ` (for example
+`America/Chicago`, `Etc/GMT+6`, or `UTC`) controls display and the interpretation
+of timezone-naive `-d` values. Explicit input offsets and `Z` identify an instant
+independently of `TZ`; the output is then rendered in the selected zone. `-u`
+always renders UTC while naive input still uses the selected sandbox zone.
+
+IANA transition rules apply at DST boundaries. Nonexistent local wall times
+fail; repeated wall times choose the earlier instant deterministically. Empty,
+invalid, POSIX-rule, and path-style `TZ` values fail closed to UTC. Formats use
+Chrono's validated strftime implementation, plus GNU `%N`, `%3N`, `%6N`, and
+`%9N` fractional-second forms.
+
+### Recently Added
+
+| Builtin | Flags / Arguments | Notes |
+|---------|-------------------|-------|
+| `ln` | `-s`, `-f` | Create links |
+| `chown` | `OWNER[:GROUP] FILE` | Change ownership (virtual) |
+| `kill` | `-SIGNAL PID` | Send signals (virtual) |
+| `trap` | `COMMAND SIGNAL...`, `-p`, `-l` | Signal/event handlers |
+| `type` | `NAME...` | Describe command type |
+| `which` | `NAME...` | Locate a command |
+| `command` | `-v`, `NAME...` | Run or identify commands |
+| `hash` | (none) | No-op in sandboxed env |
+| `declare`/`typeset` | `-i`, `-r`, `-x`, `-a`, `-p`, `-n`, `-l`, `-u` | Variable attributes |
+| `let` | `EXPR...` | Evaluate arithmetic |
+| `getopts` | `OPTSTRING NAME` | Parse positional parameters |
+| `caller` | `[FRAME]` | Display call stack frame |
+| `mapfile` | `-n`, `-O`, `-s`, `-t`, `-d` | Read lines into array |
+| `readarray` | `-n`, `-O`, `-s`, `-t`, `-d` | Alias for mapfile |
+| `shopt` | `-s`, `-u`, `-q` | Shell options |
+| `seq` | `[FIRST [INCR]] LAST` | Print number sequence |
+| `tac` | (none) | Reverse file lines |
+| `rev` | (none) | Reverse characters per line |
+| `yes` | `[STRING]` | Output repeated string |
+| `expr` | `EXPRESSION` | Evaluate expressions |
+| `mktemp` | `-d`, `-p`, `-t` | Create temporary files |
+| `realpath` | `PATH` | Resolve path |
+| `pushd`/`popd`/`dirs` | standard flags | Directory stack |
+
+### Not Implemented
+
+| Builtin | Priority | Status |
+|---------|----------|--------|
+| `exec` | N/A | Security: intentionally excluded |
+
+---
+
+## Shell Syntax
+
+### Operators
+
+| Operator | Status | Example | Notes |
+|----------|--------|---------|-------|
+| `\|` | ✅ | `cmd1 \| cmd2` | Pipeline |
+| `&&` | ✅ | `cmd1 && cmd2` | AND list |
+| `\|\|` | ✅ | `cmd1 \|\| cmd2` | OR list |
+| `;` | ✅ | `cmd1; cmd2` | Sequential |
+| `&` | ⚠️ | `cmd &` | Parsed, async pending |
+| `!` | ✅ | `! cmd` | Negate exit code |
+
+### Redirections
+
+| Redirect | Status | Example | Notes |
+|----------|--------|---------|-------|
+| `>` | ✅ | `cmd > file` | Output to file |
+| `>>` | ✅ | `cmd >> file` | Append to file |
+| `<` | ✅ | `cmd < file` | Input from file |
+| `<<<` | ✅ | `cmd <<< "string"` | Here-string |
+| `<<EOF` | ✅ | Heredoc | Multi-line input |
+| `2>` | ✅ | `cmd 2> file` | Stderr redirect |
+| `2>&1` | ✅ | `cmd 2>&1` | Stderr to stdout |
+| `&>` | ✅ | `cmd &> file` | Both to file |
+
+### Control Flow
+
+| Feature | Status | Example |
+|---------|--------|---------|
+| `if/elif/else/fi` | ✅ | `if cmd; then ...; fi` |
+| `for/do/done` | ✅ | `for i in a b c; do ...; done` |
+| `while/do/done` | ✅ | `while cmd; do ...; done` |
+| `until/do/done` | ✅ | `until cmd; do ...; done` |
+| `case/esac` | ✅ | `case $x in pat) ...;; esac` |
+| `{ ... }` | ✅ | Brace group |
+| `( ... )` | ✅ | Subshell |
+| `function name { }` | ✅ | Function definition |
+| `name() { }` | ✅ | Function definition |
+
+---
+
+## Expansions
+
+### Variable Expansion
+
+| Syntax | Status | Example | Description |
+|--------|--------|---------|-------------|
+| `$var` | ✅ | `$HOME` | Simple expansion |
+| `${var}` | ✅ | `${HOME}` | Braced expansion |
+| `${var:-default}` | ✅ | `${X:-fallback}` | Use default if unset/empty |
+| `${var:=default}` | ✅ | `${X:=value}` | Assign default if unset/empty |
+| `${var:+alt}` | ✅ | `${X:+yes}` | Use alt if set |
+| `${var:?error}` | ✅ | `${X:?missing}` | Error if unset/empty |
+| `${#var}` | ✅ | `${#str}` | Length of value |
+| `${var#pat}` | ✅ | `${f#*.}` | Remove shortest prefix |
+| `${var##pat}` | ✅ | `${f##*/}` | Remove longest prefix |
+| `${var%pat}` | ✅ | `${f%.*}` | Remove shortest suffix |
+| `${var%%pat}` | ✅ | `${f%%/*}` | Remove longest suffix |
+| `${var/pat/repl}` | ✅ | `${s/foo/bar}` | Substitute first match |
+| `${var//pat/repl}` | ✅ | `${s//o/0}` | Substitute all matches |
+| `${var^}` | ✅ | `${s^}` | Uppercase first |
+| `${var^^}` | ✅ | `${s^^}` | Uppercase all |
+| `${var,}` | ✅ | `${s,}` | Lowercase first |
+| `${var,,}` | ✅ | `${s,,}` | Lowercase all |
+
+### Prefix Environment Assignments
+
+| Syntax | Status | Example | Description |
+|--------|--------|---------|-------------|
+| `VAR=val cmd` | ✅ | `TOKEN=abc printenv TOKEN` | Temporary env for command |
+| Multiple prefix | ✅ | `A=1 B=2 cmd` | Multiple vars in one command |
+| No persist | ✅ | `X=1 cmd; echo $X` | Var not set after command |
+| Assignment-only | ✅ | `X=1` (no cmd) | Persists in shell variables |
+
+### Command Substitution
+
+| Syntax | Status | Example |
+|--------|--------|---------|
+| `$(cmd)` | ✅ | `x=$(pwd)` |
+| `` `cmd` `` | ✅ | Backticks (deprecated but supported) |
+
+### Arithmetic
+
+| Syntax | Status | Example |
+|--------|--------|---------|
+| `$((expr))` | ✅ | `$((1+2))` |
+| `+`, `-`, `*`, `/`, `%` | ✅ | Basic ops |
+| `==`, `!=`, `<`, `>`, `<=`, `>=` | ✅ | Comparisons |
+| `&`, `\|` | ✅ | Bitwise |
+| `&&`, `\|\|` | ✅ | Logical operators |
+| `? :` | ✅ | Ternary |
+| `=`, `+=`, etc. | ✅ | Assignment operators |
+
+### Other Expansions
+
+| Syntax | Status | Example | Description |
+|--------|--------|---------|-------------|
+| `*`, `?` | ✅ | `*.txt` | Glob patterns |
+| `[abc]` | ✅ | `[0-9]` | Bracket globs |
+| `{a,b,c}` | ✅ | `{1..5}` | Brace expansion |
+| `~` | ✅ | `~/file` | Tilde expansion |
+| `<(cmd)` | ✅ | `diff <(a) <(b)` | Process substitution |
+
+---
+
+## Special Variables
+
+| Variable | Status | Description |
+|----------|--------|-------------|
+| `$?` | ✅ | Last exit code |
+| `$#` | ✅ | Number of positional params |
+| `$@` | ✅ | All positional params (separate) |
+| `$*` | ✅ | All positional params (joined) |
+| `$0` | ✅ | Script/function name |
+| `$1`-`$9` | ✅ | Positional parameters |
+| `$!` | ✅ | Last background job ID (POSIX) |
+| `$$` | ✅ | Current PID |
+| `$-` | ✅ | Current option flags (POSIX) |
+| `$_` | ❌ | Last argument |
+| `$RANDOM` | ✅ | Random number (0-32767) |
+| `$LINENO` | ✅ | Current line number |
+
+---
+
+## Arrays
+
+| Feature | Status | Example |
+|---------|--------|---------|
+| Declaration | ✅ | `arr=(a b c)` |
+| Index access | ✅ | `${arr[0]}` |
+| All elements `@` | ✅ | `${arr[@]}` (separate args) |
+| All elements `*` | ✅ | `${arr[*]}` (single arg when quoted) |
+| Array length | ✅ | `${#arr[@]}` |
+| Element length | ✅ | `${#arr[0]}` |
+| Append | ✅ | `arr+=(d e)` |
+| Slice | ✅ | `${arr[@]:1:2}` |
+| Indices | ✅ | `${!arr[@]}` |
+| Associative | ✅ | `declare -A` |
+
+---
+
+## Test Operators
+
+### File Tests
+
+| Operator | Status | Description |
+|----------|--------|-------------|
+| `-e file` | ✅ | Exists |
+| `-f file` | ✅ | Is regular file |
+| `-d file` | ✅ | Is directory |
+| `-s file` | ✅ | Size > 0 |
+| `-r file` | ✅ | Is readable (exists in virtual fs) |
+| `-w file` | ✅ | Is writable (exists in virtual fs) |
+| `-x file` | ✅ | Is executable (mode & 0o111) |
+| `-L file` | ✅ | Is symlink |
+
+### String Tests
+
+| Operator | Status | Description |
+|----------|--------|-------------|
+| `-z str` | ✅ | Is empty |
+| `-n str` | ✅ | Is non-empty |
+| `str1 = str2` | ✅ | Equal |
+| `str1 != str2` | ✅ | Not equal |
+| `str1 < str2` | ✅ | Less than |
+| `str1 > str2` | ✅ | Greater than |
+
+### Numeric Tests
+
+| Operator | Status | Description |
+|----------|--------|-------------|
+| `-eq` | ✅ | Equal |
+| `-ne` | ✅ | Not equal |
+| `-lt` | ✅ | Less than |
+| `-gt` | ✅ | Greater than |
+| `-le` | ✅ | Less or equal |
+| `-ge` | ✅ | Greater or equal |
+
+---
+
+## Resource Limits
+
+Default limits (configurable):
+
+| Resource | Default | Notes |
+|----------|---------|-------|
+| Commands | 10,000 | Per execution |
+| Loop iterations | 100,000 | Per loop |
+| Function depth | 100 | Recursion limit |
+| Output size | 10MB | Total stdout |
+| Parser timeout | 5s | Prevents infinite parse |
+| Parser operations | 100,000 | Fuel-based limit |
+| Input size | 10MB | Max script size |
+| AST depth | 100 | Nesting limit |
+
+---
+
+## Filesystem
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Virtual filesystem | ✅ | InMemoryFs, OverlayFs, MountableFs |
+| Real filesystem | ❌ | Virtual by default |
+| Symlinks | ✅ | Stored but not followed |
+| Permissions | ✅ | Metadata stored, not enforced |
+| `/dev/null` | ✅ | Interpreter-level handling (cannot be bypassed) |
+
+---
+
+## Network
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| HTTP client | ✅ | Full implementation with security mitigations |
+| URL allowlist | ✅ | Default-deny whitelist security model |
+| `curl` builtin | ✅ | Full HTTP client; ordered data variants, `@file`, and `-G` query aggregation included |
+| `wget` builtin | ✅ | Full downloader with `-q`, `-O`, `--spider`, `--header`, `-U`, `--post-data`, `-t` |
+| Response limits | ✅ | 10MB max response size, 30s timeout |
+| Redirect security | ✅ | Redirects require explicit `-L` and allowlist check |
+| Raw sockets | ❌ | Not planned |
+
+### Network Configuration
+
+```rust,ignore
+use bashkit::{Bash, NetworkAllowlist};
+
+// Enable network with URL allowlist
+let bash = Bash::builder()
+    .network(NetworkAllowlist::new()
+        .allow("https://api.example.com")
+        .allow("https://cdn.example.com/assets"))
+    .build();
+```
+
+See [knowledge/security/threat-model.md](../../../knowledge/security/threat-model.md) for HTTP security details.
+
+---
+
+## Running Tests
+
+```bash
+# All tests
+cargo test --all-features
+
+# Spec tests only
+cargo test --test spec_tests
+
+# Compare with real bash
+cargo test --test spec_tests -- bash_comparison_tests --ignored
+```
+
+---
+
+## Roadmap
+
+### Completed
+- [x] `sleep` builtin
+- [x] `head`/`tail` builtins
+- [x] File operation builtins (`mkdir`, `rm`, `cp`, `mv`, `touch`, `chmod`)
+- [x] `wc` builtin
+- [x] Text processing (`sort`, `uniq`, `cut`, `tr`)
+- [x] Text structure (`nl`, `paste`, `column`)
+- [x] File comparison (`diff`, `comm`)
+- [x] Byte inspection (`strings`, `od`, `xxd`, `hexdump`)
+- [x] `basename`/`dirname` builtins
+- [x] `date` builtin
+- [x] Background execution (`&`, `wait`) - parsed, runs synchronously
+- [x] Network (`curl`, `wget`) - full HTTP implementation with security mitigations
+- [x] `timeout` builtin - stub, requires interpreter-level integration
+- [x] Process substitution (`<(cmd)`, `>(cmd)`)
+- [x] Here string edge cases tested
+- [x] `set -e` (errexit) - exit on command failure
+- [x] Tilde expansion (~) - expands to $HOME
+- [x] Special variables ($$, $RANDOM, $LINENO)
+- [x] File test operators (-r, -w, -x, -L)
+- [x] Stderr redirections (2>, 2>&1, &>)
+- [x] Arithmetic logical operators (&&, ||)
+- [x] Brace expansion ({a,b,c}, {1..5})
+- [x] String comparison operators (< >) in test
+- [x] Array indices `${!arr[@]}`
+- [x] `/dev/null` support (interpreter-level, cannot be bypassed by custom fs)
+
+### Known LLM Compatibility Gaps (Resolved)
+
+Identified from eval analysis, all items now implemented:
+
+**High Impact (commonly generated by LLMs):**
+- [x] `chmod +x` symbolic mode, `apply_symbolic_mode()` in fileops.rs
+- [x] `sed` ampersand (`&`) in replacement, PR #196
+- [x] AWK `printf %x/%o/%c` format specifiers, hex/octal output
+- [x] AWK `match()` and `gensub()` functions, text extraction
+- [x] `sed` `\n` literal newline in replacement, line splitting
+
+**Medium Impact:**
+- [x] AWK power operators (`^`, `**`), math scripts
+- [x] AWK `exit` statement with code, error handling
+- [x] AWK negation `!$1`, filtering empty fields
+- [x] `sed` grouped commands `{cmd1;cmd2}`, PR #227
+- [x] `sed` branch/label (`b`/`t`/`:label`), branching support
+- [x] AWK `ORS` variable, custom output formatting
+- [x] AWK `getline`, multi-file processing
+
+**Low Impact:**
+- [x] `sed` `0~2` step addressing, even/odd line processing
+- [x] `sed` `Q` quiet quit command
+- [x] `sed` `0,/pattern/` first match addressing
+- [x] AWK `$0` modification with field re-splitting
+
+### Not Planned
+- Interactive features (history, job control UI)
+- Process spawning (virtual environment)
+- Raw filesystem access
+
+---
+
+## See Also
+
+- [knowledge/operations/limitations.md](../../../knowledge/operations/limitations.md) - Intentional gaps and partial features
+- [Bashkit knowledge](../../../knowledge/) - Persistent design and engineering knowledge

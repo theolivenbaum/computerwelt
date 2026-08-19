@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Bashkit</RootNamespace>
+    <AssemblyName>Bashkit</AssemblyName>
+    <PackageId>Bashkit</PackageId>
+    <Description>Sandboxed, in-process bash interpreter with a virtual filesystem. C# port of the Rust bashkit crate.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Bashkit.Tests" />
+    <InternalsVisibleTo Include="Bashkit.SpecTests" />
+  </ItemGroup>
+
+</Project>

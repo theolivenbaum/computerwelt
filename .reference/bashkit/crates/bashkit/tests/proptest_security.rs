@@ -1,0 +1,767 @@
+//! Property-based security tests for Bashkit
+//!
+//! These tests use proptest to generate random inputs and verify
+//! that Bashkit maintains security invariants under all conditions.
+//!
+//! Run with: cargo test --test proptest_security
+
+use bashkit::testing::{assert_fuzz_invariants, fuzz_init};
+use bashkit::{Bash, ExecutionLimits};
+use proptest::prelude::*;
+use std::time::Duration;
+
+// Strategy for generating arbitrary bash-like input
+// Note: Limited character set and length to avoid parser pathological cases
+fn bash_input_strategy() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[a-zA-Z0-9_ ;|$()]{0,50}").unwrap()
+}
+
+// Strategy for generating arithmetic expressions with multi-byte chars
+// Covers the char-index vs byte-index mismatch that caused panics
+fn arithmetic_multibyte_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // Multi-byte chars mixed with operators
+        proptest::string::string_regex("[0-9a-z+\\-*/%,()éèüöñ]{1,30}").unwrap(),
+        // CJK + operators
+        proptest::string::string_regex("[0-9+\\-*/()你好世界]{1,20}").unwrap(),
+        // Emoji + arithmetic
+        proptest::string::string_regex("[0-9+\\-*/,🎉🚀]{1,15}").unwrap(),
+        // Multi-byte with ternary/bitwise
+        proptest::string::string_regex("[0-9a-z?:|&^!<>=éü]{1,30}").unwrap(),
+    ]
+}
+
+// Strategy for generating degenerate array subscript expressions
+fn array_subscript_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // Lone/mismatched quotes in subscripts
+        proptest::string::string_regex("\\$\\{arr\\[[\"'a-z]{0,5}\\]\\}").unwrap(),
+        // Multi-byte in subscripts
+        proptest::string::string_regex("\\$\\{arr\\[[éü0-9\"']{0,5}\\]\\}").unwrap(),
+        // Edge-case subscript lengths (0, 1, 2 chars)
+        Just("${arr[\"]}".to_string()),
+        Just("${arr[']}".to_string()),
+    ]
+}
+
+// Strategy for generating resource-intensive scripts
+fn resource_stress_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // Long pipelines
+        (2..20usize).prop_map(|n| {
+            let mut s = "echo x".to_string();
+            for _ in 0..n {
+                s.push_str(" | cat");
+            }
+            s
+        }),
+        // Many commands
+        (2..50usize).prop_map(|n| { (0..n).map(|_| "echo x").collect::<Vec<_>>().join("; ") }),
+        // Long variable names
+        (1..100usize).prop_map(|n| format!("{}=value", "A".repeat(n))),
+    ]
+}
+
+proptest! {
+    // 16 cases per test - fast enough for CI
+    // Parser fuzzing is done in nightly workflow due to potential hangs (threat model V3)
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// Lexer should never panic on arbitrary input
+    /// Note: Parser tests moved to fuzz workflow due to potential hangs (threat model V3)
+    #[test]
+    fn lexer_never_panics(input in bash_input_strategy()) {
+        let mut lexer = bashkit::parser::Lexer::new(&input);
+        // Consume all tokens - should never panic
+        while lexer.next_token().is_some() {}
+    }
+
+    /// Resource limits should be enforced
+    #[test]
+    fn resource_limits_enforced(input in resource_stress_strategy()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+
+        RT.with(|rt| {
+            rt.block_on(async {
+                let limits = ExecutionLimits::new()
+                    .max_commands(10)
+                    .max_loop_iterations(10)
+                    .timeout(Duration::from_millis(20));
+
+                let mut bash = Bash::builder().limits(limits).build();
+                let _ = bash.exec(&input).await;
+            });
+        });
+    }
+
+    /// Output should not exceed reasonable bounds
+    /// Uses resource_stress_strategy which generates valid bash (arbitrary input can hang parser)
+    #[test]
+    fn output_bounded(input in resource_stress_strategy()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+
+        let (stdout_len, stderr_len) = RT.with(|rt| {
+            rt.block_on(async {
+                let limits = ExecutionLimits::new()
+                    .max_commands(10)
+                    .timeout(Duration::from_millis(20));
+
+                let mut bash = Bash::builder().limits(limits).build();
+
+                if let Ok(result) = bash.exec(&input).await {
+                    (result.stdout.len(), result.stderr.len())
+                } else {
+                    (0, 0)
+                }
+            })
+        });
+
+        prop_assert!(stdout_len < 10_000_000);
+        prop_assert!(stderr_len < 10_000_000);
+    }
+
+    /// Path traversal attempts should be contained
+    #[test]
+    fn path_traversal_contained(
+        prefix in "[.]{0,10}",
+        slashes in "[/]{1,10}",
+        segments in proptest::collection::vec("[.]{0,3}", 0..10)
+    ) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+
+        let path = format!("{prefix}{slashes}{}", segments.join("/"));
+        let script = format!("cat {path}");
+
+        RT.with(|rt| {
+            rt.block_on(async {
+                let mut bash = Bash::new();
+                let _ = bash.exec(&script).await;
+            });
+        });
+    }
+
+    /// Arithmetic evaluator must not panic on multi-byte input
+    /// Regression: char-index used as byte-index caused panics on multi-byte chars
+    #[test]
+    fn arithmetic_multibyte_no_panic(expr in arithmetic_multibyte_strategy()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+
+        let script = format!("echo $(({expr}))");
+
+        RT.with(|rt| {
+            rt.block_on(async {
+                let limits = ExecutionLimits::new()
+                    .max_commands(10)
+                    .timeout(Duration::from_millis(50));
+
+                let mut bash = Bash::builder().limits(limits).build();
+                let _ = bash.exec(&script).await;
+            });
+        });
+    }
+
+    /// Parser must not panic on degenerate array subscripts
+    /// Regression: single-char quote in subscript caused begin > end slice panic
+    #[test]
+    fn parser_subscript_no_panic(input in array_subscript_strategy()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+
+        let script = format!("arr=(a b c); echo {input}");
+
+        RT.with(|rt| {
+            rt.block_on(async {
+                let limits = ExecutionLimits::new()
+                    .max_commands(10)
+                    .timeout(Duration::from_millis(50));
+
+                let mut bash = Bash::builder().limits(limits).build();
+                let _ = bash.exec(&script).await;
+            });
+        });
+    }
+
+    /// Lexer must not panic on multi-byte input (extends lexer_never_panics with unicode)
+    #[test]
+    fn lexer_multibyte_no_panic(input in proptest::string::string_regex("[a-zA-Z0-9_ ;|$()\"'éèüöñ你好🎉]{0,50}").unwrap()) {
+        let mut lexer = bashkit::parser::Lexer::new(&input);
+        while lexer.next_token().is_some() {}
+    }
+
+    /// Variable expansion should not execute code
+    #[test]
+    fn variable_expansion_safe(var_content in "[^']{0,100}") {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+
+        let script = format!("X='{var_content}'; echo $X");
+
+        RT.with(|rt| {
+            rt.block_on(async {
+                let limits = ExecutionLimits::new()
+                    .max_commands(10)
+                    .timeout(Duration::from_millis(20));
+
+                let mut bash = Bash::builder().limits(limits).build();
+                let _ = bash.exec(&script).await;
+            });
+        });
+    }
+}
+
+// Additional focused tests
+
+#[test]
+fn test_deeply_nested_parens() {
+    // Test very deep nesting doesn't cause stack overflow
+    let deep = format!("{}1{}", "(".repeat(500), ")".repeat(500));
+    let parser = bashkit::parser::Parser::new(&deep);
+    let _ = parser.parse();
+}
+
+#[test]
+fn test_very_long_pipeline() {
+    let pipeline = (0..100).map(|_| "cat").collect::<Vec<_>>().join(" | ");
+    let script = format!("echo x | {pipeline}");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let limits = ExecutionLimits::new()
+            .max_commands(200)
+            .timeout(Duration::from_millis(500));
+
+        let mut bash = Bash::builder().limits(limits).build();
+        let _ = bash.exec(&script).await;
+    });
+}
+
+#[test]
+fn test_null_bytes_handled() {
+    // Null bytes should not cause issues
+    let input = "echo hello\x00world";
+    let parser = bashkit::parser::Parser::new(input);
+    let _ = parser.parse();
+}
+
+#[test]
+fn test_unicode_handling() {
+    let scripts = [
+        "echo 你好世界",
+        "echo مرحبا",
+        "echo 🎉🚀",
+        "VAR=émoji; echo $VAR",
+        "echo '\u{0000}\u{FFFF}'",
+    ];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        for script in scripts {
+            let mut bash = Bash::new();
+            let _ = bash.exec(script).await;
+        }
+    });
+}
+
+/// Regression: proptest found multi-byte char panic in variable expansion
+/// Input "${:¡%" caused byte index panic in substring/parameter expansion
+#[test]
+fn test_multibyte_in_variable_expansion() {
+    let scripts = [
+        "X='${:¡%'; echo $X",
+        "X='¡%'; echo ${X:1}",
+        "X='日本語'; echo ${X:1:2}",
+        "X='émoji'; echo ${X:0:3}",
+        "X='über'; echo ${#X}",
+    ];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        for script in scripts {
+            let limits = ExecutionLimits::new()
+                .max_commands(10)
+                .timeout(Duration::from_millis(100));
+            let mut bash = Bash::builder().limits(limits).build();
+            let _ = bash.exec(script).await;
+        }
+    });
+}
+
+// ============================================================================
+// TM-INF-013, TM-INF-016, TM-INF-022: cross-tool invariants under random input.
+//
+// Random strings through high-risk builtins must not leak Debug shapes,
+// host paths, or the host-env canary. The static check
+// (`builtins::tests::no_debug_fmt_in_builtin_source`) and the per-tool
+// `no_leak_*` curated cases catch known patterns; this proptest catches
+// what we didn't think of.
+// ============================================================================
+
+/// Generates short random strings — not bash-grammar valid, just stuff
+/// likely to trigger error paths in tools that parse their argument as
+/// a regex / format / filter expression.
+fn arbitrary_tool_arg() -> impl Strategy<Value = String> {
+    proptest::string::string_regex(r"[\x20-\x7e\t]{0,80}").unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        max_shrink_iters: 32,
+        ..ProptestConfig::default()
+    })]
+
+    /// jq with arbitrary filter input must not leak.
+    #[cfg(feature = "jq")]
+    #[test]
+    fn jq_arbitrary_filter_no_leak(filter in arbitrary_tool_arg()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+        RT.with(|rt| rt.block_on(async {
+            fuzz_init();
+            let limits = ExecutionLimits::new()
+                .max_commands(5)
+                .max_stdout_bytes(4096)
+                .max_stderr_bytes(4096)
+                .timeout(Duration::from_millis(200));
+            let mut bash = Bash::builder().limits(limits).build();
+            let escaped = filter.replace('\'', "'\\''");
+            let script = format!("echo '{{}}' | jq '{}'", escaped);
+            let result = bash.exec(&script).await.unwrap_or_default();
+            assert_fuzz_invariants(&result, "jq_arbitrary_filter", &[]);
+        }));
+    }
+
+    /// yq with arbitrary YAML and filter input must not panic or leak parser
+    /// or evaluator internals at the format/evaluator composition boundary.
+    #[cfg(feature = "jq")]
+    #[test]
+    fn yq_arbitrary_yaml_and_filter_no_leak(
+        input in arbitrary_tool_arg(),
+        filter in arbitrary_tool_arg(),
+    ) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+        RT.with(|rt| rt.block_on(async {
+            fuzz_init();
+            let limits = ExecutionLimits::new()
+                .max_commands(5)
+                .max_stdout_bytes(4096)
+                .max_stderr_bytes(4096)
+                .timeout(Duration::from_millis(200));
+            let mut bash = Bash::builder().limits(limits).build();
+            let escaped_input = input.replace('\'', "'\\''");
+            let escaped_filter = filter.replace('\'', "'\\''");
+            let script = format!("printf '%s' '{escaped_input}' | yq '{escaped_filter}'");
+            let result = bash.exec(&script).await.unwrap_or_default();
+            assert_fuzz_invariants(
+                &result,
+                "yq_arbitrary_yaml_and_filter",
+                &["serde_yaml_ng::", "Mapping {", "TaggedValue {"],
+            );
+        }));
+    }
+
+    /// awk with arbitrary program input must not leak.
+    #[test]
+    fn awk_arbitrary_program_no_leak(program in arbitrary_tool_arg()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+        RT.with(|rt| rt.block_on(async {
+            fuzz_init();
+            let limits = ExecutionLimits::new()
+                .max_commands(5)
+                .max_stdout_bytes(4096)
+                .max_stderr_bytes(4096)
+                .timeout(Duration::from_millis(200));
+            let mut bash = Bash::builder().limits(limits).build();
+            let escaped = program.replace('\'', "'\\''");
+            let script = format!("echo 'a b c' | awk '{}'", escaped);
+            let result = bash.exec(&script).await.unwrap_or_default();
+            assert_fuzz_invariants(&result, "awk_arbitrary_program", &[]);
+        }));
+    }
+
+    /// grep with arbitrary regex must not leak (TM-INF-022 + ReDoS guard).
+    #[test]
+    fn grep_arbitrary_regex_no_leak(pattern in arbitrary_tool_arg()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+        RT.with(|rt| rt.block_on(async {
+            fuzz_init();
+            let limits = ExecutionLimits::new()
+                .max_commands(5)
+                .max_stdout_bytes(4096)
+                .max_stderr_bytes(4096)
+                .timeout(Duration::from_millis(200));
+            let mut bash = Bash::builder().limits(limits).build();
+            let escaped = pattern.replace('\'', "'\\''");
+            let script = format!("echo 'hello world' | grep -E '{}'", escaped);
+            let result = bash.exec(&script).await.unwrap_or_default();
+            assert_fuzz_invariants(&result, "grep_arbitrary_regex", &[]);
+        }));
+    }
+
+    /// sed with arbitrary expression must not leak.
+    #[test]
+    fn sed_arbitrary_expr_no_leak(expr in arbitrary_tool_arg()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+        RT.with(|rt| rt.block_on(async {
+            fuzz_init();
+            let limits = ExecutionLimits::new()
+                .max_commands(5)
+                .max_stdout_bytes(4096)
+                .max_stderr_bytes(4096)
+                .timeout(Duration::from_millis(200));
+            let mut bash = Bash::builder().limits(limits).build();
+            let escaped = expr.replace('\'', "'\\''");
+            let script = format!("echo 'hello' | sed '{}'", escaped);
+            let result = bash.exec(&script).await.unwrap_or_default();
+            assert_fuzz_invariants(&result, "sed_arbitrary_expr", &[]);
+        }));
+    }
+
+    /// json with arbitrary path must not leak.
+    #[test]
+    fn json_arbitrary_path_no_leak(path in arbitrary_tool_arg()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+        RT.with(|rt| rt.block_on(async {
+            fuzz_init();
+            let limits = ExecutionLimits::new()
+                .max_commands(5)
+                .max_stdout_bytes(4096)
+                .max_stderr_bytes(4096)
+                .timeout(Duration::from_millis(200));
+            let mut bash = Bash::builder().limits(limits).build();
+            let escaped = path.replace('\'', "'\\''");
+            let script = format!("echo '{{\"a\":1}}' | json get '{}'", escaped);
+            let result = bash.exec(&script).await.unwrap_or_default();
+            assert_fuzz_invariants(&result, "json_arbitrary_path", &[]);
+        }));
+    }
+}
+
+// ============================================================================
+// Static script analysis (TM-ESC-032)
+//
+// Hosts gate execution on `analyze()` output, so the invariants that matter
+// are: it never panics, it never inserts command-name characters, and anything it
+// cannot resolve statically must surface as opaque rather than as safe.
+// ============================================================================
+
+/// Scripts built only from statically-named, side-effect-free commands.
+/// Every dispatched command name must appear in the analysis.
+fn static_script_strategy() -> impl Strategy<Value = String> {
+    let atom = prop_oneof![
+        Just("echo hello".to_string()),
+        Just("true".to_string()),
+        Just("printf '%s' x".to_string()),
+        Just("echo a | grep a".to_string()),
+        Just("basename /x/y".to_string()),
+        Just("echo one > /tmp/p_a".to_string()),
+        Just("cat /tmp/p_a".to_string()),
+        Just("if true; then echo t; fi".to_string()),
+        Just("for i in 1 2; do echo $i; done".to_string()),
+        Just("echo $(basename /x/y)".to_string()),
+        Just("V=1 echo $V".to_string()),
+    ];
+    proptest::collection::vec(atom, 1..6).prop_map(|parts| parts.join("; "))
+}
+
+/// Scripts whose effective command is only known at runtime.
+fn opaque_script_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("c=echo; $c hi".to_string()),
+        Just("$(echo echo) hi".to_string()),
+        Just("eval \"echo hi\"".to_string()),
+        Just("bash -c 'echo hi'".to_string()),
+        Just("sh -c 'echo hi'".to_string()),
+        Just("bash /tmp/nope.sh".to_string()),
+        Just(". /tmp/nope.sh".to_string()),
+        Just("source /tmp/nope.sh".to_string()),
+        Just("${cmd} hi".to_string()),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Analysis must never panic, whatever the input.
+    #[test]
+    fn analyze_never_panics(input in bash_input_strategy()) {
+        let _ = bashkit::analysis::analyze(&input);
+    }
+
+    /// Multi-byte input must not trip byte/char index handling.
+    #[test]
+    fn analyze_never_panics_on_multibyte(input in arithmetic_multibyte_strategy()) {
+        let _ = bashkit::analysis::analyze(&input);
+    }
+
+    /// Analysis is pure: same input, same result.
+    #[test]
+    fn analyze_is_deterministic(input in bash_input_strategy()) {
+        let first = bashkit::analysis::analyze(&input);
+        let second = bashkit::analysis::analyze(&input);
+        prop_assert_eq!(first.is_ok(), second.is_ok());
+        if let (Ok(a), Ok(b)) = (first, second) {
+            prop_assert_eq!(a, b);
+        }
+    }
+
+    /// Outside ANSI-C quotes, known-name characters come from the source in order.
+    #[test]
+    fn analyze_command_name_characters_come_from_source(input in bash_input_strategy()) {
+        if let Ok(analysis) = bashkit::analysis::analyze(&input)
+            && !input.contains("$'") {
+            for command in &analysis.commands {
+                if let Some(name) = command.name.as_deref() {
+                    let mut source = input.chars();
+                    prop_assert!(name.chars().all(|wanted| source.any(|ch| ch == wanted)));
+                }
+            }
+        }
+    }
+
+    /// Output stays inside the node budget, and hitting it sets `truncated`.
+    #[test]
+    fn analyze_respects_the_node_budget(n in 1..600usize) {
+        let script = "echo x > /tmp/f;".repeat(n);
+        let analysis = bashkit::analysis::analyze(&script).expect("parses");
+        let nodes = analysis.commands.len() + analysis.redirects.len();
+        prop_assert!(nodes <= bashkit::analysis::MAX_ANALYSIS_NODES);
+        prop_assert_eq!(
+            analysis.truncated,
+            nodes == bashkit::analysis::MAX_ANALYSIS_NODES
+        );
+        prop_assert!(!analysis.truncated || analysis.is_opaque());
+    }
+
+    /// The load-bearing invariant: for a transparent script, every command the
+    /// interpreter actually dispatches was reported by the analysis. A host
+    /// that allowlists `command_names()` must not be surprised at runtime.
+    #[test]
+    fn analysis_covers_every_dispatched_command(script in static_script_strategy()) {
+        thread_local! {
+            static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
+        let dispatched = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = dispatched.clone();
+        let mut bash = Bash::builder()
+            .limits(
+                ExecutionLimits::new()
+                    .max_commands(200)
+                    .timeout(Duration::from_millis(500)),
+            )
+            .before_tool(Box::new(move |event: bashkit::hooks::ToolEvent| {
+                sink.lock().expect("lock").push(event.name.clone());
+                bashkit::hooks::HookAction::Continue(event)
+            }))
+            .build();
+
+        let analysis = bash.analyze(&script).expect("generated script parses");
+        prop_assert!(!analysis.is_opaque(), "generator emits transparent scripts only");
+
+        RT.with(|rt| rt.block_on(async {
+            let _ = bash.exec(&script).await;
+        }));
+
+        let names = analysis.command_names();
+        for ran in dispatched.lock().expect("lock").iter() {
+            prop_assert!(
+                names.contains(&ran.as_str()),
+                "`{}` ran but analysis reported {:?} for `{}`",
+                ran,
+                names,
+                script
+            );
+        }
+    }
+
+    /// Scripts that resolve their command at runtime must never analyze as
+    /// transparent — that is the bypass TM-ESC-032 guards against.
+    #[test]
+    fn runtime_resolved_scripts_are_opaque(script in opaque_script_strategy()) {
+        let analysis = bashkit::analysis::analyze(&script).expect("parses");
+        prop_assert!(analysis.is_opaque(), "`{}` must not analyze as transparent", script);
+    }
+}
+
+// ============================================================================
+// Snapshot decoding (TM-SNAP-*)
+// ============================================================================
+//
+// Snapshot bytes are the one input hosts routinely load from storage they do
+// not fully control, and the unkeyed integrity digest is explicitly not a
+// security boundary (TM-SNAP-001). The `snapshot_fuzz` target explores this
+// space far more deeply, but it only gets compile-checked on a PR — these run
+// on every CI pass.
+
+/// Byte strings shaped like the things a damaged store actually returns.
+fn snapshot_bytes_strategy() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        // Free-form noise of every interesting length around the header.
+        proptest::collection::vec(any::<u8>(), 0..200),
+        // A plausible digest followed by arbitrary body.
+        proptest::collection::vec(any::<u8>(), 32..160),
+        // The v2 magic followed by noise, so the container decoder is reached
+        // rather than bailing at the prefix check.
+        proptest::collection::vec(any::<u8>(), 0..128).prop_map(|tail| [
+            vec![0u8; 32],
+            b"BKSNAP".to_vec(),
+            tail
+        ]
+        .concat()),
+        // A JSON-ish prefix, which routes to the legacy v1 decoder.
+        proptest::collection::vec(any::<u8>(), 0..128).prop_map(|tail| [
+            vec![0u8; 32],
+            b"{".to_vec(),
+            tail
+        ]
+        .concat()),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Arbitrary bytes must be an error, never a panic, and must never leave a
+    /// live instance damaged.
+    #[test]
+    fn snapshot_decode_never_panics(data in snapshot_bytes_strategy()) {
+        fuzz_init();
+
+        // Both formats, both integrity modes.
+        let _ = bashkit::Snapshot::from_bytes(&data);
+        let _ = bashkit::Snapshot::from_bytes_keyed(&data, b"proptest-key");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut bash = Bash::new();
+        rt.block_on(async {
+            bash.exec("echo intact > /intact.txt").await.unwrap();
+        });
+
+        // Whatever the bytes are, the instance survives and stays usable.
+        let _ = bash.restore_snapshot_with_policy(&data, bashkit::CheckoutPolicy::Force);
+        let result = rt.block_on(async { bash.exec("echo alive").await });
+        prop_assert!(result.is_ok(), "instance unusable after a rejected restore");
+        prop_assert_eq!(result.unwrap().stdout, "alive\n");
+    }
+
+    /// Object ids come from callers as strings in three languages, so any byte
+    /// sequence can reach the parser — including multi-byte characters at any
+    /// offset, which used to panic.
+    #[test]
+    fn object_id_parsing_never_panics(text in ".{0,80}") {
+        let _ = bashkit::ObjectId::from_hex(&text);
+
+        // Slice at character boundaries so lengths vary around the 64-byte
+        // check without constructing invalid UTF-8.
+        for (offset, _) in text.char_indices() {
+            let _ = bashkit::ObjectId::from_hex(&text[offset..]);
+        }
+    }
+
+    /// A store full of junk must not panic any graph walker, and a commit id
+    /// that happens to collide with a junk entry must still be refused.
+    #[test]
+    fn graph_walks_never_panic_on_a_junk_store(
+        seed in proptest::collection::vec(any::<u8>(), 32..128),
+    ) {
+        use std::collections::HashMap;
+
+        let mut root_bytes = [0u8; 32];
+        root_bytes.copy_from_slice(&seed[..32]);
+        let root = bashkit::ObjectId::from_bytes(root_bytes);
+
+        let mut store: HashMap<bashkit::ObjectId, Vec<u8>> = HashMap::new();
+        store.insert(root, seed[32..].to_vec());
+
+        let _ = bashkit::SnapshotGraph::read_commit(root, &store);
+        let _ = bashkit::SnapshotGraph::parents(root, &store);
+        let _ = bashkit::SnapshotGraph::meta(root, &store);
+        let _ = bashkit::SnapshotGraph::capabilities(root, &store);
+        let _ = bashkit::SnapshotGraph::ancestry(root, &store, 1000);
+        let _ = bashkit::SnapshotGraph::plan_checkout(root, &store);
+        let _ = bashkit::SnapshotGraph::reachable(root, &store);
+        let _ = bashkit::SnapshotGraph::diff(root, root, &store);
+
+        let mut bash = Bash::new();
+        prop_assert!(
+            bash.checkout(root, &store, bashkit::CheckoutPolicy::Force).is_err(),
+            "a junk store must never satisfy a checkout"
+        );
+    }
+}

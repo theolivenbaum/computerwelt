@@ -1,0 +1,101 @@
+"""
+PydanticAI integration for Bashkit.
+
+Provides a Tool that wraps BashTool for use with PydanticAI agents.
+
+Create a tool and attach it to a PydanticAI agent::
+
+    >>> from bashkit.pydantic_ai import create_bash_tool
+    >>> from pydantic_ai import Agent
+    >>>
+    >>> tool = create_bash_tool(timeout_seconds=30)
+    >>> agent = Agent('anthropic:claude-sonnet-5', tools=[tool])
+
+The agent can then run bash commands in a sandboxed VFS::
+
+    >>> result = await agent.run("List files in the home directory")
+"""
+
+from __future__ import annotations
+
+try:
+    from pydantic_ai import Tool
+
+    PYDANTIC_AI_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AI_AVAILABLE = False
+
+from bashkit import BashTool as NativeBashTool
+
+
+def create_bash_tool(
+    username: str | None = None,
+    hostname: str | None = None,
+    max_commands: int | None = None,
+    max_loop_iterations: int | None = None,
+    timeout_seconds: float | None = None,
+    max_output_length: int = 100_000,
+) -> Tool:
+    """Create a PydanticAI Tool wrapping Bashkit.
+
+    Args:
+        username: Custom username for sandbox
+        hostname: Custom hostname for sandbox
+        max_commands: Max commands to execute
+        max_loop_iterations: Max loop iterations
+        timeout_seconds: Execution timeout in seconds. When set, commands
+            that exceed this duration are aborted with exit code 124.
+
+    Returns:
+        Tool for use with ``Agent(tools=[...])``
+
+    Raises:
+        ImportError: If pydantic-ai is not installed
+
+    Example:
+        >>> from bashkit.pydantic_ai import create_bash_tool
+        >>> tool = create_bash_tool(timeout_seconds=30)
+        >>> from pydantic_ai import Agent
+        >>> agent = Agent('anthropic:claude-sonnet-5', tools=[tool])
+    """
+    if not PYDANTIC_AI_AVAILABLE:
+        raise ImportError(
+            "pydantic-ai is required for PydanticAI integration. Install with: pip install 'bashkit[pydantic-ai]'"
+        )
+
+    native = NativeBashTool(
+        username=username,
+        hostname=hostname,
+        max_commands=max_commands,
+        max_loop_iterations=max_loop_iterations,
+        timeout_seconds=timeout_seconds,
+    )
+
+    async def bash(commands: str) -> str:
+        """Execute bash commands in a sandboxed virtual environment.
+
+        Runs commands like ``bash -c "commands"``. All file operations happen
+        in a virtual filesystem — nothing touches the real host.
+
+        Args:
+            commands: Bash commands to execute
+        """
+        result = await native.execute(commands)
+
+        output = result.stdout
+        if result.error:
+            output += f"\nError: {result.error}"
+        if result.stderr:
+            output += f"\nSTDERR: {result.stderr}"
+        if result.exit_code != 0:
+            output += f"\n[Exit code: {result.exit_code}]"
+
+        output = output if output else "[No output]"
+        if len(output) > max_output_length:
+            output = output[:max_output_length] + "\n[truncated]"
+        return output
+
+    return Tool(bash, takes_ctx=False, name="bash")
+
+
+__all__ = ["create_bash_tool"]

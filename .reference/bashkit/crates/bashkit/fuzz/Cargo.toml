@@ -1,0 +1,153 @@
+# Fuzz testing for Bashkit parser
+# Run with: cargo +nightly fuzz run parser_fuzz
+# See knowledge/security/threat-model.md for security context
+
+[package]
+name = "bashkit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1", features = ["rt"] }
+
+[dependencies.bashkit]
+path = ".."
+features = ["jq"]
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parser_fuzz"
+path = "fuzz_targets/parser_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_fuzz"
+path = "fuzz_targets/snapshot_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "analyze_fuzz"
+path = "fuzz_targets/analyze_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lexer_fuzz"
+path = "fuzz_targets/lexer_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arithmetic_fuzz"
+path = "fuzz_targets/arithmetic_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob_fuzz"
+path = "fuzz_targets/glob_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jq_fuzz"
+path = "fuzz_targets/jq_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "awk_fuzz"
+path = "fuzz_targets/awk_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "printf_fuzz"
+path = "fuzz_targets/printf_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "base64_fuzz"
+path = "fuzz_targets/base64_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envsubst_fuzz"
+path = "fuzz_targets/envsubst_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sed_fuzz"
+path = "fuzz_targets/sed_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yq_fuzz"
+path = "fuzz_targets/yq_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "template_fuzz"
+path = "fuzz_targets/template_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grep_fuzz"
+path = "fuzz_targets/grep_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "csv_fuzz"
+path = "fuzz_targets/csv_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_fuzz"
+path = "fuzz_targets/archive_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tomlq_fuzz"
+path = "fuzz_targets/tomlq_fuzz.rs"
+test = false
+doc = false
+bench = false

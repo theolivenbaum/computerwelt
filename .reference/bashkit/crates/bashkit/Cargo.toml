@@ -1,0 +1,312 @@
+# Bashkit core library
+# Sandboxed bash interpreter for multi-tenant environments
+
+[package]
+name = "bashkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+# futures-core / tower are only pulled in by the LLM `BashTool` wrapper
+# (and the `scripted_tool` layer on top of it). Optional, gated under `bash_tool`.
+futures-core = { workspace = true, optional = true }
+futures-util = { workspace = true }
+tower = { workspace = true, optional = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true, optional = true }
+
+# Regex
+regex = { workspace = true }
+fancy-regex = { workspace = true }
+
+# Date/Time
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+
+# HTTP client (for curl/wget) - optional, enabled with http_client feature
+reqwest = { workspace = true, optional = true }
+# Direct rustls dep so we can install the `ring` crypto provider at runtime
+# (paired with reqwest's `rustls-no-provider` feature). Optional, gated under http_client.
+rustls = { workspace = true, optional = true }
+
+# SSH client (for ssh/scp/sftp) - optional, enabled with ssh feature
+russh = { workspace = true, optional = true }
+
+# Fault injection for testing (optional)
+fail = { workspace = true, optional = true }
+
+# URL parsing
+url = "2"
+
+# Compact flag bitsets used by the interpreter for variable attributes
+# (readonly/integer/lower/upper) and shell options (set -e/-u/-x/-o pipefail).
+# Stays the format!()-based `_READONLY_X`/`SHOPT_*` keys off the hot path.
+bitflags = "2"
+
+# JSON processing (jq) - optional, enabled with jq feature
+jaq-core = { workspace = true, optional = true }
+jaq-std = { workspace = true, optional = true }
+jaq-json = { workspace = true, optional = true }
+
+# Compression (for gzip/gunzip and bzip2/bunzip2)
+flate2 = { workspace = true }
+bzip2 = { workspace = true }
+
+# Base64 encoding (for base64 builtin and HTTP basic auth)
+base64 = { workspace = true }
+
+# Ed25519 signing for bot-auth request signing (optional)
+ed25519-dalek = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+# CSPRNG for credential placeholder generation
+getrandom = { workspace = true }
+
+# Checksums (for md5sum, sha1sum, sha256sum builtins)
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hmac = "0.13"
+
+# Logging/tracing (optional)
+tracing = { workspace = true, optional = true }
+
+# CLI-style argument parsing for custom builtins and ported coreutils
+# argument surfaces. Always on — see knowledge/runtimes/coreutils-args-port.md.
+clap = { workspace = true }
+
+# Pinned to uutils' workspace versions. Used by the vendored
+# uucore::format module (see crates/bashkit/src/builtins/generated/format)
+# that backs `printf`. Kept platform-clean — no rustix / errno
+# transitive deps — so wasm32 stays buildable.
+bigdecimal = "0.4"
+num-traits = "0.2"
+unit-prefix = "0.5"
+os_display = "0.1.3"
+
+# Embedded Python interpreter (optional).
+# Registry dep since monty 0.0.19 — the first version published to crates.io.
+# Keeps `python` usable for downstream crates and lets the publish workflow
+# ship the feature instead of stripping it.
+#
+# Important decision (security): held at 0.0.19. Cargo treats `0.0.z` as its own
+# compatibility range (`^0.0.19` == `>=0.0.19, <0.0.20`), so this is already an
+# exact pin; the matching `ignore` entries in .github/dependabot.yml stop the
+# bump PRs from being regenerated.
+#
+# 0.0.21 moves `max_memory` enforcement from host-side accounting to a probe of
+# the `LIVE_MEMORY`/`BASELINE_MEMORY` globals, which only the separate
+# `monty-alloc` crate writes — and only when installed as the process-wide
+# global allocator. Bashkit is an embeddable library (and bashkit-python is a
+# CPython extension module), so it cannot impose a global allocator on its
+# hosts. Without one, `probe_memory()` is `0.saturating_sub(usize::MAX)` == 0
+# and the Python sandbox's memory ceiling silently stops being enforced.
+# See knowledge/runtimes/python-builtin.md § Upgrade blocker.
+monty = { version = "0.0.19", optional = true }
+monty-types = { version = "0.0.19", optional = true }
+
+# Embedded TypeScript interpreter (optional)
+zapcode-core = { version = "1.5.1", optional = true }
+
+# Embedded SQLite engine via Turso (optional, BETA upstream).
+# Pulls a multi-MB transitive dep tree only when the `sqlite` feature is active.
+turso_core = { workspace = true, optional = true }
+
+[features]
+default = ["bash_tool"]
+# Enable the LLM-facing `BashTool` wrapper: the `Tool` trait, `ToolExecution`,
+# OpenAI tool-definition/JSON-schema helpers, and the `tower::Service` bridge.
+# On by default. Disable with `--no-default-features` to compile just the
+# embeddable `Bash` interpreter and drop the `tower` / `futures-core` deps.
+# Usage: cargo build --no-default-features [--features <others>]
+bash_tool = ["dep:tower", "dep:futures-core"]
+# Enable jq builtin via embedded jaq interpreter
+# Usage: cargo build --features jq
+jq = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json", "dep:serde_yaml_ng"]
+http_client = ["reqwest", "rustls"]
+# Enable Ed25519 request signing per RFC 9421 / web-bot-auth profile
+bot-auth = ["http_client", "dep:ed25519-dalek", "dep:rand", "dep:zeroize"]
+# Enable fail points for security/fault injection testing
+# Usage: FAILPOINTS="fail_point_name=action" cargo test --features failpoints
+failpoints = ["fail/failpoints"]
+# Enable structured logging via tracing crate
+# Usage: cargo build --features logging
+logging = ["tracing"]
+# Enable git builtin for sandboxed git operations
+# Phase 1: Local operations (init, config, add, commit, status, log)
+# Phase 2 will add gix dependency for remote operations
+# Usage: cargo build --features git
+git = []
+# Enable ssh/scp/sftp builtins for remote command execution and file transfer
+# Usage: cargo build --features ssh
+ssh = ["russh"]
+# Enable ScriptedTool: compose ToolDef+callback pairs into a single Tool
+# Builds on the `BashTool` contract, so it pulls in the `bash_tool` feature.
+# Usage: cargo build --features scripted_tool
+scripted_tool = ["bash_tool"]
+# Enable python/python3 builtins via embedded Monty interpreter
+# Usage: cargo build --features python
+python = ["dep:monty", "dep:monty-types"]
+# Enable ts/node/deno/bun builtins via embedded ZapCode TypeScript interpreter
+# Usage: cargo build --features typescript
+typescript = ["dep:zapcode-core"]
+# Enable sqlite/sqlite3 builtins backed by Turso (pure-Rust SQLite-compatible
+# engine). Phase 1 uses turso's `MemoryIO` with a load/flush against the VFS
+# at command boundaries; Phase 2 plugs the bashkit VFS in via a custom `IO`
+# implementation. Both paths share the same builtin and dot-command surface.
+# See knowledge/runtimes/sqlite-builtin.md.
+#
+# Turso is BETA upstream — keep this off by default and document the risk.
+# Requires the multi-threaded tokio runtime so the sync `IO` trait can bridge
+# back to the async VFS via `block_in_place`.
+# Usage: cargo build --features sqlite
+sqlite = ["dep:turso_core", "tokio/rt-multi-thread"]
+# Enable RealFs backend for accessing host filesystem directories
+# WARNING: This intentionally breaks the sandbox boundary.
+# Usage: cargo build --features realfs
+realfs = ["dep:rand"]
+# Enable native-extension interop contracts such as bashkit::interop::fs.
+interop = ["tokio/rt-multi-thread"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+pretty_assertions = { workspace = true }
+insta = { workspace = true }
+criterion = { version = "0.8", features = ["async_tokio"] }
+proptest = { workspace = true }
+tempfile = "3"
+serial_test = { workspace = true }
+
+# Important decision: consolidate the bulk of integration tests into one
+# binary. Cargo's auto-discovery makes every `tests/*.rs` its own crate,
+# statically linking the world (monty, zapcode, turso, russh, jaq,
+# reqwest+rustls, ed25519-dalek) — 80+ link steps blew CI runner disk.
+# This single `[[test]]` rolls them up. Tests that need their own binary
+# (process-global env mutation, `--test-threads=1`, ssh-only feature
+# isolation) remain as siblings at `tests/<name>.rs`. See
+# `knowledge/operations/testing.md` for the convention.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+[[bench]]
+name = "parallel_execution"
+harness = false
+
+[[bench]]
+name = "hotpath"
+harness = false
+
+[[bench]]
+name = "file_ops"
+harness = false
+
+[[bench]]
+name = "awk_regex"
+harness = false
+
+[[bench]]
+name = "snapshot_history"
+harness = false
+
+[[bench]]
+name = "sqlite"
+harness = false
+required-features = ["sqlite"]
+
+[[example]]
+name = "agent_tool"
+required-features = ["http_client"]
+
+[[example]]
+name = "git_workflow"
+required-features = ["git"]
+
+[[example]]
+name = "ssh_supabase"
+required-features = ["ssh"]
+
+[[example]]
+name = "show_tool_output"
+required-features = ["bash_tool"]
+
+[[example]]
+name = "scripted_tool"
+required-features = ["scripted_tool"]
+
+[[example]]
+name = "python_scripts"
+required-features = ["python"]
+
+[[example]]
+name = "python_external_functions"
+required-features = ["python"]
+
+[[example]]
+name = "typescript_scripts"
+required-features = ["typescript"]
+
+[[example]]
+name = "typescript_external_functions"
+required-features = ["typescript"]
+
+[[example]]
+name = "realfs_readonly"
+required-features = ["realfs"]
+
+[[example]]
+name = "realfs_readwrite"
+required-features = ["realfs"]
+
+[[example]]
+name = "sqlite_basic"
+required-features = ["sqlite"]
+
+[[example]]
+name = "sqlite_workflow"
+required-features = ["sqlite"]
+
+# Additional tokio features needed only on native (not WASM)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
+
+# std::time::{Instant,SystemTime} panic on wasm32-unknown-unknown; see
+# time_compat.rs. Only pulled in for wasm32 — everywhere else time_compat
+# re-exports std::time directly with zero overhead.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = { workspace = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+gloo-timers = { version = "0.4", features = ["futures"] }
+send_wrapper = { version = "0.6", features = ["futures"] }
+
+# Vendored uucore modules (e.g. generated/format/human.rs) carry upstream
+# `#[cfg(feature = "i18n-decimal")]` gates. bashkit has no i18n surface —
+# the port tool hard-errors on Fluent/translate imports — so this feature
+# is never defined here and the gated branch is always compiled out. Declare
+# it as a known cfg so `unexpected_cfgs` (denied via -D warnings in CI) does
+# not flag the vendored code. See knowledge/runtimes/coreutils-args-port.md.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("i18n-decimal"))'] }

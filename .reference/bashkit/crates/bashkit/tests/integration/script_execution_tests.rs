@@ -1,0 +1,510 @@
+//! Tests for executing script files by path and $PATH search.
+//!
+//! Covers: absolute path, relative path, arguments, shebang stripping,
+//! missing file, directory, permission denied, exit code propagation,
+//! nested paths, and $PATH search.
+
+use bashkit::Bash;
+use std::path::Path;
+
+/// Execute script by absolute path
+#[tokio::test]
+async fn exec_script_by_absolute_path() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/test.sh"), b"#!/bin/bash\necho hello")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/test.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/test.sh").await.unwrap();
+    assert_eq!(result.stdout.trim(), "hello");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// Execute script without shebang line
+#[tokio::test]
+async fn exec_script_without_shebang() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/no_shebang.sh"), b"echo no shebang")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/no_shebang.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/no_shebang.sh").await.unwrap();
+    assert_eq!(result.stdout.trim(), "no shebang");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// Execute script with arguments ($1, $2)
+#[tokio::test]
+async fn exec_script_with_args() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(
+        Path::new("/greet.sh"),
+        b"#!/bin/bash\necho \"Hello, $1 and $2!\"",
+    )
+    .await
+    .unwrap();
+    fs.chmod(Path::new("/greet.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/greet.sh world moon").await.unwrap();
+    assert_eq!(result.stdout.trim(), "Hello, world and moon!");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// $0 is set to the script name
+#[tokio::test]
+async fn exec_script_dollar_zero() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/show_name.sh"), b"#!/bin/bash\necho $0")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/show_name.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/show_name.sh").await.unwrap();
+    assert_eq!(result.stdout.trim(), "/show_name.sh");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// Nonexistent file returns "No such file or directory" (exit 127)
+#[tokio::test]
+async fn exec_script_missing_file() {
+    let mut bash = Bash::new();
+
+    let result = bash.exec("/missing.sh").await.unwrap();
+    assert!(result.stderr.contains("No such file or directory"));
+    assert_eq!(result.exit_code, 127);
+}
+
+/// Directory returns "Is a directory" (exit 126)
+#[tokio::test]
+async fn exec_script_is_directory() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.mkdir(Path::new("/mydir"), false).await.unwrap();
+
+    let result = bash.exec("/mydir").await.unwrap();
+    assert!(result.stderr.contains("Is a directory"));
+    assert_eq!(result.exit_code, 126);
+}
+
+/// Not executable returns "Permission denied" (exit 126)
+#[tokio::test]
+async fn exec_script_permission_denied() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/noperm.sh"), b"echo nope")
+        .await
+        .unwrap();
+    // Default mode is 0o644 — not executable
+
+    let result = bash.exec("/noperm.sh").await.unwrap();
+    assert!(result.stderr.contains("Permission denied"));
+    assert_eq!(result.exit_code, 126);
+}
+
+/// Exit code propagation from script
+#[tokio::test]
+async fn exec_script_exit_code_propagation() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/fail.sh"), b"#!/bin/bash\nexit 42")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/fail.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/fail.sh\necho $?").await.unwrap();
+    assert_eq!(result.stdout.trim(), "42");
+}
+
+/// Nested directory paths work
+#[tokio::test]
+async fn exec_script_nested_path() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.mkdir(Path::new("/workspace/.agents/skills/nav/scripts"), true)
+        .await
+        .unwrap();
+    fs.write_file(
+        Path::new("/workspace/.agents/skills/nav/scripts/nav.sh"),
+        b"#!/bin/bash\necho \"nav: $1\"",
+    )
+    .await
+    .unwrap();
+    fs.chmod(
+        Path::new("/workspace/.agents/skills/nav/scripts/nav.sh"),
+        0o755,
+    )
+    .await
+    .unwrap();
+
+    let result = bash
+        .exec("/workspace/.agents/skills/nav/scripts/nav.sh dist")
+        .await
+        .unwrap();
+    assert_eq!(result.stdout.trim(), "nav: dist");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// $PATH search finds and executes script
+#[tokio::test]
+async fn exec_script_via_path_search() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.mkdir(Path::new("/usr/local/bin"), true).await.unwrap();
+    fs.write_file(
+        Path::new("/usr/local/bin/myscript"),
+        b"#!/bin/bash\necho found",
+    )
+    .await
+    .unwrap();
+    fs.chmod(Path::new("/usr/local/bin/myscript"), 0o755)
+        .await
+        .unwrap();
+
+    let result = bash.exec("PATH=/usr/local/bin\nmyscript").await.unwrap();
+    assert_eq!(result.stdout.trim(), "found");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// $PATH search skips non-executable files
+#[tokio::test]
+async fn path_search_skips_non_executable() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.mkdir(Path::new("/bin1"), false).await.unwrap();
+    fs.mkdir(Path::new("/bin2"), false).await.unwrap();
+    // /bin1/cmd exists but not executable
+    fs.write_file(Path::new("/bin1/cmd"), b"echo wrong")
+        .await
+        .unwrap();
+    // /bin2/cmd is executable
+    fs.write_file(Path::new("/bin2/cmd"), b"echo right")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/bin2/cmd"), 0o755).await.unwrap();
+
+    let result = bash.exec("PATH=/bin1:/bin2\ncmd").await.unwrap();
+    assert_eq!(result.stdout.trim(), "right");
+}
+
+/// $PATH search returns "command not found" when no match
+#[tokio::test]
+async fn path_search_command_not_found() {
+    let mut bash = Bash::new();
+
+    let result = bash.exec("PATH=\nnosuchcmd").await.unwrap();
+    assert!(result.stderr.contains("command not found"));
+    assert_eq!(result.exit_code, 127);
+}
+
+/// Command-not-found suggests similar builtins (typo detection)
+#[tokio::test]
+async fn command_not_found_typo_suggestion() {
+    let mut bash = Bash::new();
+
+    // "grepp" is close to "grep" (distance=1, unique match)
+    let result = bash.exec("grepp test").await.unwrap();
+    assert_eq!(result.exit_code, 127);
+    assert!(result.stderr.contains("Did you mean"));
+    assert!(result.stderr.contains("grep"));
+}
+
+/// Command-not-found hints for unavailable sandbox commands
+#[tokio::test]
+async fn command_not_found_sandbox_hint() {
+    let mut bash = Bash::new();
+
+    let result = bash.exec("pip install foo").await.unwrap();
+    assert_eq!(result.exit_code, 127);
+    assert!(result.stderr.contains("Package managers"));
+
+    let result = bash.exec("sudo ls").await.unwrap();
+    assert_eq!(result.exit_code, 127);
+    assert!(result.stderr.contains("privilege"));
+
+    // With ssh feature, ssh is a registered builtin (returns "not configured").
+    // Without ssh feature, ssh is unavailable (returns "command not found").
+    let result = bash.exec("ssh user@host").await.unwrap();
+    #[cfg(feature = "ssh")]
+    {
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("not configured"));
+    }
+    #[cfg(not(feature = "ssh"))]
+    {
+        assert_eq!(result.exit_code, 127);
+        assert!(result.stderr.contains("ssh"));
+    }
+}
+
+/// Completely unknown command has no suggestion
+#[tokio::test]
+async fn command_not_found_no_suggestion() {
+    let mut bash = Bash::new();
+
+    let result = bash.exec("zzzznonexistent").await.unwrap();
+    assert_eq!(result.exit_code, 127);
+    assert!(result.stderr.contains("command not found"));
+    assert!(!result.stderr.contains("Did you mean"));
+}
+
+/// Script with relative path (contains /)
+#[tokio::test]
+async fn exec_script_relative_path() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.mkdir(Path::new("/workspace"), false).await.unwrap();
+    fs.write_file(Path::new("/workspace/run.sh"), b"echo relative works")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/workspace/run.sh"), 0o755)
+        .await
+        .unwrap();
+
+    // Set cwd to /workspace so ./run.sh resolves
+    let result = bash.exec("cd /workspace\n./run.sh").await.unwrap();
+    assert_eq!(result.stdout.trim(), "relative works");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// Script calls another script by path
+#[tokio::test]
+async fn exec_script_calls_script() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/inner.sh"), b"#!/bin/bash\necho inner")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/inner.sh"), 0o755).await.unwrap();
+
+    fs.write_file(
+        Path::new("/outer.sh"),
+        b"#!/bin/bash\necho outer\n/inner.sh",
+    )
+    .await
+    .unwrap();
+    fs.chmod(Path::new("/outer.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/outer.sh").await.unwrap();
+    assert_eq!(result.stdout, "outer\ninner\n");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// Script written via echo/redirect then chmod +x then executed
+#[tokio::test]
+async fn exec_script_chmod_then_run() {
+    let mut bash = Bash::new();
+
+    let result = bash
+        .exec(
+            "echo '#!/bin/bash\necho script ran' > /tmp/test_exec.sh\n\
+             chmod +x /tmp/test_exec.sh\n\
+             /tmp/test_exec.sh",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.stdout.trim(), "script ran");
+    assert_eq!(result.exit_code, 0);
+}
+
+/// $PATH search with args
+#[tokio::test]
+async fn path_search_with_args() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.mkdir(Path::new("/mybin"), false).await.unwrap();
+    fs.write_file(Path::new("/mybin/greeter"), b"#!/bin/bash\necho \"hi $1\"")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/mybin/greeter"), 0o755).await.unwrap();
+
+    let result = bash.exec("PATH=/mybin\ngreeter alice").await.unwrap();
+    assert_eq!(result.stdout.trim(), "hi alice");
+}
+
+/// Script $# shows argument count
+#[tokio::test]
+async fn exec_script_dollar_hash() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/count.sh"), b"#!/bin/bash\necho $#")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/count.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/count.sh a b c").await.unwrap();
+    assert_eq!(result.stdout.trim(), "3");
+}
+
+/// Script $@ shows all arguments
+#[tokio::test]
+async fn exec_script_dollar_at() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/all.sh"), b"#!/bin/bash\necho $@")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/all.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/all.sh x y z").await.unwrap();
+    assert_eq!(result.stdout.trim(), "x y z");
+}
+
+/// Functions defined in parent are NOT visible in subprocess script execution
+#[tokio::test]
+async fn exec_script_functions_not_inherited() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(
+        Path::new("/check_func.sh"),
+        b"#!/bin/bash\nif declare -f helper > /dev/null 2>&1; then\n  echo found\nelse\n  echo not found\nfi",
+    )
+    .await
+    .unwrap();
+    fs.chmod(Path::new("/check_func.sh"), 0o755).await.unwrap();
+
+    // Define a function in parent, then run subprocess script
+    bash.exec("helper() { echo from_parent; }").await.unwrap();
+    let result = bash.exec("/check_func.sh").await.unwrap();
+    assert_eq!(result.stdout.trim(), "not found");
+}
+
+/// `declare -f nonexistent` should return exit code 1
+#[tokio::test]
+async fn declare_f_nonexistent_function_returns_1() {
+    let mut bash = Bash::new();
+    let result = bash.exec("declare -f no_such_func").await.unwrap();
+    assert_eq!(result.exit_code, 1);
+}
+
+/// `declare -f existing_func` should print definition and return exit code 0
+#[tokio::test]
+async fn declare_f_existing_function_prints_definition() {
+    let mut bash = Bash::new();
+    bash.exec("myfunc() { echo hello; }").await.unwrap();
+    let result = bash.exec("declare -f myfunc").await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stdout.contains("myfunc"));
+}
+
+/// `declare -f` with no args lists all functions
+#[tokio::test]
+async fn declare_f_no_args_lists_all_functions() {
+    let mut bash = Bash::new();
+    bash.exec("foo() { echo a; }").await.unwrap();
+    bash.exec("bar() { echo b; }").await.unwrap();
+    let result = bash.exec("declare -f").await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stdout.contains("foo"));
+    assert!(result.stdout.contains("bar"));
+}
+
+/// Issue #842: $? should be 0 at start of VFS script subprocess, even when
+/// parent had non-zero exit code. Subprocess isolation must reset last_exit_code
+/// to match real bash subprocess behavior.
+#[tokio::test]
+async fn exec_vfs_script_initial_exit_code_is_zero() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(Path::new("/check_exit.sh"), b"#!/bin/bash\necho $?\n")
+        .await
+        .unwrap();
+    fs.chmod(Path::new("/check_exit.sh"), 0o755).await.unwrap();
+
+    // Parent has non-zero exit code, then run VFS script
+    let result = bash.exec("false; /check_exit.sh").await.unwrap();
+    assert_eq!(
+        result.stdout.trim(),
+        "0",
+        "VFS script subprocess should start with $?=0 (like real bash); got stdout={:?}",
+        result.stdout
+    );
+}
+
+/// Issue #842: `set -euo pipefail` in VFS script should not trigger false failure
+/// even after a prior non-zero exit code in the parent shell.
+#[tokio::test]
+async fn exec_vfs_script_set_e_after_prior_failure() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(
+        Path::new("/test.sh"),
+        br#"#!/bin/bash
+set -euo pipefail
+MY_VAR="hello"
+echo "${MY_VAR}"
+"#,
+    )
+    .await
+    .unwrap();
+    fs.chmod(Path::new("/test.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("false; /test.sh").await.unwrap();
+    assert_eq!(
+        result.exit_code, 0,
+        "VFS script with set -e should succeed after prior failure; stdout={:?}, stderr={:?}",
+        result.stdout, result.stderr
+    );
+    assert_eq!(result.stdout.trim(), "hello");
+}
+
+/// Issue #842: Nested VFS scripts with set -e and command substitution.
+#[tokio::test]
+async fn exec_vfs_script_set_e_nested_scripts() {
+    let mut bash = Bash::new();
+    let fs = bash.fs();
+
+    fs.write_file(
+        Path::new("/inner.sh"),
+        br#"#!/bin/bash
+set -euo pipefail
+echo "inner_output"
+"#,
+    )
+    .await
+    .unwrap();
+    fs.chmod(Path::new("/inner.sh"), 0o755).await.unwrap();
+
+    fs.write_file(
+        Path::new("/outer.sh"),
+        br#"#!/bin/bash
+set -euo pipefail
+RESULT="$(/inner.sh)"
+echo "${RESULT}"
+"#,
+    )
+    .await
+    .unwrap();
+    fs.chmod(Path::new("/outer.sh"), 0o755).await.unwrap();
+
+    let result = bash.exec("/outer.sh").await.unwrap();
+    assert_eq!(
+        result.exit_code, 0,
+        "Nested VFS scripts with set -e should work; stdout={:?}, stderr={:?}",
+        result.stdout, result.stderr
+    );
+    assert_eq!(result.stdout.trim(), "inner_output");
+}

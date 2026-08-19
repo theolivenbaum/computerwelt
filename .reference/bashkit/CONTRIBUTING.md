@@ -1,0 +1,110 @@
+# Contributing to Bashkit
+
+Thanks for your interest in contributing to Bashkit!
+
+## How to Contribute
+
+The easiest and most valuable way to contribute is to [create an issue](https://github.com/everruns/bashkit/issues). Bug reports, feature requests, compatibility gaps, and questions all help us prioritize and improve bashkit. A well-described issue is often more impactful than a pull request.
+
+If you'd like to contribute code, read on.
+
+## Setup
+
+```bash
+# Clone
+git clone https://github.com/everruns/bashkit.git
+cd bashkit
+
+# Install just (task runner)
+cargo install just
+
+# Build
+just build
+
+# Test
+just test
+```
+
+## Development Workflow
+
+1. Fork the repo
+2. Create a feature branch
+3. Make changes
+4. Run pre-PR checks: `just pre-pr`
+5. Submit a pull request
+
+## Commands
+
+```bash
+just --list       # Show all commands
+just build        # Build all crates
+just test         # Run all tests
+just fmt          # Format code (auto-fix)
+just check        # fmt + clippy + test (checks only)
+just pre-pr       # Full pre-PR validation
+```
+
+## Code Style
+
+- Format with `cargo fmt`
+- Lint with `cargo clippy -- -D warnings`
+- License check: `cargo deny check`
+
+## Commits
+
+Follow [Conventional Commits](https://www.conventionalcommits.org):
+
+```
+feat(parser): add brace expansion support
+fix(awk): handle regex in gsub correctly
+docs: update compatibility scorecard
+test: add array edge case tests
+```
+
+## Adding Features
+
+1. Check if the feature is documented in `knowledge/`
+2. Add spec tests in `crates/bashkit/tests/spec_cases/`
+3. Implement the feature
+4. Update `crates/bashkit/docs/compatibility.md` if applicable
+5. Update `knowledge/operations/limitations.md` if removing a limitation
+
+## Spec Test Format
+
+Tests live in `.test.sh` files:
+
+```sh
+### test_name
+# Optional description
+echo hello world
+### expect
+hello world
+### end
+
+### skipped_test
+### skip: reason for skipping
+command
+### expect
+expected
+### end
+```
+
+## Pull Request Checklist
+
+- [ ] `just pre-pr` passes
+- [ ] Rebased on main
+- [ ] Knowledge updated if behavior changes
+- [ ] CI green
+
+## Architecture
+
+See `knowledge/` for persistent design and engineering knowledge:
+
+- `architecture.md` - Overall design
+- `parser.md` - Parser/lexer details
+- `vfs.md` - Virtual filesystem
+- `testing.md` - Testing strategy
+
+## Questions?
+
+Open an issue at https://github.com/everruns/bashkit/issues

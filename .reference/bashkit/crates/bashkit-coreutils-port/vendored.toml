@@ -1,0 +1,113 @@
+# Manifest of uucore modules vendored into bashkit by
+# `bashkit-coreutils-port port-module`.
+#
+# Single source of truth for both the porting tool (CLI lookup) and the
+# coreutils-args-drift workflow (which iterates this file to re-port
+# every entry against uutils HEAD). Adding a new vendored module is
+# one TOML stanza here plus consumer wiring in bashkit.
+#
+# Schema: see the rustdoc on `crate::manifest::Manifest`.
+#
+# Currently empty — module-vendor mode lands here as the tool capability
+# (#1533). The first consumer (uucore::format for printf, #1534) adds
+# the first stanza.
+#
+# Example, kept commented out so the file parses cleanly when empty:
+#
+# [[modules]]
+# name = "format"
+# source = "src/uucore/src/lib/features/format"
+# out = "format"
+#
+# [[modules.substitutions]]
+# prefix = "uucore::error::UError"
+# action = "error"
+
+[[modules]]
+name = "format"
+source = "src/uucore/src/lib/features/format"
+out = "format"
+
+# Self-references inside uucore::format now point at the vendored
+# generated module path.
+[[modules.substitutions]]
+prefix = "crate::format"
+action = "replace_with"
+target = "crate::builtins::generated::format"
+
+# Small numeric helper module. Inlined so the generated code stays detached
+# from uucore's broad runtime dependency surface.
+[[modules.substitutions]]
+prefix = "crate::extendedbigdecimal"
+action = "inline"
+inline_source = "src/uucore/src/lib/features/extendedbigdecimal.rs"
+
+# Numeric parser required by FormatArgument::Unparsed.
+[[modules.substitutions]]
+prefix = "crate::parser::num_parser"
+action = "inline"
+inline_source = "src/uucore/src/lib/features/parser/num_parser.rs"
+
+# Bashkit-local replacements for uucore runtime hooks and platform helpers.
+[[modules.substitutions]]
+prefix = "crate::NonUtf8OsStrError"
+action = "replace_with"
+target = "crate::builtins::generated::format_support::NonUtf8OsStrError"
+
+[[modules.substitutions]]
+prefix = "crate::os_str_as_bytes"
+action = "replace_with"
+target = "crate::builtins::generated::format_support::os_str_as_bytes"
+
+[[modules.substitutions]]
+prefix = "crate::error::UError"
+action = "replace_with"
+target = "crate::builtins::generated::format_support::UError"
+
+[[modules.substitutions]]
+prefix = "crate::error::set_exit_code"
+action = "replace_with"
+target = "crate::builtins::generated::format_support::set_exit_code"
+
+# Strips uucore's " (os error N)" suffix off io::Error text so printf's
+# write-error diagnostic matches GNU. Pure string work, reimplemented in
+# format_support rather than dragging in uucore's error module.
+[[modules.substitutions]]
+prefix = "crate::error::strip_errno"
+action = "replace_with"
+target = "crate::builtins::generated::format_support::strip_errno"
+
+# uucore routes FormatError's Display through Fluent. bashkit resolves
+# those messages at port time instead (see the `fluent` action in
+# manifest.rs): the generated code carries plain en-US literals and
+# bashkit links no Fluent and ships no locale bundle.
+[[modules.substitutions]]
+prefix = "crate::translate"
+action = "fluent"
+ftl_sources = [
+    "src/uucore/locales/en-US.ftl",
+    "src/uucore/locales/errors/en-US.ftl",
+]
+
+[[modules.substitutions]]
+prefix = "crate::translate_text"
+action = "fluent"
+ftl_sources = [
+    "src/uucore/locales/en-US.ftl",
+    "src/uucore/locales/errors/en-US.ftl",
+]
+
+[[modules.substitutions]]
+prefix = "crate::quoting_style"
+action = "replace_with"
+target = "crate::builtins::generated::format_support"
+
+[[modules.substitutions]]
+prefix = "crate::show_error"
+action = "replace_with"
+target = "crate::builtins::generated::format_support::show_error"
+
+[[modules.substitutions]]
+prefix = "crate::show_warning"
+action = "replace_with"
+target = "crate::builtins::generated::format_support::show_warning"
