@@ -234,7 +234,11 @@ public sealed class PyInstance : PyObject
 
     /// <inheritdoc />
     public override string Repr() =>
-        Dunder("__repr__") is { } repr ? Invoke(repr, []).Display() : $"<{Class.Name} object>";
+        Dunder("__repr__") is { } repr
+            ? Invoke(repr, []).Display()
+            // The default repr names the class and the identity, as CPython's does; the
+            // "address" is the same identity `id()` reports.
+            : $"<{Class.Name} object at 0x{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this):x8}>";
 
     /// <inheritdoc />
     public override string Display() =>
@@ -253,19 +257,38 @@ public sealed class PyInstance : PyObject
     }
 
     /// <inheritdoc />
-    public override bool PyEquals(PyObject other) =>
-        Dunder("__eq__") is { } equals
-            ? Invoke(equals, [other]).IsTruthy()
-            : ReferenceEquals(this, other);
+    /// <remarks>
+    /// A <c>__eq__</c> that returns <c>NotImplemented</c> is declining to answer, not
+    /// answering "true": the comparison then falls back to identity, which is what makes
+    /// the usual <c>if not isinstance(other, C): return NotImplemented</c> guard work.
+    /// </remarks>
+    public override bool PyEquals(PyObject other)
+    {
+        if (Dunder("__eq__") is not { } equals)
+        {
+            return ReferenceEquals(this, other);
+        }
+
+        var result = Invoke(equals, [other]);
+
+        return result is Builtins.NotImplementedSingleton ? ReferenceEquals(this, other) : result.IsTruthy();
+    }
 
     /// <inheritdoc />
-    public override System.Numerics.BigInteger PyHash() =>
-        Dunder("__hash__") is { } hash
+    public override System.Numerics.BigInteger PyHash()
+    {
+        // `__hash__ = None` is the explicit way to opt out, and a class defining `__eq__`
+        // without `__hash__` opts out implicitly: equal objects would otherwise hash apart.
+        if (Class.GetAttribute("__hash__") is PyNone
+            || (Dunder("__hash__") is null && Dunder("__eq__") is not null))
+        {
+            throw new PyRaise(PyErrors.TypeError($"unhashable type: '{Class.Name}'"));
+        }
+
+        return Dunder("__hash__") is { } hash
             ? ((PyInt)Invoke(hash, [])).Value
-            // A class defining `__eq__` without `__hash__` is unhashable, as Python says.
-            : Dunder("__eq__") is not null
-                ? throw new PyRaise(PyErrors.TypeError($"unhashable type: '{Class.Name}'"))
-                : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
+            : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
+    }
 
     /// <inheritdoc />
     public override int? PyCompare(PyObject other)

@@ -433,7 +433,7 @@ public sealed class PyDict : PyObject
     /// <summary>Reads a value by key.</summary>
     public bool TryGetValue(PyObject key, out PyObject value)
     {
-        if (_index.TryGetValue(new PyKey(key), out var position))
+        if (_index.TryGetValue(PyKey.For(key, "dict key"), out var position))
         {
             value = _entries[position].Value;
             return true;
@@ -446,7 +446,7 @@ public sealed class PyDict : PyObject
     /// <summary>Inserts or replaces a value, keeping the original insertion position.</summary>
     public void Set(PyObject key, PyObject value)
     {
-        var wrapped = new PyKey(key);
+        var wrapped = PyKey.For(key, "dict key");
 
         if (_index.TryGetValue(wrapped, out var position))
         {
@@ -461,7 +461,7 @@ public sealed class PyDict : PyObject
     /// <summary>Removes a key. Returns false when it was absent.</summary>
     public bool Remove(PyObject key)
     {
-        var wrapped = new PyKey(key);
+        var wrapped = PyKey.For(key, "dict key");
 
         if (!_index.Remove(wrapped, out var position))
         {
@@ -501,15 +501,49 @@ public sealed class PyDict : PyObject
 }
 
 /// <summary>Wraps a key so a .NET dictionary uses Python's hash and equality.</summary>
-internal readonly struct PyKey(PyObject value) : IEquatable<PyKey>
+/// <remarks>
+/// The hash is taken once, when the key is wrapped, for two reasons: a Python
+/// <c>__hash__</c> may be arbitrarily expensive, and hashing may raise — which must happen
+/// where the caller can say what the key was being used for, not from inside a .NET
+/// dictionary operation.
+/// </remarks>
+internal readonly struct PyKey : IEquatable<PyKey>
 {
-    public PyObject Value { get; } = value;
+    private readonly int _hash;
+
+    public PyKey(PyObject value)
+    {
+        Value = value;
+        _hash = value.PyHash().GetHashCode();
+    }
+
+    private PyKey(PyObject value, int hash)
+    {
+        Value = value;
+        _hash = hash;
+    }
+
+    public PyObject Value { get; }
+
+    /// <summary>Wraps a key, saying what it was being used for if hashing refuses.</summary>
+    public static PyKey For(PyObject value, string role)
+    {
+        try
+        {
+            return new PyKey(value);
+        }
+        catch (PyRaise raise) when (raise.Exception.ExceptionType == PyExceptionType.TypeError)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"cannot use '{value.TypeName}' as a {role} ({raise.Exception.Message})"));
+        }
+    }
 
     public bool Equals(PyKey other) => Value.PyEquals(other.Value);
 
     public override bool Equals(object? obj) => obj is PyKey other && Equals(other);
 
-    public override int GetHashCode() => Value.PyHash().GetHashCode();
+    public override int GetHashCode() => _hash;
 }
 
 /// <summary><c>set</c>.</summary>
@@ -556,7 +590,7 @@ public sealed class PySet : PyObject
     public override IEnumerable<PyObject>? Iterate() => _items.Values.ToList();
 
     /// <inheritdoc />
-    public override bool Contains(PyObject item) => _items.ContainsKey(new PyKey(item));
+    public override bool Contains(PyObject item) => _items.ContainsKey(PyKey.For(item, "set element"));
 
     /// <inheritdoc />
     public override string Repr()
@@ -596,10 +630,10 @@ public sealed class PySet : PyObject
         other is PySet set && set.Count == Count && _items.Keys.All(set._items.ContainsKey);
 
     /// <summary>Adds a member. Returns false when it was already present.</summary>
-    public bool Add(PyObject item) => _items.TryAdd(new PyKey(item), item);
+    public bool Add(PyObject item) => _items.TryAdd(PyKey.For(item, "set element"), item);
 
     /// <summary>Removes a member. Returns false when it was absent.</summary>
-    public bool Remove(PyObject item) => _items.Remove(new PyKey(item));
+    public bool Remove(PyObject item) => _items.Remove(PyKey.For(item, "set element"));
 
     /// <summary>Removes every member.</summary>
     public void Clear() => _items.Clear();

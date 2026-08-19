@@ -92,7 +92,36 @@ public static class TypeRegistry
     public static PyType Type { get; } = Define(
         "type",
         static value => value is PyType or PyClass or PyExceptionType,
-        static (arguments, _) => arguments.Length > 0 ? Of(arguments[0]) : Object);
+        static (arguments, keywords) =>
+        {
+            // `type(x)` asks what something is; `type(name, bases, namespace)` makes a new
+            // class, which is how a decorator or a factory builds one at runtime.
+            if (arguments.Length == 3)
+            {
+                PyBuiltinFunction.RejectKeywords("type", keywords);
+                // The namespace is copied, so later edits to the caller's dict do not
+                // reach into the class.
+                var members = new PyDict();
+
+                if (arguments[2] is PyDict namespaceDict)
+                {
+                    foreach (var (key, value) in namespaceDict.Entries)
+                    {
+                        members.Set(key, value);
+                    }
+                }
+
+                return new PyClass(arguments[0].Display(), members);
+            }
+
+            if (arguments.Length is not (0 or 1))
+            {
+                throw new PyRaise(PyErrors.TypeError("type() takes 1 or 3 arguments"));
+            }
+
+            PyBuiltinFunction.RejectKeywords("type", keywords);
+            return arguments.Length > 0 ? Of(arguments[0]) : Object;
+        });
 
     /// <summary><c>NoneType</c>.</summary>
     public static PyType NoneType { get; } = Define(
