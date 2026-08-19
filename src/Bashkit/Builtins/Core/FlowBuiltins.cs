@@ -116,3 +116,50 @@ public sealed class ContinueBuiltin : IBuiltin
         return ValueTask.FromResult(new ExecResult { ControlFlow = ControlFlow.Continue(levels) });
     }
 }
+
+/// <summary><c>caller</c> — reports the call frame a function was invoked from.</summary>
+/// <remarks>
+/// The frame numbering counts outwards from the current function: frame 0 is whoever called
+/// it. Outside a function there is no frame at all, which is why <c>caller</c> then fails
+/// rather than printing the top level.
+/// </remarks>
+public sealed class CallerBuiltin : IBuiltin
+{
+    /// <inheritdoc />
+    public string Name => "caller";
+
+    /// <inheritdoc />
+    public string? LlmHint => "caller: Prints the line, function and source of an enclosing call frame.";
+
+    /// <inheritdoc />
+    public ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
+    {
+        var stack = context.State.CallStack;
+
+        if (stack.Count == 0)
+        {
+            return ValueTask.FromResult(ExecResult.FromExitCode(ExitCodes.Failure));
+        }
+
+        var frame = context.Arguments.Count > 0
+            && int.TryParse(context.Arguments[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+                ? parsed
+                : 0;
+
+        var index = stack.Count - 2 - frame;
+
+        if (index < -1)
+        {
+            return ValueTask.FromResult(ExecResult.FromExitCode(ExitCodes.Failure));
+        }
+
+        // Below the outermost function is the script itself, which bash calls `main`.
+        var caller = index >= 0 ? stack[index] : "main";
+        var line = context.State.CurrentLine.ToString(CultureInfo.InvariantCulture);
+
+        // With no script file — `bash -c` — the source of every frame is bash's own `main`.
+        var source = context.State.ScriptName is "bash" or "" ? "main" : context.State.ScriptName;
+
+        return ValueTask.FromResult(ExecResult.Ok($"{line} {caller} {source}\n"));
+    }
+}

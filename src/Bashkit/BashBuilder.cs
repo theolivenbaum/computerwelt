@@ -192,6 +192,7 @@ public sealed class BashBuilder
         Register(new ColonBuiltin());
         Register(new ExitBuiltin());
         Register(new ReturnBuiltin());
+        Register(new CallerBuiltin());
         Register(new BreakBuiltin());
         Register(new ContinueBuiltin());
 

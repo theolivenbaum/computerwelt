@@ -904,6 +904,7 @@ public sealed class Interpreter
 
         State.Positional = arguments;
         State.CallStack.Add(function.Name);
+        UpdateFunctionName();
         State.PushScope();
 
         try
@@ -926,9 +927,23 @@ public sealed class Interpreter
         {
             State.PopScope();
             State.CallStack.RemoveAt(State.CallStack.Count - 1);
+            UpdateFunctionName();
             State.Positional = savedPositional;
             RestoreTemporaryAssignments(savedAssignments);
         }
+    }
+
+    /// <summary>Republishes <c>FUNCNAME</c> from the call stack, innermost first.</summary>
+    private void UpdateFunctionName()
+    {
+        var names = new List<string>(State.CallStack.Count);
+
+        for (var i = State.CallStack.Count - 1; i >= 0; i--)
+        {
+            names.Add(State.CallStack[i]);
+        }
+
+        State.GetOrCreate("FUNCNAME").SetArray(names);
     }
 
     private async ValueTask<List<(string Name, string? Value, bool Existed)>> ApplyTemporaryAssignmentsAsync(
