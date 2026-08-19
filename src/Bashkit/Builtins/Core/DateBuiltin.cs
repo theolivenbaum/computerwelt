@@ -337,6 +337,9 @@ public sealed class TimeoutBuiltin : IBuiltin
     /// <summary>The status <c>timeout</c> reports when the limit was reached.</summary>
     public const int TimedOut = 124;
 
+    /// <summary>The status coreutils uses for a <c>timeout</c> that could not run at all.</summary>
+    private const int TimeoutFailure = 125;
+
     /// <inheritdoc />
     public string Name => "timeout";
 
@@ -366,25 +369,25 @@ public sealed class TimeoutBuiltin : IBuiltin
     parsed:
         if (index >= context.Arguments.Count)
         {
-            return ExecResult.Usage("timeout", "missing duration operand", ExitCodes.Usage);
+            return ExecResult.Usage("timeout", "missing duration operand", TimeoutFailure);
         }
 
         if (!SleepBuiltin.TryParseDuration(context.Arguments[index++], out var limit))
         {
-            return ExecResult.Usage("timeout", $"invalid time interval '{context.Arguments[index - 1]}'", ExitCodes.Usage);
+            return ExecResult.Usage("timeout", $"invalid time interval '{context.Arguments[index - 1]}'", TimeoutFailure);
         }
 
         var words = context.Arguments.Skip(index).ToList();
 
         if (words.Count == 0)
         {
-            return ExecResult.Usage("timeout", "missing command operand", ExitCodes.Usage);
+            return ExecResult.Usage("timeout", "missing command operand", TimeoutFailure);
         }
 
-        // A zero duration means no limit at all, per coreutils.
+        // A zero limit has already elapsed, so the command never starts.
         if (limit <= TimeSpan.Zero)
         {
-            return await context.Hooks.RunCommand(words, context.Stdin, cancellationToken);
+            return ExecResult.FromExitCode(TimedOut);
         }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

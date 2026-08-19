@@ -102,6 +102,12 @@ public sealed record IfCommand(Node Condition, Node Then, Node? Else) : Node;
 /// <param name="Body">The loop body.</param>
 public sealed record ForCommand(string Variable, IReadOnlyList<Word>? Items, Node Body) : Node;
 
+/// <summary><c>select NAME [in words]; do ...; done</c>.</summary>
+/// <param name="Variable">The variable each chosen item is assigned to.</param>
+/// <param name="Items">The menu items, or <see langword="null"/> for the positional parameters.</param>
+/// <param name="Body">The loop body.</param>
+public sealed record SelectCommand(string Variable, IReadOnlyList<Word>? Items, Node Body) : Node;
+
 /// <summary><c>for ((init; condition; update)); do ...; done</c>.</summary>
 /// <param name="Init">The initializer expression, unparsed.</param>
 /// <param name="Condition">The condition expression, unparsed. An empty string means "always true".</param>

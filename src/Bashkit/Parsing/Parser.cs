@@ -252,6 +252,7 @@ public sealed class Parser
                 case "while": return WithRedirects(ParseWhile());
                 case "until": return WithRedirects(ParseUntil());
                 case "for": return WithRedirects(ParseFor());
+                case "select": return WithRedirects(ParseSelect());
                 case "case": return WithRedirects(ParseCase());
                 case "function": return ParseFunctionKeyword();
                 case "{": return WithRedirects(ParseBraceGroup());
@@ -397,6 +398,37 @@ public sealed class Parser
         ExpectKeyword("done");
 
         return new ForCommand(variable, items, body) { Span = new Span(start, Current.Start - start) };
+    }
+
+    /// <summary>Parses <c>select</c>, whose header is <c>for</c>'s minus the arithmetic form.</summary>
+    private Node ParseSelect()
+    {
+        var start = Current.Start;
+        ExpectKeyword("select");
+
+        if (Current.Kind != TokenKind.Word)
+        {
+            throw Unexpected("expected a variable name");
+        }
+
+        var variable = Advance().Text;
+        List<Word>? items = null;
+
+        if (MatchKeyword("in"))
+        {
+            items = [];
+            while (Current.Kind == TokenKind.Word && !BlockTerminators.Contains(Current.Text))
+            {
+                items.Add(WordParser.Parse(Advance().Text));
+            }
+        }
+
+        SkipTerminators();
+        ExpectKeyword("do");
+        var body = ParseBlockUntil("done");
+        ExpectKeyword("done");
+
+        return new SelectCommand(variable, items, body) { Span = new Span(start, Current.Start - start) };
     }
 
     private Node ParseArithmeticFor(int start)

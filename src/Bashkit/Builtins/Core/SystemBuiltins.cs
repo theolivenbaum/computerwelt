@@ -104,20 +104,30 @@ public sealed class SleepBuiltin : IBuiltin
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
         var total = TimeSpan.Zero;
+        var operands = 0;
 
         foreach (var argument in context.Arguments)
         {
-            if (argument.StartsWith('-'))
+            // A negative interval is not an option: `sleep -1` is an invalid duration, and
+            // coreutils reports it as one rather than as an unknown flag.
+            if (argument.StartsWith('-') && argument.Length > 1 && !char.IsAsciiDigit(argument[1]) && argument[1] != '.')
             {
                 continue;
             }
 
-            if (!TryParseDuration(argument, out var duration))
+            operands++;
+
+            if (!TryParseDuration(argument, out var duration) || duration < TimeSpan.Zero)
             {
-                return ExecResult.Usage("sleep", $"invalid time interval '{argument}'");
+                return ExecResult.Error($"sleep: invalid time interval '{argument}'\n", ExitCodes.Failure);
             }
 
             total += duration;
+        }
+
+        if (operands == 0)
+        {
+            return ExecResult.Error("sleep: missing operand\n", ExitCodes.Failure);
         }
 
         // A sleep longer than the remaining budget would only end in a timeout, so it is

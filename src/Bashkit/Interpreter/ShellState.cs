@@ -60,6 +60,16 @@ public sealed class ShellState
     public List<string> CallStack { get; } = [];
 
     /// <summary>
+    /// True while a trap handler is running.
+    /// </summary>
+    /// <remarks>
+    /// The flag lives on the state rather than on an interpreter because a handler runs in
+    /// a fresh interpreter over the same state: an <c>ERR</c> handler that itself fails
+    /// would otherwise re-enter itself until the nesting limit stopped it.
+    /// </remarks>
+    public bool InTrap { get; set; }
+
+    /// <summary>
     /// Variables the shell seeded at start-up rather than the script exporting them.
     /// </summary>
     /// <remarks>

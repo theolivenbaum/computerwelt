@@ -24,7 +24,6 @@ public sealed class Interpreter
     private readonly IReadOnlyDictionary<string, IBuiltin> _builtins;
     private readonly StringBuilder _stderr = new();
     private readonly HashSet<string> _aliasesInProgress = new(StringComparer.Ordinal);
-    private bool _inTrap;
     private int _loopDepth;
 
     /// <summary>Creates an interpreter over the given state, filesystem and builtin table.</summary>
@@ -174,7 +173,7 @@ public sealed class Interpreter
     /// <summary>True for the node kinds whose body shares one input stream.</summary>
     private static bool SharesInput(Node node) =>
         node is WhileCommand or UntilCommand or ForCommand or ArithmeticForCommand
-            or CaseCommand or IfCommand or CompoundCommand or BraceGroup or Subshell;
+            or SelectCommand or CaseCommand or IfCommand or CompoundCommand or BraceGroup or Subshell;
 
     private async ValueTask<ExecResult> DispatchNodeAsync(Node node, StreamData? stdin, CancellationToken cancellationToken)
     {
@@ -189,6 +188,7 @@ public sealed class Interpreter
             UntilCommand untilCommand => await ExecuteWhileAsync(
                 new WhileCommand(untilCommand.Condition, untilCommand.Body), stdin, negate: true, cancellationToken),
             ForCommand forCommand => await ExecuteForAsync(forCommand, stdin, cancellationToken),
+            SelectCommand selectCommand => await ExecuteSelectAsync(selectCommand, cancellationToken),
             ArithmeticForCommand arithFor => await ExecuteArithmeticForAsync(arithFor, stdin, cancellationToken),
             CaseCommand caseCommand => await ExecuteCaseAsync(caseCommand, stdin, cancellationToken),
             Subshell subshell => await ExecuteSubshellAsync(subshell, stdin, cancellationToken),
@@ -210,13 +210,13 @@ public sealed class Interpreter
     /// </remarks>
     public async ValueTask<ExecResult> RunTrapAsync(string signal, CancellationToken cancellationToken)
     {
-        if (_inTrap || !State.Traps.TryGetValue(signal, out var handler) || handler.Length == 0)
+        if (State.InTrap || !State.Traps.TryGetValue(signal, out var handler) || handler.Length == 0)
         {
             return ExecResult.Success;
         }
 
         var savedExitCode = State.LastExitCode;
-        _inTrap = true;
+        State.InTrap = true;
 
         try
         {
@@ -225,7 +225,7 @@ public sealed class Interpreter
         }
         finally
         {
-            _inTrap = false;
+            State.InTrap = false;
             State.LastExitCode = savedExitCode;
         }
     }
@@ -562,6 +562,85 @@ public sealed class Interpreter
                 var body = await ExecuteAsync(command.Body, stdin, cancellationToken);
                 stdin = null;
 
+                stdout.Append(body.Stdout.ToString());
+                stderr.Append(body.Stderr.ToString());
+                exitCode = body.ExitCode;
+                State.LastExitCode = exitCode;
+
+                if (HandleLoopControlFlow(body, out var propagate))
+                {
+                    if (propagate is { } signal)
+                    {
+                        return BuildLoopResult(stdout, stderr, exitCode, signal);
+                    }
+
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _loopDepth--;
+        }
+
+        return BuildLoopResult(stdout, stderr, exitCode, ControlFlow.None);
+    }
+
+    /// <summary>
+    /// Runs <c>select</c>: a menu, a prompt and a loop.
+    /// </summary>
+    /// <remarks>
+    /// The menu and the prompt go to standard error, which is what lets the body's own
+    /// output be captured on its own. End of input ends the loop with a failing status,
+    /// exactly as reaching the end of a here-document or a pipe does in bash.
+    /// </remarks>
+    private async ValueTask<ExecResult> ExecuteSelectAsync(SelectCommand command, CancellationToken cancellationToken)
+    {
+        var items = command.Items is null
+            ? [.. State.Positional]
+            : await Expander.ExpandAllAsync(command.Items, cancellationToken);
+
+        var stdout = new StringBuilder();
+        var stderr = new StringBuilder();
+        var exitCode = 0;
+        var iteration = 0;
+        var prompt = State.Get("PS3") ?? "#? ";
+
+        _loopDepth++;
+        try
+        {
+            while (true)
+            {
+                Budget.ChargeLoopIteration(++iteration);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                for (var i = 0; i < items.Count; i++)
+                {
+                    stderr.Append((i + 1).ToString(CultureInfo.InvariantCulture)).Append(") ").Append(items[i]).Append('\n');
+                }
+
+                stderr.Append(prompt);
+
+                if (_standardInput?.ReadLine('\n') is not { } reply)
+                {
+                    // End of input ends the menu, and bash closes it with a newline.
+                    stdout.Append('\n');
+                    exitCode = ExitCodes.Failure;
+                    break;
+                }
+
+                State.Set("REPLY", reply);
+
+                // A reply that is not a listed number leaves the variable empty and the
+                // menu is shown again; only `break` or end of input leaves the loop.
+                var chosen = int.TryParse(reply.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var index)
+                    && index >= 1 && index <= items.Count
+                        ? items[index - 1]
+                        : string.Empty;
+
+                State.Set(command.Variable, chosen);
+
+                var body = await ExecuteAsync(command.Body, null, cancellationToken);
                 stdout.Append(body.Stdout.ToString());
                 stderr.Append(body.Stderr.ToString());
                 exitCode = body.ExitCode;
@@ -1345,7 +1424,7 @@ public sealed class Interpreter
     {
         using var nesting = Budget.EnterNesting();
         var parsed = Parser.Parse(script, Budget);
-        var nested = new Interpreter(State, FileSystem, Budget, _builtins);
+        var nested = new Interpreter(State, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
         return await nested.RunAsync(parsed, stdin, cancellationToken);
     }
 
