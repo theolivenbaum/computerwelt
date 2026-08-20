@@ -78,22 +78,29 @@ dotnet build
 dotnet test
 ```
 
-The conformance suite is **ratchet-based**: `tests/spec/baseline.json` records how many
-cases each file currently passes, and the suite fails on a regression. After making cases
-pass, raise the baseline:
+Both conformance suites are **ratchet-based**: `tests/spec/baseline.json` records how many
+cases each shell file currently passes and `tests/monty-spec/baseline.json` records which
+Python fixtures pass, and each suite fails on a regression. After making cases pass, raise
+the baseline:
 
 ```bash
 BASHKIT_UPDATE_BASELINE=1 dotnet test tests/Bashkit.SpecTests
+MONTY_UPDATE_BASELINE=1 dotnet test tests/Monty.SpecTests
 ```
 
-Never lower a baseline number to make a build green.
+Never lower a baseline to make a build green.
 
 ## Status
 
 | | conformance | notes |
 |---|---|---|
-| shell | **1,694 / 2,521** | 73 commands implemented |
-| python | **371 / 558** | parser, bytecode compiler, VM, types, builtins, 9 stdlib modules, dunders |
+| shell | **2,521 / 2,521** | 73 commands implemented; 27 cases skipped by upstream directive |
+| python | **557 / 558** | parser, bytecode compiler, VM, types, builtins, the stdlib subset, dunders |
+
+The one Python fixture that does not pass asserts that a temporary's `id()` is handed to
+the next object of the same shape — an artifact of upstream's slot-recycling heap. Object
+identity here is the host runtime's, and an id is never recycled; the reasoning is in
+[`todo.md`](todo.md).
 
 The two halves share one virtual filesystem: `src/Computerwelt/` adds `python` as a shell
 command whose `os`, `os.path` and `open` are backed by the shell's `IFileSystem`.

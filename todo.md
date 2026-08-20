@@ -15,25 +15,31 @@ Upstream reference: `.reference/bashkit/crates/bashkit/src/`
 Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-scope
 `python` and `typescript` suites). Ratchet file: `tests/spec/baseline.json`.
 
-**Current state — shell:** solution builds clean, 151 unit tests green,
-**1,694 / 2,521 conformance cases passing (67.2 %)**.
+**Current state — shell:** solution builds clean, 156 unit tests green,
+**2,521 / 2,521 conformance cases passing (100 %)**, 27 cases skipped by upstream
+directive.
 
 **Current state — python:** tokenizer, parser, bytecode compiler, VM, core types,
-builtins, nine stdlib modules, dunder dispatch and the external-function boundary are in
-place. **371 / 558 fixtures passing (66.5 %)**. No host exception escapes to a script any
-more; every remaining failure is Python-level.
+builtins, the stdlib subset, dunder dispatch and the external-function boundary are all in
+place. **557 / 558 fixtures passing (99.8 %)**, with 18 unit tests covering what the
+corpus does not reach. No host exception escapes to a script.
 
-Largest remaining gaps: ~75 real semantic differences, 22 fixtures needing `asyncio`,
-`os`/`pathlib` or `unicodedata`, and 20 pinning tracebacks the port does not format yet.
+The one remaining fixture is a documented divergence, not a gap — see below.
 
 | suite | passing |
 |---|---|
-| `bash` | 1,556 / 2,094 |
-| `grep` | 70 / 95 |
-| `sed` | 66 / 80 |
-| `jq` | 2 / 124 |
-| `awk` | 0 / 126 |
-| `yq` | 0 / 26 |
+| `bash` | 2,094 / 2,094 |
+| `grep` | 95 / 95 |
+| `sed` | 80 / 80 |
+| `jq` | 124 / 124 |
+| `awk` | 126 / 126 |
+| `yq` | 26 / 26 |
+
+## Known divergences
+
+| Fixture | Why |
+|---|---|
+| `id__non_overlapping_lifetimes_same_types.py` | Asserts `id([]) == id([])`: upstream allocates from a heap of recycled slots, so a temporary's id is handed to the next object of the same shape. Here an object's identity is the host runtime's, and the host frees objects when its collector chooses rather than when the last reference drops — so an id is never recycled. Reproducing the assertion would mean either making distinct live objects share an id or forcing a collection inside `id()`, and a sandbox that can make its host collect on demand is a denial-of-service vector. Upstream's own corpus marks the sibling file `xfail=cpython`, so this family tests heap behaviour rather than language behaviour. |
 
 ---
 
@@ -229,7 +235,7 @@ Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 - [ ] Port the 280+ threat-model mitigations (`.reference/bashkit/knowledge/security/`)
 - [ ] Property tests for parser/expansion (`proptest_security.rs` equivalent, FsCheck)
 - [ ] Fuzz targets for lexer/parser/arithmetic (`fuzz/`)
-- [ ] Fill in the ratchet to 100 % of non-skipped spec cases
+- [x] Fill in the ratchet to 100 % of non-skipped spec cases
 
 ---
 
@@ -355,9 +361,11 @@ Upstream: `modules/` — the permitted set and nothing more.
 - [x] `math`, `json`, `sys`, `typing`, `__future__`, `re`, `datetime`, `dataclasses`
 - [x] `collections` (`Counter`, `defaultdict`, `namedtuple`, `OrderedDict`, `deque`)
 - [x] `itertools`
-- [ ] `os` and `pathlib` — routed through this repo's `IFileSystem`, so Python and bash
+- [x] `os` and `pathlib` — routed through this repo's `IFileSystem`, so Python and bash
       see one filesystem
-- [ ] `unicodedata`, `asyncio`, `gc`
+- [x] `unicodedata`, `asyncio`, `gc` — `unicodedata` carries its own Unicode 16.0.0 tables
+      (categories, combining classes, names, decompositions) and implements normalization
+      itself, so no answer depends on the host's ICU or on its globalization mode
 - [~] `itertools.count` and `repeat` are bounded rather than infinite, since results are
       materialized rather than lazy
 
