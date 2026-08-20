@@ -11,5 +11,6 @@
     <Project Path="tests/Bashkit.Tests/Bashkit.Tests.csproj" />
     <Project Path="tests/Computerwelt.Tests/Computerwelt.Tests.csproj" />
     <Project Path="tests/Monty.SpecTests/Monty.SpecTests.csproj" />
+    <Project Path="tests/Monty.Tests/Monty.Tests.csproj" />
   </Folder>
 </Solution>

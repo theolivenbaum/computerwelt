@@ -208,12 +208,19 @@ public sealed class PyClass : PyCallable
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name)
     {
-        if (name == "__name__")
+        if (Members.TryGetValue(new PyStr(name), out var value))
         {
-            return new PyStr(Name);
+            return value;
         }
 
-        return Members.TryGetValue(new PyStr(name), out var value) ? value : null;
+        return name switch
+        {
+            "__name__" or "__qualname__" => new PyStr(Name),
+
+            // A class with no docstring still has `__doc__`, holding None.
+            "__doc__" => PyNone.Instance,
+            _ => null,
+        };
     }
 
     /// <inheritdoc />
@@ -473,6 +480,13 @@ public sealed class PyInstance : PyObject
         if (Fields.TryGetValue(new PyStr(name), out var field))
         {
             return field;
+        }
+
+        // `__class__` is the class object itself, which is also what makes
+        // `obj.__class__(...)` construct a sibling.
+        if (name == "__class__")
+        {
+            return Class;
         }
 
         var classAttribute = Class.GetAttribute(name);

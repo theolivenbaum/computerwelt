@@ -102,6 +102,14 @@ public sealed class ArgCursor
                 return argument[..equals];
             }
 
+            // `head -30` is one option, not the cluster `-3 -0`: no builtin has a digit
+            // for a short option, and the GNU tools that take a count spell it this way.
+            if (char.IsAsciiDigit(argument[1]) && argument.AsSpan(1).ContainsAnyExceptInRange('0', '9') == false)
+            {
+                _index++;
+                return argument;
+            }
+
             _bundleOffset = 1;
         }
 

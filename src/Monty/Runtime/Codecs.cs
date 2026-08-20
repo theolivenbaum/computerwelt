@@ -20,6 +20,8 @@ public static class Codecs
         ["utf_8"] = "utf-8", ["utf8"] = "utf-8", ["utf"] = "utf-8", ["u8"] = "utf-8",
         ["cp65001"] = "utf-8", ["utf8_ucs2"] = "utf-8", ["utf8_ucs4"] = "utf-8",
 
+        ["utf_8_sig"] = "utf-8-sig",
+
         ["ascii"] = "ascii", ["646"] = "ascii", ["us"] = "ascii", ["us_ascii"] = "ascii",
         ["cp367"] = "ascii", ["ibm367"] = "ascii", ["csascii"] = "ascii",
         ["ansi_x3.4_1968"] = "ascii", ["ansi_x3.4_1986"] = "ascii",
@@ -89,6 +91,10 @@ public static class Codecs
             "utf-32" => [.. (byte[])[0xff, 0xfe, 0x00, 0x00], .. EncodeUnits(text, littleEndian: true, 4)],
             "utf-32-le" => EncodeUnits(text, littleEndian: true, 4),
             "utf-32-be" => EncodeUnits(text, littleEndian: false, 4),
+
+            // The `-sig` variant writes the UTF-8 signature, which is the BOM's code point
+            // spelled in UTF-8 rather than a byte-order marker — UTF-8 has no order.
+            "utf-8-sig" => [.. (byte[])[0xef, 0xbb, 0xbf], .. Encoding.UTF8.GetBytes(text)],
             _ => Encoding.UTF8.GetBytes(text),
         };
     }
@@ -115,6 +121,18 @@ public static class Codecs
                 : value.Length >= 4 && value[0] == 0xff && value[1] == 0xfe && value[2] == 0 && value[3] == 0
                     ? ("utf-32-le", 4)
                     : ("utf-32-le", 0);
+        }
+
+        // The `-sig` variant drops a leading signature if there is one, and is plain
+        // UTF-8 otherwise.
+        if (codec == "utf-8-sig")
+        {
+            codec = "utf-8";
+
+            if (value.Length >= 3 && value[0] == 0xef && value[1] == 0xbb && value[2] == 0xbf)
+            {
+                value = value[3..];
+            }
         }
 
         return codec switch

@@ -320,4 +320,19 @@ public sealed class ShellTests
         Assert.Equal("0\n", passing.Stdout.ToString());
         Assert.Equal("1\n", failing.Stdout.ToString());
     }
+
+    [Theory]
+    [InlineData("head -2", "a\nb\n")]
+    [InlineData("head -10", "a\nb\nc\n")]
+    [InlineData("head -30", "a\nb\nc\n")]
+    [InlineData("tail -2", "b\nc\n")]
+    [InlineData("tail -20", "a\nb\nc\n")]
+    public async Task A_multi_digit_count_option_is_one_option(string command, string expected)
+    {
+        // `head -30` is a count, not the cluster `-3 -0`, which would take the last digit
+        // as the count and print nothing.
+        var result = await ExecAsync($"printf 'a\\nb\\nc\\n' | {command}");
+
+        Assert.Equal(expected, result.Stdout.ToString());
+    }
 }

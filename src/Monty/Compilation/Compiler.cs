@@ -279,10 +279,12 @@ public sealed class Compiler
             return Binding.Local;
         }
 
-        // A name bound in an enclosing function is captured; otherwise it is a global.
+        // A name bound in an enclosing function is captured; otherwise it is a global. A
+        // class body is not such a scope: a method's bare name reaches past its class to
+        // the module, which is why `helper` in a method is never the class attribute.
         for (var scope = _parent; scope is not null; scope = scope._parent)
         {
-            if (!scope._isFunctionScope || !scope._locals.Contains(name))
+            if (!scope._isFunctionScope || scope._isClassBody || !scope._locals.Contains(name))
             {
                 continue;
             }
@@ -309,7 +311,8 @@ public sealed class Compiler
 
         for (var scope = _parent; scope is not null; scope = scope._parent)
         {
-            if (scope._isFunctionScope && (scope._locals.Contains(name) || scope._code.CellNames.Contains(name)))
+            if (scope._isFunctionScope && !scope._isClassBody
+                && (scope._locals.Contains(name) || scope._code.CellNames.Contains(name)))
             {
                 definer = scope;
                 break;
