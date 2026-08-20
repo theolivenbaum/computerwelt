@@ -1275,10 +1275,12 @@ public sealed class Parser
         var parts = new List<FormatPart>();
         var text = new System.Text.StringBuilder();
         var formatted = false;
+        var unicodePrefix = false;
 
         while (Current.Kind is TokenKind.String or TokenKind.FString)
         {
             var piece = Advance();
+            unicodePrefix |= piece.Prefix.Contains('u', StringComparison.Ordinal);
 
             if (piece.Kind == TokenKind.String)
             {
@@ -1293,7 +1295,9 @@ public sealed class Parser
             parts.AddRange(FStringParser.Parse(piece.Text).Parts);
         }
 
-        return formatted ? new FormattedString(parts) : new Literal(text.ToString());
+        return formatted
+            ? new FormattedString(parts)
+            : new Literal(text.ToString()) { HasUnicodePrefix = unicodePrefix };
     }
 
     private Expression ParseParenthesized()

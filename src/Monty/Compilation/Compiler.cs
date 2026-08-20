@@ -642,7 +642,9 @@ public sealed class Compiler
         if (_isClassBody && assign.Annotation is { } annotation
             && assign.Targets is [Parsing.Name annotated])
         {
-            CompileExpression(annotation);
+            // The annotation is stored as text, not evaluated: a name that exists only for a
+            // type checker must cost nothing and raise nothing at run time.
+            Emit(OpCode.LoadConst, _code.AddConstant(new PyStr(Annotations.Unparse(annotation))), assign.Line);
             EmitLoad(AnnotationsName, assign.Line);
             Emit(OpCode.LoadConst, _code.AddConstant(new PyStr(annotated.Id)), assign.Line);
             Emit(OpCode.StoreSubscript, 0, assign.Line);
@@ -1261,9 +1263,9 @@ public sealed class Compiler
         compiler._code.Parameters = parameters;
         compiler._code.IsGenerator = isGeneratorHint ?? ContainsYield(body);
 
-        // A class that annotates any of its names gets an `__annotations__` mapping, which
-        // is where `@dataclass` reads its fields from — the annotations are the fields.
-        if (isClassBody && body.Any(static statement => statement is Assign { Annotation: not null }))
+        // Every class gets an `__annotations__` mapping, empty when it annotates nothing.
+        // It is where `@dataclass` reads its fields from — the annotations are the fields.
+        if (isClassBody)
         {
             compiler.Declare(AnnotationsName);
             compiler.Emit(OpCode.BuildMap, 0, line);

@@ -5,7 +5,17 @@ public abstract record Expression : PyNode;
 
 /// <summary>A literal constant: number, string, bytes, <c>True</c>, <c>False</c>, <c>None</c>, <c>...</c>.</summary>
 /// <param name="Value">The literal value, already decoded.</param>
-public sealed record Literal(object? Value) : Expression;
+public sealed record Literal(object? Value) : Expression
+{
+    /// <summary>
+    /// True when the source spelled a <c>u</c> prefix on a string literal.
+    /// </summary>
+    /// <remarks>
+    /// The prefix means nothing at run time — every string is Unicode — but it survives
+    /// into the canonical text of a stringized annotation, so it has to survive parsing.
+    /// </remarks>
+    public bool HasUnicodePrefix { get; init; }
+}
 
 /// <summary>A name reference.</summary>
 /// <param name="Id">The identifier.</param>
