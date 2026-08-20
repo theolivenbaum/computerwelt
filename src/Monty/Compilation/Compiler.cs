@@ -52,10 +52,13 @@ public sealed class Compiler
         return compiler._code;
     }
 
-    /// <summary>A <c>finally</c> whose body a jump out of the block still owes.</summary>
-    /// <param name="Body">The cleanup statements.</param>
-    /// <param name="LoopDepth">How many loops were open when the block was entered.</param>
-    private sealed record FinallyContext(IReadOnlyList<Statement> Body, int LoopDepth);
+    /// <summary>
+    /// Cleanup owed to an enclosing <c>try</c>/<c>finally</c> or <c>with</c>, which a jump
+    /// out of it has to run first.
+    /// </summary>
+    /// <param name="Body">The finally body, or null for a <c>with</c>.</param>
+    /// <param name="LoopDepth">How many loops enclosed the block when it was opened.</param>
+    private sealed record FinallyContext(IReadOnlyList<Statement>? Body, int LoopDepth);
 
     private sealed record LoopContext(List<int> BreakJumps, List<int> ContinueJumps, int ContinueTarget)
     {
@@ -800,12 +803,20 @@ public sealed class Compiler
                     break;
                 }
 
+                // A `with` has no body to re-emit: its cleanup is the manager's exit,
+                // which is already on the stack, and which ExitWith finds for itself.
+                if (pending[i].Body is not { } body)
+                {
+                    Emit(OpCode.ExitWith, 0, line);
+                    continue;
+                }
+
                 Emit(OpCode.PopBlock, 0, line);
 
                 // A `return` inside the body being emitted must not unwind this same body
                 // again, so it is dropped from the pending set while it is compiled.
                 _finallies.RemoveRange(i, _finallies.Count - i);
-                CompileStatements(pending[i].Body);
+                CompileStatements(body);
             }
         }
         finally
@@ -906,29 +917,58 @@ public sealed class Compiler
         PatchAll(handlerExits, Here);
     }
 
-    private void CompileWith(With with)
-    {
-        foreach (var item in with.Items)
-        {
-            CompileExpression(item.ContextManager);
-            Emit(OpCode.SetupWith, 0, with.Line);
+    /// <summary>
+    /// Compiles a <c>with</c>, including the exception path.
+    /// </summary>
+    /// <remarks>
+    /// Several managers on one <c>with</c> are compiled as nested single-manager ones,
+    /// which is how the language defines them — and what makes an exception swallowed by an
+    /// inner manager still run the outer one's exit.
+    /// </remarks>
+    private void CompileWith(With with) => CompileWithItem(with, 0);
 
-            if (item.Target is { } target)
+    private void CompileWithItem(With with, int index)
+    {
+        var item = with.Items[index];
+        CompileExpression(item.ContextManager);
+        var setup = Emit(OpCode.SetupWith, 0, with.Line);
+
+        if (item.Target is { } target)
+        {
+            CompileStoreTarget(target, with.Line);
+        }
+        else
+        {
+            Emit(OpCode.Pop, 0, with.Line);
+        }
+
+        // A `return`, `break` or `continue` leaving the body has to run this exit, the same
+        // way it has to run an enclosing `finally`.
+        _finallies.Add(new FinallyContext(null, _loops.Count));
+
+        try
+        {
+            if (index + 1 < with.Items.Count)
             {
-                CompileStoreTarget(target, with.Line);
+                CompileWithItem(with, index + 1);
             }
             else
             {
-                Emit(OpCode.Pop, 0, with.Line);
+                CompileStatements(with.Body);
             }
         }
-
-        CompileStatements(with.Body);
-
-        foreach (var _ in with.Items)
+        finally
         {
-            Emit(OpCode.ExitWith, 0, with.Line);
+            _finallies.RemoveAt(_finallies.Count - 1);
         }
+
+        Emit(OpCode.ExitWith, 0, with.Line);
+        var done = Emit(OpCode.Jump, 0, with.Line);
+
+        Patch(setup, Here);
+        Emit(OpCode.ExitWithException, 0, with.Line);
+        Emit(OpCode.ReRaise, 0, with.Line);
+        Patch(done, Here);
     }
 
     private void CompileRaise(Raise raise)

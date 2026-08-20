@@ -517,6 +517,37 @@ public sealed class VirtualMachine
         }
     }
 
+    /// <summary>
+    /// The instruction after the <c>ReRaise</c> that closes a <c>with</c>'s handler chain.
+    /// </summary>
+    /// <remarks>
+    /// A manager that swallows the exception must skip the outer managers' handlers as
+    /// well: they are only reached while an exception is in flight. The chain holds nothing
+    /// but handler calls and that final re-raise, so the first one found ends it.
+    /// </remarks>
+    private static int SkipHandlers(CodeObject code, int from)
+    {
+        for (var i = from; i < code.Instructions.Count; i++)
+        {
+            if (code.Instructions[i].OpCode == OpCode.ReRaise)
+            {
+                return i + 1;
+            }
+        }
+
+        return code.Instructions.Count;
+    }
+
+    /// <summary>
+    /// Looks up a special method the way a protocol does: on the type, never on the
+    /// instance.
+    /// </summary>
+    private PyObject Protocol(PyObject value, string name) =>
+        (value is PyInstance instance ? instance.Dunder(name) : Attributes.TryGet(this, value, name))
+        ?? throw new PyRaise(PyErrors.TypeError(
+            $"'{value.TypeName}' object does not support the context manager protocol "
+            + $"(missed {name} method)"));
+
     private void RecordTraceback(PyException exception, Frame frame) =>
         exception.Traceback.Insert(0, new TracebackFrame(frame.Code.Name, frame.CurrentLine, null));
 
@@ -529,17 +560,12 @@ public sealed class VirtualMachine
         while (frame.Blocks.Count > 0)
         {
             var block = frame.Blocks[^1];
-            frame.Blocks.RemoveAt(frame.Blocks.Count - 1);
 
-            if (block.Kind == BlockKind.With)
+            // A `with` block stays registered: its handler pops it, the same way the
+            // normal path's ExitWith does, so both find the manager's exit the same way.
+            if (block.Kind != BlockKind.With)
             {
-                // The context manager's exit is on the stack; drop it and keep unwinding.
-                if (frame.Stack.Count > block.StackDepth)
-                {
-                    frame.Stack.RemoveRange(block.StackDepth, frame.Stack.Count - block.StackDepth);
-                }
-
-                continue;
+                frame.Blocks.RemoveAt(frame.Blocks.Count - 1);
             }
 
             if (frame.Stack.Count > block.StackDepth)
@@ -1231,32 +1257,69 @@ public sealed class VirtualMachine
             {
                 var manager = frame.Pop();
 
-                // `__exit__` is checked first, so an object with neither is reported
-                // against it — which is the half CPython names.
-                var exit = Attributes.TryGet(this, manager, "__exit__")
-                    ?? throw new PyRaise(PyErrors.TypeError(
-                        $"'{manager.TypeName}' object does not support the context manager "
-                        + "protocol (missed __exit__ method)"));
+                // The protocol reads through the type, not the instance, so an instance
+                // attribute of the same name does not shadow the method. `__exit__` is
+                // checked first, so an object with neither is reported against it — which
+                // is the half CPython names.
+                var exit = Protocol(manager, "__exit__");
+                var enter = Protocol(manager, "__enter__");
 
-                var enter = Attributes.TryGet(this, manager, "__enter__")
-                    ?? throw new PyRaise(PyErrors.TypeError(
-                        $"'{manager.TypeName}' object does not support the context manager "
-                        + "protocol (missed __enter__ method)"));
+                // `__enter__` runs before the block is registered: a manager whose entry
+                // raises was never entered, so its `__exit__` must not run.
+                var entered = Call(enter, []);
 
                 frame.Push(exit);
-                frame.Blocks.Add(new Block(BlockKind.With, -1, frame.Stack.Count));
-                frame.Push(Call(enter, []));
+                frame.Blocks.Add(new Block(BlockKind.With, instruction.Operand, frame.Stack.Count));
+                frame.Push(entered);
+                return false;
+            }
+
+            case OpCode.ExitWithException:
+            {
+                // The exception is in flight and the manager's `__exit__` sits in the slot
+                // its block recorded; a truthy return means the manager handled it.
+                var index = frame.Blocks.FindLastIndex(static b => b.Kind == BlockKind.With);
+
+                if (index < 0)
+                {
+                    return false;
+                }
+
+                var slot = frame.Blocks[index].StackDepth - 1;
+                var exit = frame.Stack[slot];
+                frame.Stack.RemoveAt(slot);
+                frame.Blocks.RemoveAt(index);
+
+                var raised = frame.CurrentException
+                    ?? throw new PyRaise(PyErrors.RuntimeError("no active exception to exit"));
+
+                var handled = Call(exit, [raised.ExceptionType, raised, PyNone.Instance]);
+
+                if (handled.IsTruthy())
+                {
+                    frame.CurrentException = null;
+                    frame.InstructionPointer = SkipHandlers(code, frame.InstructionPointer);
+                }
+
                 return false;
             }
 
             case OpCode.ExitWith:
             {
-                if (frame.Blocks.Count > 0 && frame.Blocks[^1].Kind == BlockKind.With)
+                // The exit is taken from the slot the block recorded, not from the top of
+                // the stack: a `return` out of the body leaves its value above it.
+                var index = frame.Blocks.FindLastIndex(static b => b.Kind == BlockKind.With);
+
+                if (index < 0)
                 {
-                    frame.Blocks.RemoveAt(frame.Blocks.Count - 1);
+                    return false;
                 }
 
-                var exit = frame.Pop();
+                var slot = frame.Blocks[index].StackDepth - 1;
+                var exit = frame.Stack[slot];
+                frame.Stack.RemoveAt(slot);
+                frame.Blocks.RemoveAt(index);
+
                 Call(exit, [PyNone.Instance, PyNone.Instance, PyNone.Instance]);
                 return false;
             }

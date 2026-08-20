@@ -38,6 +38,12 @@ public enum OpCode
     /// </remarks>
     LoadName,
 
+    /// <summary>
+    /// Runs a context manager's <c>__exit__</c> with the exception in flight, and swallows
+    /// that exception when it returns a truthy value.
+    /// </summary>
+    ExitWithException,
+
     /// <summary>Pop and store into the module globals.</summary>
     StoreGlobal,
 
