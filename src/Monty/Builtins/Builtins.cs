@@ -255,6 +255,21 @@ public static class BuiltinNamespace
             // digits leaves the value alone, and -10**30 flattens it to zero.
             var digits = requested > 400 ? 400 : requested < -400 ? -400 : (int)requested;
 
+            // A non-finite float has no integral form, but with an explicit precision it
+            // is simply returned: rounding it changes nothing.
+            if (number is PyFloat { Value: var raw } special && !double.IsFinite(raw))
+            {
+                if (given is not (null or PyNone))
+                {
+                    return special;
+                }
+
+                throw new PyRaise(double.IsNaN(raw)
+                    ? PyErrors.ValueError("cannot convert float NaN to integer")
+                    : new PyException(
+                        PyExceptionType.OverflowError, "cannot convert float infinity to integer"));
+            }
+
             return number switch
             {
                 PyInt integer when digits >= 0 => integer,
@@ -266,8 +281,12 @@ public static class BuiltinNamespace
                     ? new PyInt(new BigInteger(Math.Round(value.Value, MidpointRounding.ToEven)))
                     : digits > 15 ? value
                     : digits >= 0 ? new PyFloat(Math.Round(value.Value, digits, MidpointRounding.ToEven))
-                    : new PyFloat((double)RoundToMultiple(
-                        new BigInteger(value.Value), BigInteger.Pow(10, Math.Min(-digits, 400)))),
+                    // A float rounded away to nothing keeps its sign: -1.5 at a huge
+                    // negative precision is -0.0, not 0.0.
+                    : new PyFloat(Math.CopySign(
+                        (double)RoundToMultiple(
+                            new BigInteger(value.Value), BigInteger.Pow(10, Math.Min(-digits, 400))),
+                        value.Value)),
                 PyInt integer => new PyInt(RoundToMultiple(integer.Value, BigInteger.Pow(10, -digits))),
                 var other => throw new PyRaise(PyErrors.TypeError(
                     $"type {other.TypeName} doesn't define __round__ method")),
@@ -669,6 +688,15 @@ internal sealed class NotImplementedSingleton : PyObject
 
     public override string Repr() => "NotImplemented";
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Truth-testing NotImplemented is almost always a comparison whose result was never
+    /// checked, so CPython refuses rather than quietly answering true.
+    /// </remarks>
+    public override bool IsTruthy() =>
+        throw new PyRaise(PyErrors.TypeError(
+            "NotImplemented should not be used in a boolean context"));
+
     public override bool PyEquals(PyObject other) => other is NotImplementedSingleton;
 }
 
@@ -877,15 +905,86 @@ public static class Conversions
         }
     }
 
-    /// <summary>Implements <c>bytes()</c>.</summary>
-    public static PyObject ToBytes(PyObject[] arguments)
+    /// <summary>Reads a bytes() argument that must be a string.</summary>
+    private static string? Named(PyObject? value, string name) => value switch
     {
-        if (arguments.Length == 0)
+        null => null,
+        PyStr text => text.Value,
+
+        // The argument clinic spells a lone None as "None", not "NoneType".
+        PyNone => throw new PyRaise(PyErrors.TypeError(
+            $"bytes() argument '{name}' must be str, not None")),
+        _ => throw new PyRaise(PyErrors.TypeError(
+            $"bytes() argument '{name}' must be str, not {value.TypeName}")),
+    };
+
+    /// <summary>Implements <c>bytes()</c>.</summary>
+    /// <remarks>
+    /// Every parameter is positional-or-keyword, so <c>bytes(source='x', encoding='utf-8')</c>
+    /// works — and giving one both ways is an error naming the parameter and its position.
+    /// </remarks>
+    public static PyObject ToBytes(PyObject[] arguments, PyDict? keywords)
+    {
+        string[] names = ["source", "encoding", "errors"];
+
+        // The clinic counts positionals and keywords together before it inspects either.
+        if (arguments.Length + (keywords?.Count ?? 0) > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"bytes() takes at most {names.Length} arguments "
+                + $"({arguments.Length + (keywords?.Count ?? 0)} given)"));
+        }
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < names.Length; i++)
+        {
+            given[i] = arguments.Length > i ? arguments[i] : null;
+        }
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"bytes() got an unexpected keyword argument '{key.Display()}'"));
+            }
+
+            if (given[position] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"argument for bytes() given by name ('{names[position]}') "
+                    + $"and position ({position + 1})"));
+            }
+
+            given[position] = value;
+        }
+
+        // An encoding or an error handler only means anything for a str source, and the
+        // encoding is checked first.
+        if (given[0] is not PyStr)
+        {
+            if (given[1] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError("encoding without a string argument"));
+            }
+
+            if (given[2] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError("errors without a string argument"));
+            }
+        }
+
+        if (given[0] is not { } source)
         {
             return new PyBytes([]);
         }
 
-        switch (arguments[0])
+        arguments = [.. given.TakeWhile(static value => value is not null).Select(static value => value!)];
+
+        switch (source)
         {
             case PyBytes bytes:
                 return bytes;
@@ -905,14 +1004,17 @@ public static class Conversions
                 return new PyBytes(new byte[(int)size.Value]);
             }
 
-            case PyStr text when arguments.Length > 1:
-                return new PyBytes(Encoding.UTF8.GetBytes(text.Value));
+            case PyStr text when given[1] is not null:
+                return new PyBytes(Codecs.Encode(
+                    text.Value,
+                    Named(given[1], "encoding")!,
+                    Named(given[2], "errors") ?? "strict"));
 
             case PyStr:
                 throw new PyRaise(PyErrors.TypeError("string argument without an encoding"));
 
             default:
-                return new PyBytes([.. VirtualMachine.RequireIterable(arguments[0])
+                return new PyBytes([.. VirtualMachine.RequireIterable(source)
                     .Select(static item => (byte)BuiltinNamespace.RequireInt(item, "bytes"))]);
         }
     }

@@ -131,6 +131,11 @@ public sealed class PyExceptionType : PyObject
     public override string Repr() => $"<class '{Name}'>";
 
     /// <inheritdoc />
+    /// <remarks>A class is a first-class value, hashable by identity like any other.</remarks>
+    public override System.Numerics.BigInteger PyHash() =>
+        System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
+
+    /// <inheritdoc />
     public override PyObject? GetAttribute(string name) =>
         name == "__name__" ? new PyStr(Name) : null;
 

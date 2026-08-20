@@ -177,7 +177,9 @@ public static class TypeRegistry
 
     /// <summary><c>bytes</c>.</summary>
     public static PyType Bytes { get; } = Define(
-        "bytes", static value => value is PyBytes, static (arguments, _) => Builtins.Conversions.ToBytes(arguments));
+        "bytes",
+        static value => value is PyBytes,
+        static (arguments, keywords) => Builtins.Conversions.ToBytes(arguments, keywords));
 
     /// <summary><c>list</c>.</summary>
     public static PyType List { get; } = Define(

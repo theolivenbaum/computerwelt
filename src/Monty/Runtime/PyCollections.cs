@@ -732,6 +732,24 @@ public sealed class PyRange : PyObject
     /// <inheritdoc />
     public override string TypeName => "range";
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// A range is immutable, so it is hashable — by the values it yields, which is why
+    /// two ranges that describe the same sequence hash alike however they were spelled.
+    /// </remarks>
+    public override BigInteger PyHash()
+    {
+        var count = Count;
+
+        // An empty range hashes as an empty sequence, and a one-element range ignores its
+        // step, because neither is observable in what the range yields.
+        return count.IsZero
+            ? new PyTuple([]).PyHash()
+            : new PyTuple(count.IsOne
+                ? [new PyInt(count), new PyInt(Start)]
+                : [new PyInt(count), new PyInt(Start), new PyInt(Step)]).PyHash();
+    }
+
     /// <summary>The number of values the range yields.</summary>
     public BigInteger Count
     {
