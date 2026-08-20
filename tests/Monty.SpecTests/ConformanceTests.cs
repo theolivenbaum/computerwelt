@@ -87,6 +87,13 @@ public sealed class ConformanceTests(ITestOutputHelper output)
                 {
                     runner.ExternalFunctions[name] = implementation;
                 }
+
+                // The same harness resolves a handful of non-function names to plain
+                // values, which is how a host injects constants.
+                foreach (var (name, value) in ExternalFunctions.Constants())
+                {
+                    runner.Variables[name] = value;
+                }
             }
 
             result = runner.Run(fixture.Source, fixture.Name);

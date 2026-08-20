@@ -186,6 +186,20 @@ public sealed class PyList : PyObject
         return true;
     }
 
+    /// <summary>
+    /// Signals that two sequences differ first at a pair that has no ordering.
+    /// </summary>
+    /// <remarks>
+    /// It carries the pair so the comparison operator can name it, and so a NaN among them
+    /// can answer false instead of raising.
+    /// </remarks>
+    internal sealed class UnorderedPair(PyObject left, PyObject right) : Exception
+    {
+        public PyObject Left { get; } = left;
+
+        public PyObject Right { get; } = right;
+    }
+
     internal static int CompareSequences(IReadOnlyList<PyObject> left, IReadOnlyList<PyObject> right)
     {
         var shared = Math.Min(left.Count, right.Count);
@@ -197,9 +211,11 @@ public sealed class PyList : PyObject
                 continue;
             }
 
+            // The first differing pair decides; if it cannot be ordered, neither can the
+            // sequences, which the caller reports (a NaN there makes the answer false
+            // rather than an error).
             return left[i].PyCompare(right[i])
-                ?? throw new PyRaise(PyErrors.TypeError(
-                    $"'<' not supported between instances of '{left[i].TypeName}' and '{right[i].TypeName}'"));
+                ?? throw new UnorderedPair(left[i], right[i]);
         }
 
         return left.Count.CompareTo(right.Count);
@@ -364,7 +380,7 @@ internal static class SequenceOps
 /// <c>True</c> must be the same key, which reference or structural .NET equality would get
 /// wrong in both directions.
 /// </remarks>
-public sealed class PyDict : PyObject
+public class PyDict : PyObject
 {
     private readonly Dictionary<PyKey, int> _index = [];
     private readonly List<KeyValuePair<PyObject, PyObject>> _entries = [];

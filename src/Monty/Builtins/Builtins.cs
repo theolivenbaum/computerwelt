@@ -185,7 +185,7 @@ public static class BuiltinNamespace
         {
             // Being iterable is not enough: reversing needs a sequence with a length and
             // an order, which a one-shot iterator and an unordered set do not have.
-            if (arguments[0] is not (PyList or PyTuple or PyStr or PyBytes or PyRange or PyDict)
+            if (arguments[0] is not (PyList or PyTuple or PyStr or PyBytes or PyRange or PyDict or PyDeque)
                 && (arguments[0] as PyInstance)?.Dunder("__reversed__") is null)
             {
                 throw new PyRaise(PyErrors.TypeError(

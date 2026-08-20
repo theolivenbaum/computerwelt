@@ -11,42 +11,7 @@ public static class SupportModules
     {
         var module = new PyModuleObject("collections");
 
-        // A Counter is a dict of counts; building it as a plain dict keeps every dict
-        // method working on it, which is what the fixtures exercise.
-        module.Add("Counter", new PyBuiltinFunction("Counter", (arguments, keywords) =>
-        {
-            var counter = new PyDict();
-
-            // `Counter(a=2, b=3)` counts by name, which is why the keywords are not an
-            // error here the way they are for most builtins.
-            foreach (var (key, value) in keywords?.Entries ?? [])
-            {
-                counter.Set(key, value);
-            }
-
-            if (arguments.Length == 0)
-            {
-                return counter;
-            }
-
-            if (arguments[0] is PyDict source)
-            {
-                foreach (var (key, value) in source.Entries)
-                {
-                    counter.Set(key, value);
-                }
-
-                return counter;
-            }
-
-            foreach (var item in VirtualMachine.RequireIterable(arguments[0]))
-            {
-                var current = counter.TryGetValue(item, out var existing) ? ((PyInt)existing).Value : BigInteger.Zero;
-                counter.Set(item, new PyInt(current + 1));
-            }
-
-            return counter;
-        }));
+        module.Add("Counter", PyCounter.Type);
 
         module.Add("OrderedDict", new PyBuiltinFunction("OrderedDict", static arguments =>
         {
@@ -66,8 +31,7 @@ public static class SupportModules
         module.Add("defaultdict", new PyBuiltinFunction("defaultdict", arguments =>
             new PyDefaultDict(machine, arguments.Length > 0 && arguments[0] is not PyNone ? arguments[0] : null)));
 
-        module.Add("deque", new PyBuiltinFunction("deque", static arguments =>
-            new PyList(arguments.Length == 0 ? [] : VirtualMachine.RequireIterable(arguments[0]).ToList())));
+        module.Add("deque", PyDeque.Type);
 
         module.Add("namedtuple", new PyBuiltinFunction("namedtuple", static (arguments, keywords) =>
         {

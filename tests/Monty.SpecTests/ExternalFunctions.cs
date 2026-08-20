@@ -105,4 +105,17 @@ public static class ExternalFunctions
         PyInt integer => integer.Value,
         _ => throw new PyRaise(PyErrors.TypeError($"expected int, got {value.TypeName}")),
     };
+
+    /// <summary>
+    /// The non-function names upstream's harness resolves, as plain values.
+    /// </summary>
+    public static Dictionary<string, PyObject> Constants() => new(StringComparer.Ordinal)
+    {
+        ["CONST_INT"] = new PyInt(42),
+        ["CONST_STR"] = new PyStr("hello"),
+        ["CONST_FLOAT"] = new PyFloat(3.14),
+        ["CONST_BOOL"] = PyBool.True,
+        ["CONST_LIST"] = new PyList([new PyInt(1), new PyInt(2), new PyInt(3)]),
+        ["CONST_NONE"] = PyNone.Instance,
+    };
 }

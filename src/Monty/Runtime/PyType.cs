@@ -56,6 +56,16 @@ public sealed class PyType : PyCallable
             return new PyStr(Name);
         }
 
+        // CPython disables the inherited classmethod on Counter, and it is reachable from
+        // the type as well as from an instance.
+        if (Name == "Counter" && name == "fromkeys")
+        {
+            return new PyBuiltinFunction("fromkeys", static _ =>
+                throw new PyRaise(new PyException(
+                    PyExceptionType.NotImplementedError,
+                    "Counter.fromkeys() is undefined.  Use Counter(iterable) instead.")));
+        }
+
         // `bytes.fromhex(...)` and `dict.fromkeys(...)` are reached through the type, not
         // an instance.
         if (Name == "bytes" && name == "fromhex")
@@ -243,6 +253,8 @@ public static class TypeRegistry
         PyStr => Str,
         PyBytes => Bytes,
         PyList => List,
+        PyCounter => PyCounter.Type,
+        PyDeque => PyDeque.Type,
         // A named tuple reports its own class, which is what makes `type(p) is Point` hold.
         PyNamedTuple named => named.Type,
         PyTuple => Tuple,

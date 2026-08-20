@@ -66,6 +66,33 @@ public static class Operators
 
     private static PyObject Apply(string op, PyObject left, PyObject right)
     {
+        if (left is PyDeque deque)
+        {
+            if (op == "+")
+            {
+                return PyDeque.Concat(deque, right);
+            }
+
+            if (op == "*")
+            {
+                return PyDeque.Repeat(deque, right);
+            }
+        }
+
+        // `2 * d` repeats just as `d * 2` does.
+        if (right is PyDeque repeated && op == "*")
+        {
+            return PyDeque.Repeat(repeated, left);
+        }
+
+        // A Counter's operators are multiset operations over the union of the keys, and
+        // keep only the positive results.
+        if (left is PyCounter counter && right is PyDict counts && op is "+" or "-" or "|" or "&")
+        {
+            return PyCounter.Combine(counter, counts, op);
+        }
+
+
         // A user class defines an operator by its dunder; the reflected form is tried when
         // the left operand does not implement the forward one.
         if ((left is PyInstance || right is PyInstance) && ArithmeticDunders.TryGetValue(op, out var dunders))
@@ -109,6 +136,7 @@ public static class Operators
 
         "-" => operand switch
         {
+            PyCounter counter => PyCounter.Negate(counter, negate: true),
             PyInstance instance when instance.Dunder("__neg__") is { } negate =>
                 instance.Invoke(negate, []),
             PyBool flag => new PyInt(flag.Value ? -1 : 0),
@@ -119,6 +147,7 @@ public static class Operators
 
         "+" => operand switch
         {
+            PyCounter counter => PyCounter.Negate(counter, negate: false),
             PyInstance instance when instance.Dunder("__pos__") is { } plus =>
                 instance.Invoke(plus, []),
             PyBool flag => new PyInt(flag.Value ? 1 : 0),
@@ -146,10 +175,12 @@ public static class Operators
         "is not" => PyBool.Of(!Identical(left, right)),
         "in" => PyBool.Of(right.Contains(left)),
         "not in" => PyBool.Of(!right.Contains(left)),
-        "<" => PyBool.Of(Order(op, left, right) < 0),
-        "<=" => PyBool.Of(Order(op, left, right) <= 0),
-        ">" => PyBool.Of(Order(op, left, right) > 0),
-        ">=" => PyBool.Of(Order(op, left, right) >= 0),
+        // A Counter compares as a multiset, element-wise over the union of the keys,
+        // rather than as the mapping it otherwise is — and only against another Counter.
+        "<" or "<=" or ">" or ">=" when left is PyCounter counter && right is PyCounter counts =>
+            PyBool.Of(PyCounter.Compare(counter, counts, op)),
+
+        "<" or "<=" or ">" or ">=" => Ordering(op, left, right),
         _ => throw new PyRaise(PyErrors.TypeError($"unsupported comparison {op}")),
     };
 
@@ -223,10 +254,46 @@ public static class Operators
         };
     }
 
-    private static int Order(string op, PyObject left, PyObject right) =>
-        left.PyCompare(right)
-        ?? throw new PyRaise(PyErrors.TypeError(
-            $"'{op}' not supported between instances of '{left.TypeName}' and '{right.TypeName}'"));
+    /// <summary>
+    /// Applies an ordering comparison.
+    /// </summary>
+    /// <remarks>
+    /// A pair with no ordering is usually a type error, but a NaN is not: IEEE says every
+    /// comparison against it is false, including inside a sequence, where the first
+    /// differing element decides.
+    /// </remarks>
+    private static PyObject Ordering(string op, PyObject left, PyObject right)
+    {
+        int? order;
+        var (a, b) = (left, right);
+
+        try
+        {
+            order = left.PyCompare(right);
+        }
+        catch (PyList.UnorderedPair pair)
+        {
+            (order, a, b) = (null, pair.Left, pair.Right);
+        }
+
+        if (order is not { } decided)
+        {
+            return IsNaN(a) || IsNaN(b)
+                ? PyBool.False
+                : throw new PyRaise(PyErrors.TypeError(
+                    $"'{op}' not supported between instances of '{a.TypeName}' and '{b.TypeName}'"));
+        }
+
+        return PyBool.Of(op switch
+        {
+            "<" => decided < 0,
+            "<=" => decided <= 0,
+            ">" => decided > 0,
+            _ => decided >= 0,
+        });
+    }
+
+    private static bool IsNaN(PyObject value) => value is PyFloat number && double.IsNaN(number.Value);
 
     private static PyObject Add(PyObject left, PyObject right)
     {
@@ -535,6 +602,27 @@ public static class Operators
             && instance.Dunder(dunder) is { } method)
         {
             return instance.Invoke(method, [right]);
+        }
+
+        // `+=` on a deque is extend, so any iterable works; `*=` repeats in place.
+        if (left is PyDeque target)
+        {
+            if (op == "+")
+            {
+                return PyDeque.Extend(target, right);
+            }
+
+            if (op == "*")
+            {
+                return PyDeque.RepeatInPlace(target, right);
+            }
+        }
+
+        // A Counter's in-place operators mutate it, unlike the binary forms, and accept
+        // any mapping — or, for `&`, anything subscriptable.
+        if (left is PyCounter counter && op is "+" or "-" or "|" or "&")
+        {
+            return PyCounter.Update(counter, right, op);
         }
 
         switch (op, left)
