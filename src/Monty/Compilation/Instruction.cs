@@ -50,6 +50,9 @@ public enum OpCode
     /// <summary>Remove a global binding.</summary>
     DeleteGlobal,
 
+    /// <summary>Clear a cell, leaving the variable it holds unbound.</summary>
+    DeleteCell,
+
     /// <summary>Push a closure cell's value.</summary>
     LoadCell,
 

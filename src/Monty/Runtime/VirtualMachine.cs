@@ -112,7 +112,15 @@ public sealed class VirtualMachine
 
             case PyExceptionType exceptionType:
             {
-                var message = arguments.Length > 0 ? arguments[0].Display() : string.Empty;
+                // A KeyError shows its key's repr rather than its text, which is what makes
+                // `KeyError('x')` print as `'x'` and a missing key visible when it is blank.
+                var single = arguments.Length > 0 ? arguments[0] : null;
+                var message = single is null
+                    ? string.Empty
+                    : ReferenceEquals(exceptionType, PyExceptionType.KeyError) && arguments.Length == 1
+                        ? single.Repr()
+                        : single.Display();
+
                 return new PyException(exceptionType, message, arguments);
             }
 
@@ -515,7 +523,19 @@ public sealed class VirtualMachine
     }
 
     /// <summary>An entry on the block stack.</summary>
-    internal readonly record struct Block(BlockKind Kind, int Handler, int StackDepth);
+    /// <summary>One entry of a frame's block stack.</summary>
+    /// <param name="Kind">What the block protects.</param>
+    /// <param name="Handler">Where control goes when it is triggered.</param>
+    /// <param name="StackDepth">The value-stack depth to restore.</param>
+    /// <param name="Saved">
+    /// For a <see cref="BlockKind.Handler"/> block, the exception that was current before
+    /// the handler began — restored when the handler ends, however it ends.
+    /// </param>
+    internal readonly record struct Block(
+        BlockKind Kind,
+        int Handler,
+        int StackDepth,
+        PyException? Saved = null);
 
     /// <summary>What a block protects.</summary>
     internal enum BlockKind
@@ -523,6 +543,17 @@ public sealed class VirtualMachine
         Except,
         Finally,
         With,
+
+        /// <summary>
+        /// A running exception handler.
+        /// </summary>
+        /// <remarks>
+        /// Pushed when control enters an <c>except</c> clause or an exception-path
+        /// <c>finally</c>, and carrying the exception state to put back. That restore is
+        /// what makes a handler that raises a new exception leave no trace of the one it was
+        /// handling — so a later bare <c>raise</c> finds nothing rather than the wrong thing.
+        /// </remarks>
+        Handler,
     }
 
     /// <summary>A control transfer that is not an exception: a return out of a frame.</summary>
@@ -681,6 +712,17 @@ public sealed class VirtualMachine
                 exception.Context ??= previous;
             }
 
+            // Leaving a handler this way ends it: its exception stops being current before
+            // the new one goes looking further out.
+            if (block.Kind == BlockKind.Handler)
+            {
+                frame.CurrentException = block.Saved;
+                continue;
+            }
+
+            frame.Blocks.Add(new Block(
+                BlockKind.Handler, block.Handler, block.StackDepth, frame.CurrentException));
+
             frame.CurrentException = exception;
             frame.InstructionPointer = block.Handler;
             return true;
@@ -773,8 +815,18 @@ public sealed class VirtualMachine
             }
 
             case OpCode.DeleteLocal:
+            {
                 frame.Locals[instruction.Operand] = null;
+
+                // Keep a captured local's cell in step, as StoreLocal does: a closure that
+                // reads the deleted name must see it unbound, not the stale value.
+                if (frame.Cells.TryGetValue(code.LocalNames[instruction.Operand], out var cell))
+                {
+                    cell.Value = null;
+                }
+
                 return false;
+            }
 
             case OpCode.LoadGlobal:
             {
@@ -814,10 +866,26 @@ public sealed class VirtualMachine
 
                 if (!frame.Cells.TryGetValue(name, out var cell) || cell.Value is null)
                 {
-                    throw new PyRaise(PyErrors.UnboundLocalError(name));
+                    // The frame that owns the variable reports it as its own unassigned
+                    // local; one that merely captured the cell names it a free variable.
+                    throw new PyRaise(code.LocalNames.Contains(name)
+                        ? PyErrors.UnboundLocalError(name)
+                        : PyErrors.UnboundFreeVariable(name));
                 }
 
                 frame.Push(cell.Value);
+                return false;
+            }
+
+            case OpCode.DeleteCell:
+            {
+                var name = code.CellNames[instruction.Operand];
+
+                if (frame.Cells.TryGetValue(name, out var cell))
+                {
+                    cell.Value = null;
+                }
+
                 return false;
             }
 
@@ -1350,13 +1418,13 @@ public sealed class VirtualMachine
             }
 
             case OpCode.EndHandler:
-                frame.CurrentException = null;
+                frame.CurrentException = EndHandler(frame);
                 return false;
 
             case OpCode.ReRaise:
                 if (frame.CurrentException is { } pending)
                 {
-                    frame.CurrentException = null;
+                    frame.CurrentException = EndHandler(frame);
                     throw new PyRaise(pending);
                 }
 
@@ -1498,12 +1566,45 @@ public sealed class VirtualMachine
         return members;
     }
 
+    /// <summary>
+    /// Ends the innermost running handler, returning the exception state to put back.
+    /// </summary>
+    private static PyException? EndHandler(Frame frame)
+    {
+        if (frame.Blocks.Count == 0 || frame.Blocks[^1].Kind != BlockKind.Handler)
+        {
+            return null;
+        }
+
+        var saved = frame.Blocks[^1].Saved;
+        frame.Blocks.RemoveAt(frame.Blocks.Count - 1);
+        return saved;
+    }
+
+    /// <summary>Tests a caught exception against an <c>except</c> clause's type.</summary>
+    /// <remarks>
+    /// A tuple of types is allowed, but only one level deep: CPython does not descend into
+    /// a nested tuple, it rejects it — and rejects it while evaluating the clause, so the
+    /// error propagates past the remaining handlers of the same <c>try</c>.
+    /// </remarks>
     private static bool MatchesExceptionType(PyException actual, PyObject expected) => expected switch
     {
         PyExceptionType type => actual.IsInstanceOf(type),
-        PyTuple tuple => tuple.Items.Any(item => MatchesExceptionType(actual, item)),
+        // Every element is validated, not just the ones up to the first match: an invalid
+        // element raises even when an earlier one already matched.
+        PyTuple tuple => tuple.Items.Count(item => MatchesOneType(actual, item)) > 0,
+        _ => MatchesOneType(actual, expected),
+    };
+
+    private static bool MatchesOneType(PyException actual, PyObject expected) => expected switch
+    {
+        PyExceptionType type => actual.IsInstanceOf(type),
+
+        // A user class cannot be an exception type here, but it is at least a class; a
+        // value that is not a class at all is a mistake worth naming.
         PyClass => false,
-        _ => false,
+        _ => throw new PyRaise(PyErrors.TypeError(
+            "catching classes that do not inherit from BaseException is not allowed")),
     };
 
     private void DoRaise(Frame frame, int argumentCount)

@@ -260,6 +260,18 @@ public sealed class PyExceptionType : PyObject
     /// <summary><c>PermissionError</c>.</summary>
     public static PyExceptionType PermissionError { get; } = Define("PermissionError", OSError);
 
+    /// <summary><c>TimeoutError</c>, an <c>OSError</c> since Python 3.3.</summary>
+    public static PyExceptionType TimeoutError { get; } = Define("TimeoutError", OSError);
+
+    /// <summary><c>InterruptedError</c>.</summary>
+    public static PyExceptionType InterruptedError { get; } = Define("InterruptedError", OSError);
+
+    /// <summary><c>ConnectionError</c>.</summary>
+    public static PyExceptionType ConnectionError { get; } = Define("ConnectionError", OSError);
+
+    /// <summary><c>BlockingIOError</c>.</summary>
+    public static PyExceptionType BlockingIOError { get; } = Define("BlockingIOError", OSError);
+
     /// <summary><c>re.PatternError</c>, also spelled <c>re.error</c>.</summary>
     public static PyExceptionType PatternError { get; } = Define("PatternError", ValueError);
 
@@ -315,6 +327,21 @@ public static class PyErrors
     /// <summary>Creates an <c>UnboundLocalError</c>.</summary>
     public static PyException UnboundLocalError(string name) =>
         new(PyExceptionType.UnboundLocalError, $"cannot access local variable '{name}' where it is not associated with a value");
+
+    /// <summary>
+    /// Creates the <c>NameError</c> for reading a captured variable that has no value.
+    /// </summary>
+    /// <remarks>
+    /// A frame that merely captured the cell gets this rather than an
+    /// <c>UnboundLocalError</c>: the variable is not its local, and the frame that owns it
+    /// has not assigned it yet.
+    /// </remarks>
+    /// <param name="name">The variable's name.</param>
+    /// <returns>The exception.</returns>
+    public static PyException UnboundFreeVariable(string name) =>
+        new(
+            PyExceptionType.NameError,
+            $"cannot access free variable '{name}' where it is not associated with a value in enclosing scope");
 
     /// <summary>Creates an <c>AttributeError</c>.</summary>
     public static PyException AttributeError(string typeName, string attribute) =>

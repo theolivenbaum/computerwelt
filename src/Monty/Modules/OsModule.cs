@@ -627,10 +627,12 @@ public sealed class PyFile : PyObject
 
         // `with open(...) as f` needs the context-manager protocol on the file itself.
         "__enter__" => new PyBuiltinFunction("__enter__", _ => this),
+        // Closing on the way out, and returning None rather than False: a file does not
+        // suppress an exception, and `f.__exit__(None, None, None)` is None.
         "__exit__" => new PyBuiltinFunction("__exit__", _ =>
         {
             _closed = true;
-            return PyBool.False;
+            return PyNone.Instance;
         }),
 
         _ => null,

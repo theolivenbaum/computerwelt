@@ -24,6 +24,11 @@ public sealed class Compiler
     private readonly CodeObject _code;
     private readonly Compiler? _parent;
     private readonly HashSet<string> _locals = new(StringComparer.Ordinal);
+    // How many return values are waiting on the stack for the `finally` bodies being
+    // emitted to finish. A `break` or `continue` inside one abandons the return, so it has
+    // to drop the value the return had already computed.
+    private int _pendingReturns;
+
     private readonly HashSet<string> _globalDeclarations = new(StringComparer.Ordinal);
 
     // What this scope has assigned or read so far, in statement order, so a later `global`
@@ -72,9 +77,16 @@ public sealed class Compiler
     /// Cleanup owed to an enclosing <c>try</c>/<c>finally</c> or <c>with</c>, which a jump
     /// out of it has to run first.
     /// </summary>
-    /// <param name="Body">The finally body, or null for a <c>with</c>.</param>
+    /// <param name="Body">The finally body, null for a <c>with</c> or a handler.</param>
     /// <param name="LoopDepth">How many loops enclosed the block when it was opened.</param>
-    private sealed record FinallyContext(IReadOnlyList<Statement>? Body, int LoopDepth);
+    /// <param name="IsHandler">
+    /// True for a running <c>except</c> clause or exception-path <c>finally</c>, whose
+    /// cleanup is ending the handler rather than running a body.
+    /// </param>
+    private sealed record FinallyContext(
+        IReadOnlyList<Statement>? Body,
+        int LoopDepth,
+        bool IsHandler = false);
 
     private sealed record LoopContext(List<int> BreakJumps, List<int> ContinueJumps, int ContinueTarget)
     {
@@ -303,7 +315,19 @@ public sealed class Compiler
         // the module, which is why `helper` in a method is never the class attribute.
         for (var scope = _parent; scope is not null; scope = scope._parent)
         {
-            if (!scope._isFunctionScope || scope._isClassBody || !scope._locals.Contains(name))
+            if (!scope._isFunctionScope || scope._isClassBody)
+            {
+                continue;
+            }
+
+            // An intermediate `global` cuts the chain: past it the name means the module's,
+            // even when a scope further out has a local of that name.
+            if (scope._globalDeclarations.Contains(name))
+            {
+                return Binding.Global;
+            }
+
+            if (!scope._locals.Contains(name))
             {
                 continue;
             }
@@ -330,6 +354,11 @@ public sealed class Compiler
 
         for (var scope = _parent; scope is not null; scope = scope._parent)
         {
+            if (scope._isFunctionScope && !scope._isClassBody && scope._globalDeclarations.Contains(name))
+            {
+                break;
+            }
+
             if (scope._isFunctionScope && !scope._isClassBody
                 && (scope._locals.Contains(name) || scope._code.CellNames.Contains(name)))
             {
@@ -475,7 +504,17 @@ public sealed class Compiler
                 // The return value is computed before the `finally` bodies run, and waits
                 // on the stack while they do — which is why `return f()` inside a `try`
                 // calls `f` first and the cleanup second.
-                UnwindFinallies(returnStatement.Line, all: true);
+                _pendingReturns++;
+
+                try
+                {
+                    UnwindFinallies(returnStatement.Line, all: true);
+                }
+                finally
+                {
+                    _pendingReturns--;
+                }
+
                 Emit(OpCode.Return, 0, returnStatement.Line);
                 break;
 
@@ -505,6 +544,7 @@ public sealed class Compiler
                 }
 
                 UnwindFinallies(breakStatement.Line);
+                DiscardPendingReturns(breakStatement.Line);
 
                 // A `for` leaves its iterator on the stack for the whole loop, and only the
                 // exhaustion path pops it — so a `break` has to pop it itself.
@@ -523,6 +563,7 @@ public sealed class Compiler
                 }
 
                 UnwindFinallies(continueStatement.Line);
+                DiscardPendingReturns(continueStatement.Line);
                 _loops[^1].ContinueJumps.Add(Emit(OpCode.Jump, 0, continueStatement.Line));
                 break;
 
@@ -736,13 +777,21 @@ public sealed class Compiler
         switch (target)
         {
             case Parsing.Name name:
-                if (Resolve(name.Id) == Binding.Local)
+                switch (Resolve(name.Id))
                 {
-                    Emit(OpCode.DeleteLocal, _code.LocalSlot(name.Id), name.Line);
-                }
-                else
-                {
-                    Emit(OpCode.DeleteGlobal, _code.AddName(name.Id), name.Line);
+                    case Binding.Local:
+                        Emit(OpCode.DeleteLocal, _code.LocalSlot(name.Id), name.Line);
+                        break;
+
+                    // A captured variable lives in its cell, so clearing the local slot
+                    // would leave the closure still seeing the old value.
+                    case Binding.Cell:
+                        Emit(OpCode.DeleteCell, CellSlot(name.Id), name.Line);
+                        break;
+
+                    default:
+                        Emit(OpCode.DeleteGlobal, _code.AddName(name.Id), name.Line);
+                        break;
                 }
 
                 break;
@@ -834,22 +883,30 @@ public sealed class Compiler
         CompileTryExcept(tryStatement);
     }
 
+    /// <summary>Drops the return values a jump out of a <c>finally</c> abandons.</summary>
+    /// <param name="line">The line to attribute the emitted code to.</param>
+    private void DiscardPendingReturns(int line)
+    {
+        for (var i = 0; i < _pendingReturns; i++)
+        {
+            Emit(OpCode.Pop, 0, line);
+        }
+    }
+
     /// <summary>
-    /// Runs the cleanup owed to every <c>finally</c> the jump is leaving.
+    /// Runs the <c>finally</c> bodies a jump out of them would skip.
     /// </summary>
     /// <remarks>
     /// <c>break</c> and <c>continue</c> leave a <c>try</c> block just as <c>return</c>
     /// does, so their finallys have to run before the jump — otherwise the cleanup a script
     /// wrote is silently skipped, which is exactly the bug <c>finally</c> exists to prevent.
     /// </remarks>
-    /// <summary>
-    /// Runs the <c>finally</c> bodies a jump out of them would skip.
-    /// </summary>
     /// <param name="line">The line to attribute the emitted code to.</param>
     /// <param name="all">
     /// True to unwind every enclosing <c>finally</c>, as a <c>return</c> does; false to
     /// stop at the current loop, which is as far as a <c>break</c> or <c>continue</c> goes.
     /// </param>
+
     private void UnwindFinallies(int line, bool all = false)
     {
         var pending = new List<FinallyContext>(_finallies);
@@ -861,6 +918,16 @@ public sealed class Compiler
                 if (!all && pending[i].LoopDepth != _loops.Count)
                 {
                     break;
+                }
+
+                // A running handler's cleanup is ending it: the exception it caught stops
+                // being current, which is why a bare `raise` in an enclosing `finally` finds
+                // nothing — while one nested *inside* the handler still finds it, because
+                // that finally is unwound first.
+                if (pending[i].IsHandler)
+                {
+                    Emit(OpCode.EndHandler, 0, line);
+                    continue;
                 }
 
                 // A `with` has no body to re-emit: its cleanup is the manager's exit,
@@ -915,11 +982,34 @@ public sealed class Compiler
         CompileStatements(tryStatement.FinallyBody);
         var skip = Emit(OpCode.Jump, 0, tryStatement.Line);
 
+        // The second copy runs while an exception is in flight, so a jump out of it ends
+        // that exception the same way leaving an `except` handler does.
         Patch(setup, Here);
-        CompileStatements(tryStatement.FinallyBody);
+        _finallies.Add(new FinallyContext(null, _loops.Count, IsHandler: true));
+
+        try
+        {
+            CompileStatements(tryStatement.FinallyBody);
+        }
+        finally
+        {
+            _finallies.RemoveAt(_finallies.Count - 1);
+        }
+
         Emit(OpCode.ReRaise, 0, tryStatement.Line);
         Patch(skip, Here);
     }
+
+    /// <summary>Wraps a handler body in the <c>finally</c> that unbinds its target.</summary>
+    private static Try Unbinding(ExceptHandler handler, string name) =>
+        new(
+            handler.Body,
+            [],
+            [],
+            [new Delete([new Parsing.Name(name) { Line = handler.Line }]) { Line = handler.Line }])
+        {
+            Line = handler.Line,
+        };
 
     private void CompileTryExcept(Try tryStatement)
     {
@@ -958,9 +1048,26 @@ public sealed class Compiler
                 EmitStore(name, handler.Line);
             }
 
+            // `except E as e` unbinds `e` however the handler ends — normally, by an early
+            // jump, or by raising — which the language spells as an implicit `finally`, and
+            // which is why reading `e` afterwards is a NameError.
+            var body = handler.Name is { } bound
+                ? (IReadOnlyList<Statement>)[Unbinding(handler, bound)]
+                : handler.Body;
+
             // The exception stays current for the whole handler, so a bare `raise` inside
             // it re-raises what was caught; it is cleared only on the way out.
-            CompileStatements(handler.Body);
+            _finallies.Add(new FinallyContext(null, _loops.Count, IsHandler: true));
+
+            try
+            {
+                CompileStatements(body);
+            }
+            finally
+            {
+                _finallies.RemoveAt(_finallies.Count - 1);
+            }
+
             Emit(OpCode.EndHandler, 0, handler.Line);
             handlerExits.Add(Emit(OpCode.Jump, 0, handler.Line));
 
