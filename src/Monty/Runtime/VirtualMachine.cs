@@ -252,11 +252,23 @@ public sealed class VirtualMachine
 
     private Dictionary<string, PyCell> BuildCells(PyFunction function, PyObject?[] locals)
     {
-        var cells = new Dictionary<string, PyCell>(function.Closure, StringComparer.Ordinal);
+        var code = function.Code;
+        var cells = new Dictionary<string, PyCell>(StringComparer.Ordinal);
+
+        // The inherited cells are the free variables this function reads. A name it binds
+        // itself shadows the enclosing one completely: `def f(x)` nested in a scope whose
+        // own `x` is captured must see its parameter, never the cell next door.
+        foreach (var (name, inherited) in function.Closure)
+        {
+            if (!code.LocalNames.Contains(name))
+            {
+                cells[name] = inherited;
+            }
+        }
 
         // A local this function's body reads through a cell must be shared, not copied,
         // so nested closures observe later assignments.
-        foreach (var name in function.Code.CellNames)
+        foreach (var name in code.CellNames)
         {
             if (cells.ContainsKey(name))
             {
@@ -264,7 +276,7 @@ public sealed class VirtualMachine
             }
 
             var cell = new PyCell();
-            var slot = function.Code.LocalNames.IndexOf(name);
+            var slot = code.LocalNames.IndexOf(name);
 
             if (slot >= 0 && slot < locals.Length)
             {

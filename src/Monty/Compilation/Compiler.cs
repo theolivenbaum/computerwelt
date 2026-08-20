@@ -25,6 +25,13 @@ public sealed class Compiler
     private readonly Compiler? _parent;
     private readonly HashSet<string> _locals = new(StringComparer.Ordinal);
     private readonly HashSet<string> _globalDeclarations = new(StringComparer.Ordinal);
+
+    // What this scope has assigned or read so far, in statement order, so a later `global`
+    // declaration can be reported as coming too late. Imports are excluded: CPython treats
+    // an import binding as a soft one that a following `global` may still override.
+    private readonly HashSet<string> _assignedHere = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _readHere = new(StringComparer.Ordinal);
+    private bool _bindingImport;
     private readonly HashSet<string> _nonlocalDeclarations = new(StringComparer.Ordinal);
     private readonly List<LoopContext> _loops = [];
     private readonly List<FinallyContext> _finallies = [];
@@ -344,6 +351,8 @@ public sealed class Compiler
 
     private void EmitLoad(string name, int line)
     {
+        _readHere.Add(name);
+
         switch (Resolve(name))
         {
             case Binding.Local:
@@ -364,6 +373,11 @@ public sealed class Compiler
 
     private void EmitStore(string name, int line)
     {
+        if (!_bindingImport)
+        {
+            _assignedHere.Add(name);
+        }
+
         switch (Resolve(name))
         {
             case Binding.Local:
@@ -512,21 +526,57 @@ public sealed class Compiler
                 _loops[^1].ContinueJumps.Add(Emit(OpCode.Jump, 0, continueStatement.Line));
                 break;
 
-            case Global or Nonlocal:
-                // Declarations only affect the pre-pass; they emit nothing.
+            case Global global:
+                // A declaration emits nothing; it only takes part in the pre-pass. What it
+                // can do here is complain, because ordering matters: the name must not have
+                // been used in this scope before the declaration was seen.
+                foreach (var name in global.Names)
+                {
+                    if (_assignedHere.Contains(name))
+                    {
+                        throw new PythonSyntaxError(
+                            $"name '{name}' is assigned to before global declaration",
+                            global.Line,
+                            global.Column);
+                    }
+
+                    if (_readHere.Contains(name))
+                    {
+                        throw new PythonSyntaxError(
+                            $"name '{name}' is used prior to global declaration",
+                            global.Line,
+                            global.Column);
+                    }
+                }
+
+                break;
+
+            case Nonlocal moduleNonlocal when !_isFunctionScope:
+                // There is no enclosing function to bind to at module level, so the
+                // declaration cannot mean anything there.
+                throw new PythonSyntaxError(
+                    "nonlocal declaration not allowed at module level",
+                    moduleNonlocal.Line,
+                    moduleNonlocal.Column);
+
+            case Nonlocal:
                 break;
 
             case Import import:
+                _bindingImport = true;
+
                 foreach (var alias in import.Names)
                 {
                     Emit(OpCode.ImportName, _code.AddName(alias.Name), import.Line);
                     EmitStore(alias.Alias ?? alias.Name.Split('.')[0], import.Line);
                 }
 
+                _bindingImport = false;
                 break;
 
             case ImportFrom importFrom:
                 Emit(OpCode.ImportName, _code.AddName(importFrom.Module), importFrom.Line);
+                _bindingImport = true;
 
                 foreach (var alias in importFrom.Names)
                 {
@@ -535,6 +585,7 @@ public sealed class Compiler
                     EmitStore(alias.Alias ?? alias.Name, importFrom.Line);
                 }
 
+                _bindingImport = false;
                 Emit(OpCode.Pop, 0, importFrom.Line);
                 break;
 
@@ -1057,6 +1108,22 @@ public sealed class Compiler
         {
             _isClassBody = isClassBody,
         };
+
+        // Two parameters of one name would share a slot, so the second would silently win.
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var parameter in parameters.Parameters
+            .Concat(parameters.KeywordOnly)
+            .Select(static p => p.Name)
+            .Concat(parameters.VarArgs is null ? [] : [parameters.VarArgs])
+            .Concat(parameters.KeywordArgs is null ? [] : [parameters.KeywordArgs]))
+        {
+            if (!seen.Add(parameter))
+            {
+                throw new PythonSyntaxError(
+                    $"duplicate argument '{parameter}' in function definition", line, 0);
+            }
+        }
 
         // Parameters occupy the first local slots, in declaration order.
         foreach (var parameter in parameters.Parameters)
