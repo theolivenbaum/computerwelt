@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Text;
 using Monty.Runtime;
 
@@ -216,14 +217,92 @@ public static class OsModule
 
     /// <summary>Builds the <c>open</c> builtin over <paramref name="fileSystem"/>.</summary>
     public static PyObject CreateOpen(IPyFileSystem fileSystem) =>
-        new PyBuiltinFunction("open", (arguments, keywords) =>
-        {
-            var path = arguments.Length > 0 ? Text(arguments[0]) : Text(Keyword(keywords, "file") ?? PyNone.Instance);
-            var mode = arguments.Length > 1 ? arguments[1].Display()
-                : Keyword(keywords, "mode")?.Display() ?? "r";
+        new PyBuiltinFunction("open", (arguments, keywords) => Open(fileSystem, arguments, keywords));
 
-            return new PyFile(fileSystem, path, mode);
-        });
+    /// <summary>Runs <c>open</c>'s argument binding and opens the file.</summary>
+    /// <remarks>
+    /// <c>Path.open</c> is the same call with the path already bound as <c>file</c>, so it
+    /// shares this body rather than repeating the binder and its rejections.
+    /// </remarks>
+    /// <param name="fileSystem">Where the file lives.</param>
+    /// <param name="arguments">The positional arguments, <c>file</c> first.</param>
+    /// <param name="keywords">The keyword arguments, if any.</param>
+    /// <returns>The open file.</returns>
+    public static PyObject Open(IPyFileSystem fileSystem, PyObject[] arguments, PyDict? keywords)
+    {
+        string[] names = ["file", "mode", "buffering", "encoding", "errors", "newline", "closefd", "opener"];
+
+        if (arguments.Length > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"open() takes at most {names.Length} arguments ({arguments.Length} given)"));
+        }
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            given[i] = arguments[i];
+        }
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"open() got an unexpected keyword argument '{key.Display()}'"));
+            }
+
+            if (given[position] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"open() got multiple values for argument '{names[position]}'"));
+            }
+
+            given[position] = value;
+        }
+
+        // Everything past the mode is accepted only at its CPython default: honouring
+        // one silently would promise behaviour this wrapper does not have. UTF-8 is
+        // the exception, because that is already what it does.
+        Default(given[2], "buffering", static value => value is PyInt { Value: var n } && n == -1);
+        if (given[3] is not (null or PyNone or PyStr))
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"open() argument 'encoding' must be str or None, not {given[3]!.TypeName}"));
+        }
+
+        Default(given[3], "encoding", static value =>
+            value is PyNone or PyStr { Value: "utf-8" or "utf8" or "UTF-8" });
+        Default(given[4], "errors", static value => value is PyNone);
+        Default(given[5], "newline", static value => value is PyNone);
+        Default(given[6], "closefd", static value => value.IsTruthy());
+        Default(given[7], "opener", static value => value is PyNone);
+
+        var mode = given[1] switch
+        {
+            null or PyStr => (given[1] as PyStr)?.Value ?? "r",
+
+            // The argument clinic spells a lone None as "None", not "NoneType".
+            PyNone => throw new PyRaise(PyErrors.TypeError(
+                "open() argument 'mode' must be str, not None")),
+            _ => throw new PyRaise(PyErrors.TypeError(
+                $"open() argument 'mode' must be str, not {given[1]!.TypeName}")),
+        };
+
+        return new PyFile(fileSystem, Text(given[0] ?? PyNone.Instance), mode);
+    }
+
+    /// <summary>Rejects an argument this wrapper accepts only at its default.</summary>
+    private static void Default(PyObject? value, string name, Func<PyObject, bool> isDefault)
+    {
+        if (value is not null && !isDefault(value))
+        {
+            throw new PyRaise(PyErrors.TypeError($"'{name}' argument is not yet supported"));
+        }
+    }
 
     private static PyObject? Keyword(PyDict? keywords, string name) =>
         keywords is not null && keywords.TryGetValue(new PyStr(name), out var value) ? value : null;
@@ -285,6 +364,40 @@ public sealed class PyFile : PyObject
         _fileSystem = fileSystem;
         _path = path;
         _binary = mode.Contains('b', StringComparison.Ordinal);
+        Mode = mode;
+
+        // The mode is parsed before anything is opened: an unknown letter, or a mode with
+        // no action in it at all, is a mistake in the call.
+        foreach (var letter in mode)
+        {
+            if (!"rwaxbt+U".Contains(letter, StringComparison.Ordinal))
+            {
+                throw new PyRaise(PyErrors.ValueError($"invalid mode: '{mode}'"));
+            }
+        }
+
+        var actions = mode.Count(static letter => letter is 'r' or 'w' or 'a' or 'x');
+
+        // Two actions and no action are different mistakes, and CPython words them
+        // differently — down to the case of the first letter.
+        if (actions > 1)
+        {
+            throw new PyRaise(PyErrors.ValueError(
+                "must have exactly one of create/read/write/append mode"));
+        }
+
+        if (actions == 0 || mode.Count(static letter => letter == '+') > 1)
+        {
+            throw new PyRaise(PyErrors.ValueError(
+                "Must have exactly one of create/read/write/append mode and at most one plus"));
+        }
+
+        // An update mode would need a read position that survives a write, which this
+        // wrapper does not keep — so it is refused rather than silently truncating.
+        if (mode.Contains('+', StringComparison.Ordinal))
+        {
+            throw new PyRaise(PyErrors.ValueError("update modes ('+') are not yet supported"));
+        }
 
         var write = mode.Contains('w', StringComparison.Ordinal);
         var append = mode.Contains('a', StringComparison.Ordinal);
@@ -313,7 +426,15 @@ public sealed class PyFile : PyObject
             return;
         }
 
-        // Reading a file that does not exist has to fail now, not at the first read.
+        // Reading a file that does not exist has to fail now, not at the first read, and
+        // a directory is not a file at all.
+        if (fileSystem.IsDirectory(path))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.IsADirectoryError,
+                $"[Errno 21] Is a directory: '{path}'"));
+        }
+
         if (!fileSystem.Exists(path))
         {
             throw new PyRaise(new PyException(
@@ -327,26 +448,78 @@ public sealed class PyFile : PyObject
     /// <summary>Whether writes append rather than overwrite.</summary>
     private bool Appending { get; }
 
-    /// <inheritdoc />
-    public override string TypeName => "TextIOWrapper";
+    /// <summary>The mode the file was opened with.</summary>
+    public string Mode { get; }
+
+    /// <summary>Whether the mode permits reading.</summary>
+    private bool Readable => Mode.Contains('r', StringComparison.Ordinal);
+
+    /// <summary>Whether the mode permits writing.</summary>
+    private bool Writable =>
+        Mode.Contains('w', StringComparison.Ordinal)
+        || Mode.Contains('a', StringComparison.Ordinal)
+        || Mode.Contains('x', StringComparison.Ordinal);
 
     /// <inheritdoc />
-    public override string Repr() => $"<_io.TextIOWrapper name='{_path}' mode='r'>";
+    /// <remarks>
+    /// A binary file is a reader or a writer depending on its mode; a text one is a
+    /// TextIOWrapper either way.
+    /// </remarks>
+    public override string TypeName => !_binary ? "_io.TextIOWrapper"
+        : Mode.Contains('r', StringComparison.Ordinal) ? "_io.BufferedReader"
+        : "_io.BufferedWriter";
+
+    /// <inheritdoc />
+    public override string Repr() => $"<{TypeName} name='{_path}' mode='{Mode}'>";
 
     /// <inheritdoc />
     public override IEnumerable<PyObject>? Iterate() => Lines().Select(static line => (PyObject)new PyStr(line));
 
     /// <inheritdoc />
-    public override PyObject? GetAttribute(string name) => name switch
+    public override PyObject? GetAttribute(string name)
     {
+        // Every operation but `close`, `closed` and the context-manager exit refuses once
+        // the file is closed.
+        if (_closed && name is not ("closed" or "close" or "name" or "mode" or "__exit__"))
+        {
+            return new PyBuiltinFunction(name, _ =>
+                throw new PyRaise(PyErrors.ValueError("I/O operation on closed file.")));
+        }
+
+        return name switch
+        {
         "name" => new PyStr(_path),
         "closed" => PyBool.Of(_closed),
+        "mode" => new PyStr(Mode),
+        "readable" => new PyBuiltinFunction("readable", _ => PyBool.Of(Readable)),
+        "writable" => new PyBuiltinFunction("writable", _ => PyBool.Of(Writable)),
 
-        "read" => new PyBuiltinFunction("read", _ =>
+        "seekable" => new PyBuiltinFunction("seekable", _ => PyBool.True),
+
+        "read" => new PyBuiltinFunction("read", arguments =>
         {
+            if (!Readable)
+            {
+                throw new PyRaise(new PyException(
+                    PyExceptionType.UnsupportedOperation, _binary ? "read" : "not readable"));
+            }
+
             var content = Content();
-            var text = _position >= content.Length ? string.Empty : content[_position..];
-            _position = content.Length;
+            var available = _position >= content.Length ? string.Empty : content[_position..];
+
+            // A size of None or a negative one reads the rest; anything that is not an
+            // integer at all is a TypeError rather than a silent read-everything.
+            if (arguments.Length > 0 && arguments[0] is not (PyInt or PyNone))
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"'{arguments[0].TypeName}' object cannot be interpreted as an integer"));
+            }
+
+            var text = arguments.Length > 0 && arguments[0] is PyInt { Value: var size } && size >= 0
+                ? available[..(int)BigInteger.Min(size, available.Length)]
+                : available;
+
+            _position += text.Length;
             return _binary ? new PyBytes(Encoding.UTF8.GetBytes(text)) : new PyStr(text);
         }),
 
@@ -356,21 +529,68 @@ public sealed class PyFile : PyObject
 
             if (_position >= content.Length)
             {
-                return new PyStr(string.Empty);
+                return Piece(string.Empty);
             }
 
             var newline = content.IndexOf('\n', _position);
             var end = newline < 0 ? content.Length : newline + 1;
             var line = content[_position..end];
             _position = end;
-            return new PyStr(line);
+            return Piece(line);
         }),
 
         "readlines" => new PyBuiltinFunction("readlines", _ =>
-            new PyList([.. Lines().Select(static line => (PyObject)new PyStr(line))])),
+            new PyList([.. Lines().Select(Piece)])),
+
+        "tell" => new PyBuiltinFunction("tell", _ => new PyInt(_position)),
+
+        "seek" => new PyBuiltinFunction("seek", arguments =>
+        {
+            var offset = arguments.Length > 0 && arguments[0] is PyInt position ? (int)position.Value : 0;
+            var whence = arguments.Length > 1 && arguments[1] is PyInt from ? (int)from.Value : 0;
+
+            if (whence is not (0 or 1 or 2))
+            {
+                throw new PyRaise(PyErrors.ValueError($"whence value {whence} unsupported"));
+            }
+
+            var target = whence switch
+            {
+                1 => _position + offset,
+                2 => Content().Length + offset,
+                _ => offset,
+            };
+
+            // Seeking before the start is an error, not a clamp.
+            if (target < 0)
+            {
+                throw new PyRaise(new PyException(
+                    PyExceptionType.OSError, "[Errno 22] Invalid argument"));
+            }
+
+            _position = target;
+            return new PyInt(_position);
+        }),
 
         "write" => new PyBuiltinFunction("write", arguments =>
         {
+            if (!Writable)
+            {
+                throw new PyRaise(new PyException(
+                    PyExceptionType.UnsupportedOperation, _binary ? "write" : "not writable"));
+            }
+
+            if (_binary && arguments[0] is not PyBytes)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"a bytes-like object is required, not '{arguments[0].TypeName}'"));
+            }
+
+            if (!_binary && arguments[0] is PyBytes)
+            {
+                throw new PyRaise(PyErrors.TypeError("write() argument must be str, not bytes"));
+            }
+
             var payload = arguments[0] switch
             {
                 PyBytes bytes => bytes.Value,
@@ -378,7 +598,13 @@ public sealed class PyFile : PyObject
             };
 
             _fileSystem.Append(_path, payload);
-            return new PyInt(arguments[0] is PyBytes ? payload.Length : arguments[0].Display().Length);
+
+            // The position advances by what was written, so tell() tracks a write-only
+            // file too.
+            var written = arguments[0] is PyBytes ? payload.Length : arguments[0].Display().Length;
+            _position += written;
+
+            return new PyInt(written);
         }),
 
         "writelines" => new PyBuiltinFunction("writelines", arguments =>
@@ -408,7 +634,12 @@ public sealed class PyFile : PyObject
         }),
 
         _ => null,
-    };
+        };
+    }
+
+    /// <summary>Wraps a piece of the content as the mode's type.</summary>
+    private PyObject Piece(string text) =>
+        _binary ? new PyBytes(Encoding.UTF8.GetBytes(text)) : new PyStr(text);
 
     private string Content() => Encoding.UTF8.GetString(_fileSystem.Read(_path));
 
@@ -416,7 +647,9 @@ public sealed class PyFile : PyObject
     {
         var content = Content();
         var start = _position;
-        _position = content.Length;
+
+        // A position past the end leaves it there rather than snapping back to the length.
+        _position = Math.Max(_position, content.Length);
 
         while (start < content.Length)
         {

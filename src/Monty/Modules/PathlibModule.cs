@@ -281,6 +281,12 @@ public sealed class PyPath : PyObject
                 return Builtin(name, arguments => PyBool.Of(
                     string.Equals(Value, Text(arguments[0]), StringComparison.Ordinal)));
 
+            // The same call as the `open` builtin, with this path bound as its `file`, so
+            // the mode parsing and the rejections stay in one place.
+            case "open":
+                return new PyBuiltinFunction("open", (arguments, keywords) =>
+                    OsModule.Open(Storage(), [this, .. arguments], keywords));
+
             case "read_text":
                 return Builtin(name, _ => new PyStr(System.Text.Encoding.UTF8.GetString(Storage().Read(Value))));
 
@@ -290,9 +296,11 @@ public sealed class PyPath : PyObject
             case "write_text":
                 return Builtin(name, arguments =>
                 {
-                    var bytes = System.Text.Encoding.UTF8.GetBytes(Text(arguments[0]));
-                    Storage().Write(Value, bytes);
-                    return new PyInt(bytes.Length);
+                    // The count is of characters written, not of the bytes they encode to.
+                    var text = Text(arguments[0]);
+                    Storage().Write(Value, System.Text.Encoding.UTF8.GetBytes(text));
+
+                    return new PyInt(new PyStr(text).Length() ?? text.Length);
                 });
 
             case "write_bytes":
@@ -311,9 +319,44 @@ public sealed class PyPath : PyObject
                 });
 
             case "mkdir":
-                return Builtin(name, _ =>
+                // `parents` and `exist_ok` are read for truth, so an empty string does not
+                // enable either of them.
+                return new PyBuiltinFunction(name, (arguments, keywords) =>
                 {
-                    Storage().CreateDirectory(Value, parents: true, existsOk: true);
+                    if (arguments.Length > 3)
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            "Path.mkdir() takes from 0 to 3 positional arguments "
+                            + $"but {arguments.Length} were given"));
+                    }
+
+                    foreach (var (key, _) in keywords?.Entries ?? [])
+                    {
+                        if (key.Display() is not ("mode" or "parents" or "exist_ok"))
+                        {
+                            throw new PyRaise(PyErrors.TypeError(
+                                $"Path.mkdir() got an unexpected keyword argument '{key.Display()}'"));
+                        }
+
+                        var position = key.Display() switch
+                        {
+                            "mode" => 0,
+                            "parents" => 1,
+                            _ => 2,
+                        };
+
+                        if (arguments.Length > position)
+                        {
+                            throw new PyRaise(PyErrors.TypeError(
+                                $"Path.mkdir() got multiple values for argument '{key.Display()}'"));
+                        }
+                    }
+
+                    Storage().CreateDirectory(
+                        Value,
+                        Flag(arguments, keywords, 1, "parents"),
+                        Flag(arguments, keywords, 2, "exist_ok"));
+
                     return PyNone.Instance;
                 });
 
@@ -351,6 +394,13 @@ public sealed class PyPath : PyObject
         _fileSystem ?? throw new PyRaise(new PyException(
             PyExceptionType.OSError,
             "no filesystem is available to this interpreter"));
+
+    /// <summary>Reads a flag given positionally or by name, for truth.</summary>
+    private static bool Flag(PyObject[] arguments, PyDict? keywords, int position, string name) =>
+        (arguments.Length > position ? arguments[position]
+            : keywords?.TryGetValue(new PyStr(name), out var value) == true ? value
+            : null)?.IsTruthy()
+        ?? false;
 
     private static PyObject Builtin(string name, Func<PyObject[], PyObject> body) =>
         new PyBuiltinFunction(name, (arguments, _) => body(arguments));

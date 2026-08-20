@@ -112,10 +112,11 @@ public readonly record struct TracebackFrame(string FunctionName, int Line, stri
 /// </remarks>
 public sealed class PyExceptionType : PyObject
 {
-    private PyExceptionType(string name, PyExceptionType? baseType)
+    private PyExceptionType(string name, PyExceptionType? baseType, PyExceptionType? secondBase = null)
     {
         Name = name;
         BaseType = baseType;
+        SecondBase = secondBase;
     }
 
     /// <summary>The class name.</summary>
@@ -123,6 +124,15 @@ public sealed class PyExceptionType : PyObject
 
     /// <summary>The base class, or null for <c>BaseException</c>.</summary>
     public PyExceptionType? BaseType { get; }
+
+    /// <summary>
+    /// A second base, for the one class in the hierarchy that has two.
+    /// </summary>
+    /// <remarks>
+    /// <c>io.UnsupportedOperation</c> derives from both <c>OSError</c> and
+    /// <c>ValueError</c> in CPython, and scripts catch it either way.
+    /// </remarks>
+    public PyExceptionType? SecondBase { get; }
 
     /// <inheritdoc />
     public override string TypeName => "type";
@@ -144,7 +154,7 @@ public sealed class PyExceptionType : PyObject
     {
         for (var current = this; current is not null; current = current.BaseType)
         {
-            if (ReferenceEquals(current, other))
+            if (ReferenceEquals(current, other) || current.SecondBase?.IsSubclassOf(other) == true)
             {
                 return true;
             }
@@ -153,9 +163,9 @@ public sealed class PyExceptionType : PyObject
         return false;
     }
 
-    private static PyExceptionType Define(string name, PyExceptionType? baseType)
+    private static PyExceptionType Define(string name, PyExceptionType? baseType, PyExceptionType? secondBase = null)
     {
-        var type = new PyExceptionType(name, baseType);
+        var type = new PyExceptionType(name, baseType, secondBase);
         Registry[name] = type;
         return type;
     }
@@ -240,6 +250,12 @@ public sealed class PyExceptionType : PyObject
 
     /// <summary><c>NotADirectoryError</c>.</summary>
     public static PyExceptionType NotADirectoryError { get; } = Define("NotADirectoryError", OSError);
+
+    /// <summary>
+    /// <c>io.UnsupportedOperation</c>, raised by an operation the file's mode forbids.
+    /// </summary>
+    public static PyExceptionType UnsupportedOperation { get; } =
+        Define("io.UnsupportedOperation", OSError, ValueError);
 
     /// <summary><c>PermissionError</c>.</summary>
     public static PyExceptionType PermissionError { get; } = Define("PermissionError", OSError);

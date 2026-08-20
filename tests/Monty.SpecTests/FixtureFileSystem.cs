@@ -110,6 +110,18 @@ public sealed class FixtureFileSystem : IPyFileSystem
                 $"[Errno 2] No such file or directory: '{path}'"));
         }
 
+        // A file in the way blocks the whole chain: a directory cannot be created inside
+        // one, however many parents were asked for.
+        for (var current = full; current != "/"; current = Parent(current))
+        {
+            if (_files.ContainsKey(current))
+            {
+                throw new PyRaise(new PyException(
+                    PyExceptionType.NotADirectoryError,
+                    $"[Errno 20] Not a directory: '{path}'"));
+            }
+        }
+
         for (var current = full; current != "/"; current = Parent(current))
         {
             _directories.Add(current);
@@ -126,9 +138,15 @@ public sealed class FixtureFileSystem : IPyFileSystem
 
         if (!_directories.Contains(full.Length == 0 ? "/" : full))
         {
+            // A path that exists but is a file is a different error from one that is not
+            // there at all.
             throw new PyRaise(new PyException(
-                PyExceptionType.FileNotFoundError,
-                $"[Errno 2] No such file or directory: '{path}'"));
+                _files.ContainsKey(full)
+                    ? PyExceptionType.NotADirectoryError
+                    : PyExceptionType.FileNotFoundError,
+                _files.ContainsKey(full)
+                    ? $"[Errno 20] Not a directory: '{path}'"
+                    : $"[Errno 2] No such file or directory: '{path}'"));
         }
 
         var prefix = full + "/";
