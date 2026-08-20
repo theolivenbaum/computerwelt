@@ -6,9 +6,9 @@ namespace Monty.Modules;
 /// <summary>The <c>unicodedata</c> module.</summary>
 /// <remarks>
 /// Backed by the tables in <see cref="UnicodeData"/> rather than by the host runtime, so
-/// every answer comes from one Unicode release and none of them varies with the machine.
-/// Normalization is the exception: it is the host's, because the algorithm is large and its
-/// results for anything a script is likely to normalize have been stable for decades.
+/// every answer comes from one Unicode release and none of them varies with the machine —
+/// normalization included, which the host would otherwise answer from whichever ICU it was
+/// built against, or not at all under an invariant-globalization build.
 /// </remarks>
 public static class UnicodedataModule
 {
@@ -125,10 +125,10 @@ public static class UnicodedataModule
 
         return form.Value switch
         {
-            "NFC" => text.Normalize(NormalizationForm.FormC),
-            "NFD" => text.Normalize(NormalizationForm.FormD),
-            "NFKC" => text.Normalize(NormalizationForm.FormKC),
-            "NFKD" => text.Normalize(NormalizationForm.FormKD),
+            "NFC" => UnicodeData.Normalize(text, compatibility: false, compose: true),
+            "NFD" => UnicodeData.Normalize(text, compatibility: false, compose: false),
+            "NFKC" => UnicodeData.Normalize(text, compatibility: true, compose: true),
+            "NFKD" => UnicodeData.Normalize(text, compatibility: true, compose: false),
             _ => throw new PyRaise(PyErrors.ValueError("invalid normalization form")),
         };
     }

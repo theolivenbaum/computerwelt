@@ -46,6 +46,12 @@ public static class UnicodeData
         "LP", "LH", "M", "B", "BS", "S", "SS", "NG", "J", "C", "K", "T", "P", "H",
     ];
 
+    private const int JamoLeadBase = 0x1100;
+    private const int JamoVowelBase = 0x1161;
+    private const int JamoTailBase = 0x11A7;
+    private const int JamoVowelCount = 21;
+    private const int JamoTailCount = 28;
+
     private static readonly Lazy<Tables> Loaded = new(Load, isThreadSafe: true);
 
     /// <summary>The Unicode release these tables come from.</summary>
@@ -194,6 +200,179 @@ public static class UnicodeData
         return best >= 0 ? best : Array.IndexOf(table, string.Empty) is var empty && empty >= 0 ? empty : fallback - 1;
     }
 
+    /// <summary>
+    /// Normalizes text to one of the four Unicode normal forms.
+    /// </summary>
+    /// <remarks>
+    /// Implemented here rather than through the host runtime because the host's answer
+    /// depends on which ICU it was built against — and, under an invariant-globalization
+    /// build, there is no answer at all. A sandbox that produced different text on
+    /// different machines would not be reproducible.
+    /// </remarks>
+    /// <param name="text">The text to normalize.</param>
+    /// <param name="compatibility">True for the K forms, which fold compatibility variants.</param>
+    /// <param name="compose">True for the composed forms, C and KC.</param>
+    /// <returns>The normalized text.</returns>
+    public static string Normalize(string text, bool compatibility, bool compose)
+    {
+        var decomposed = new List<int>(text.Length);
+
+        foreach (var codePoint in CodePoints(text))
+        {
+            Decompose(codePoint, compatibility, decomposed);
+        }
+
+        Reorder(decomposed);
+
+        if (compose)
+        {
+            Compose(decomposed);
+        }
+
+        var builder = new StringBuilder(decomposed.Count);
+
+        foreach (var codePoint in decomposed)
+        {
+            builder.Append(char.ConvertFromUtf32(codePoint));
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>The code points of a string, pairing surrogates.</summary>
+    private static IEnumerable<int> CodePoints(string text)
+    {
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+            {
+                yield return char.ConvertToUtf32(text[i], text[i + 1]);
+                i++;
+                continue;
+            }
+
+            yield return text[i];
+        }
+    }
+
+    /// <summary>Decomposes one code point into <paramref name="into"/>, recursively.</summary>
+    private static void Decompose(int codePoint, bool compatibility, List<int> into)
+    {
+        // Hangul syllables decompose by arithmetic rather than by table.
+        if (codePoint >= HangulBase && codePoint < HangulBase + HangulCount)
+        {
+            var index = codePoint - HangulBase;
+            into.Add(JamoLeadBase + (index / (JamoVowelCount * JamoTailCount)));
+            into.Add(JamoVowelBase + (index / JamoTailCount % JamoVowelCount));
+
+            if (index % JamoTailCount != 0)
+            {
+                into.Add(JamoTailBase + (index % JamoTailCount));
+            }
+
+            return;
+        }
+
+        if (Loaded.Value.Decompositions.TryGetValue(codePoint, out var mapping)
+            && (compatibility || !mapping.IsCompatibility))
+        {
+            foreach (var part in mapping.Parts)
+            {
+                Decompose(part, compatibility, into);
+            }
+
+            return;
+        }
+
+        into.Add(codePoint);
+    }
+
+    /// <summary>Puts combining marks into canonical order, which is a stable sort by class.</summary>
+    private static void Reorder(List<int> codePoints)
+    {
+        for (var i = 1; i < codePoints.Count; i++)
+        {
+            var current = Combining(codePoints[i]);
+
+            if (current == 0)
+            {
+                continue;
+            }
+
+            var j = i;
+
+            while (j > 0 && Combining(codePoints[j - 1]) > current)
+            {
+                (codePoints[j - 1], codePoints[j]) = (codePoints[j], codePoints[j - 1]);
+                j--;
+            }
+        }
+    }
+
+    /// <summary>Composes a canonically ordered sequence in place, as UAX #15 describes.</summary>
+    private static void Compose(List<int> codePoints)
+    {
+        if (codePoints.Count == 0)
+        {
+            return;
+        }
+
+        var starter = 0;
+        var last = -1;
+        var write = 1;
+
+        for (var read = 1; read < codePoints.Count; read++)
+        {
+            var current = codePoints[read];
+            var combining = Combining(current);
+
+            // A character may combine with the last starter only when nothing blocking sits
+            // between them: a mark of the same or a higher class blocks the pairing.
+            if ((last < 0 || last < combining) && Pair(codePoints[starter], current) is { } composed)
+            {
+                codePoints[starter] = composed;
+                continue;
+            }
+
+            if (combining == 0)
+            {
+                starter = write;
+                last = -1;
+            }
+            else
+            {
+                last = combining;
+            }
+
+            codePoints[write++] = current;
+        }
+
+        codePoints.RemoveRange(write, codePoints.Count - write);
+    }
+
+    /// <summary>The primary composite of two code points, or null when there is none.</summary>
+    private static int? Pair(int first, int second)
+    {
+        // Hangul composes by arithmetic, in two steps: lead plus vowel, then plus a tail.
+        if (first >= JamoLeadBase && first < JamoLeadBase + 19
+            && second >= JamoVowelBase && second < JamoVowelBase + JamoVowelCount)
+        {
+            return HangulBase
+                + ((((first - JamoLeadBase) * JamoVowelCount) + (second - JamoVowelBase)) * JamoTailCount);
+        }
+
+        if (first >= HangulBase && first < HangulBase + HangulCount
+            && (first - HangulBase) % JamoTailCount == 0
+            && second > JamoTailBase && second < JamoTailBase + JamoTailCount)
+        {
+            return first + (second - JamoTailBase);
+        }
+
+        return Loaded.Value.Compositions.TryGetValue(((long)first << 32) | (uint)second, out var composed)
+            ? composed
+            : null;
+    }
+
     private static Tables Load()
     {
         using var stream = typeof(UnicodeData).GetTypeInfo().Assembly
@@ -210,6 +389,8 @@ public static class UnicodeData
         var names = new Dictionary<int, string>();
         var byName = new Dictionary<string, int>(StringComparer.Ordinal);
         var algorithmic = new List<Range>();
+        var decompositions = new Dictionary<int, Mapping>();
+        var compositions = new Dictionary<long, int>();
         var section = string.Empty;
 
         while (reader.ReadLine() is { } line)
@@ -243,15 +424,39 @@ public static class UnicodeData
                 case "#algorithmic":
                     algorithmic.Add(new Range(Hex(fields[0]), Hex(fields[1]), fields[2]));
                     break;
+
+                case "#decompositions":
+                    decompositions[Hex(fields[0])] = new Mapping(
+                        fields[1] == "K",
+                        [.. fields[2].Split(' ').Select(Hex)]);
+
+                    break;
+
+                case "#compositions":
+                {
+                    var pair = fields[0].Split(' ');
+                    compositions[((long)Hex(pair[0]) << 32) | (uint)Hex(pair[1])] = Hex(fields[1]);
+                    break;
+                }
             }
         }
 
-        return new Tables(version, [.. categories], combining, names, byName, [.. algorithmic]);
+        return new Tables(
+            version,
+            [.. categories],
+            combining,
+            names,
+            byName,
+            [.. algorithmic],
+            decompositions,
+            compositions);
     }
 
     private static int Hex(string text) => int.Parse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
 
     private readonly record struct Range(int Start, int End, string Category);
+
+    private readonly record struct Mapping(bool IsCompatibility, int[] Parts);
 
     private sealed record Tables(
         string Version,
@@ -259,5 +464,7 @@ public static class UnicodeData
         Dictionary<int, int> Combining,
         Dictionary<int, string> Names,
         Dictionary<string, int> ByName,
-        Range[] Algorithmic);
+        Range[] Algorithmic,
+        Dictionary<int, Mapping> Decompositions,
+        Dictionary<long, int> Compositions);
 }
