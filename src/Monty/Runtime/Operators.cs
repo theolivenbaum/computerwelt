@@ -789,17 +789,10 @@ public static class Operators
                 ? (candidate, right)
                 : ((PyView)right, left);
 
-            var found = new PySet();
-
-            foreach (var item in VirtualMachine.RequireIterable(other))
-            {
-                if (view.Contains(item))
-                {
-                    found.Add(item);
-                }
-            }
-
-            return found;
+            // The other side's items are hashed as they are read — an unhashable one is an
+            // error even against an empty view — while the view's own values never are.
+            var probes = new PySet(VirtualMachine.RequireIterable(other));
+            return new PySet(probes.Items.Where(view.Contains));
         }
 
         var x = new PySet(VirtualMachine.RequireIterable(left));

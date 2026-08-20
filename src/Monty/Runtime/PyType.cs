@@ -268,6 +268,20 @@ public static class TypeRegistry
                 $"slice expected at most 3 arguments, got {arguments.Length}")),
         });
 
+    /// <summary>
+    /// <c>property</c>.
+    /// </summary>
+    /// <remarks>
+    /// The name exists as a type object — scripts reach for it and error messages spell it —
+    /// but the descriptor itself is not implemented: <c>@property</c> is not recognised,
+    /// as upstream's `limitations/builtins.md` records.
+    /// </remarks>
+    public static PyType Property { get; } = Define(
+        "property",
+        static _ => false,
+        static (_, _) => throw new PyRaise(new PyException(
+            PyExceptionType.NotImplementedError, "property is not supported")));
+
     /// <summary><c>function</c>.</summary>
     public static PyType Function { get; } = Define(
         "function",

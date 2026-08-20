@@ -436,9 +436,32 @@ public static class SupportModules
     }
 
     /// <summary>
+    /// Builds the <c>gc</c> module.
+    /// </summary>
+    /// <remarks>
+    /// The port has no collector of its own — objects belong to the host runtime — so these
+    /// are the honest no-ops that shape implies. Reaching the host's collector from
+    /// sandboxed code would let a program stall its host at will, and reporting real counts
+    /// would leak the host's heap state, so neither is done.
+    /// </remarks>
+    /// <returns>The module.</returns>
+    public static PyModuleObject CreateGc()
+    {
+        var module = new PyModuleObject("gc");
+
+        module.Add("collect", new PyBuiltinFunction("collect", static _ => new PyInt(0)));
+        module.Add("disable", new PyBuiltinFunction("disable", static _ => PyNone.Instance));
+        module.Add("enable", new PyBuiltinFunction("enable", static _ => PyNone.Instance));
+        module.Add("isenabled", new PyBuiltinFunction("isenabled", static _ => PyBool.True));
+
+        return module;
+    }
+
+    /// <summary>
     /// Builds <c>typing</c>. Annotations are not evaluated at run time, so the names only
     /// need to exist.
     /// </summary>
+    /// <returns>The module.</returns>
     public static PyModuleObject CreateTyping()
     {
         var module = new PyModuleObject("typing");

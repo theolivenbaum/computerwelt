@@ -47,6 +47,7 @@ public static class StandardLibrary
         ["asyncio"] = AsyncioModule.Create(machine),
         ["collections"] = SupportModules.CreateCollections(machine),
         ["itertools"] = SupportModules.CreateItertools(machine),
+        ["gc"] = SupportModules.CreateGc(),
         ["typing"] = SupportModules.CreateTyping(),
         ["__future__"] = new PyModuleObject("__future__").Add("annotations", PyNone.Instance),
     };

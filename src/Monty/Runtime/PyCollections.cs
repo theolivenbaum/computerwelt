@@ -705,7 +705,27 @@ public sealed class PySet : PyObject
     public override int? Length() => _items.Count;
 
     /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => _items.Values.ToList();
+    public override IEnumerable<PyObject>? Iterate() => Walk();
+
+    /// <summary>Walks the members, refusing to continue if the set was resized.</summary>
+    /// <remarks>
+    /// Growing or shrinking a set while something iterates it would silently skip or repeat
+    /// members, so it raises instead — the same guard a dict has.
+    /// </remarks>
+    private IEnumerable<PyObject> Walk()
+    {
+        var expected = _items.Count;
+
+        foreach (var item in _items.Values.ToList())
+        {
+            yield return item;
+
+            if (_items.Count != expected)
+            {
+                throw new PyRaise(PyErrors.RuntimeError("Set changed size during iteration"));
+            }
+        }
+    }
 
     /// <inheritdoc />
     public override bool Contains(PyObject item) => _items.ContainsKey(PyKey.For(item, "set element"));
