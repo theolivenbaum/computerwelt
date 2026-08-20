@@ -809,39 +809,47 @@ public static class Conversions
 
                 return new PyInt(new BigInteger(Math.Truncate(number.Value)));
 
+            // A bytes literal is read as the ASCII text it spells, byte for byte, and only
+            // ASCII whitespace pads it: a UTF-8 encoded non-breaking space is data, not
+            // padding, and must not be trimmed away into a valid number.
             case PyBytes raw:
-                // A bytes literal is read as the ASCII text it spells.
-                return ToInt([new PyStr(System.Text.Encoding.UTF8.GetString(raw.Value)), .. arguments[1..]], keywords);
+                return ParseInt(string.Concat(raw.Value.Select(static b => (char)b)), true, radix, raw);
 
             case PyStr text:
-            {
-                var trimmed = text.Value.Trim().Replace("_", string.Empty, StringComparison.Ordinal);
-
-                // A well-formed decimal literal that is merely too long gets the digit-limit
-                // error, and gets it before any number is built; a malformed one gets the
-                // ordinary complaint, however long it is.
-                if (radix is 10 or 0
-                    && trimmed.TrimStart('-', '+') is { Length: > PyInt.MaxStringDigits } digits
-                    && digits.All(char.IsAsciiDigit))
-                {
-                    throw new PyRaise(PyErrors.ValueError(
-                        $"Exceeds the limit ({PyInt.MaxStringDigits} digits) for integer string conversion: "
-                        + $"value has {digits.Length} digits"));
-                }
-
-                if (TryParseRadix(trimmed, radix, out var parsed))
-                {
-                    return new PyInt(parsed);
-                }
-
-                throw new PyRaise(PyErrors.ValueError(
-                    $"invalid literal for int() with base {radix}: {text.Repr()}"));
-            }
+                return ParseInt(text.Value, false, radix, text);
 
             default:
                 throw new PyRaise(PyErrors.TypeError(
                     $"int() argument must be a string, a bytes-like object or a real number, not '{arguments[0].TypeName}'"));
         }
+    }
+
+    /// <summary>Reads an integer literal out of the text a str or bytes source spells.</summary>
+    /// <param name="source">The literal text.</param>
+    /// <param name="asciiOnly">Whether only ASCII whitespace counts as padding.</param>
+    /// <param name="radix">The base, or 0 to take it from the prefix.</param>
+    /// <param name="original">The argument, which the error message repeats verbatim.</param>
+    private static PyObject ParseInt(string source, bool asciiOnly, int radix, PyObject original)
+    {
+        var padded = asciiOnly ? source.Trim(' ', '\t', '\n', '\r', '\v', '\f') : source.Trim();
+        var trimmed = padded.Replace("_", string.Empty, StringComparison.Ordinal);
+
+        // A well-formed decimal literal that is merely too long gets the digit-limit error,
+        // and gets it before any number is built; a malformed one gets the ordinary
+        // complaint, however long it is.
+        if (radix is 10 or 0
+            && trimmed.TrimStart('-', '+') is { Length: > PyInt.MaxStringDigits } digits
+            && digits.All(char.IsAsciiDigit))
+        {
+            throw new PyRaise(PyErrors.ValueError(
+                $"Exceeds the limit ({PyInt.MaxStringDigits} digits) for integer string conversion: "
+                + $"value has {digits.Length} digits"));
+        }
+
+        return TryParseRadix(trimmed, radix, out var parsed)
+            ? new PyInt(parsed)
+            : throw new PyRaise(PyErrors.ValueError(
+                $"invalid literal for int() with base {radix}: {original.Repr()}"));
     }
 
     private static bool TryParseRadix(string text, int radix, out BigInteger value)
@@ -884,6 +892,13 @@ public static class Conversions
         }
 
         if (text.Length == 0)
+        {
+            return false;
+        }
+
+        // With no base given, a leading zero would be ambiguous — `010` was octal in Python
+        // 2 — so it is rejected outright unless the whole literal is zeros.
+        if (detect && radix == 10 && text.Length > 1 && text[0] == '0' && text.Any(static c => c != '0'))
         {
             return false;
         }

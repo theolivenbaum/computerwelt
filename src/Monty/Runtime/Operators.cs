@@ -449,6 +449,13 @@ public static class Operators
             $"unsupported operand type(s) for *: '{left.TypeName}' and '{right.TypeName}'"));
     }
 
+    /// <summary>Widens an integer to a float, refusing one that has no float to widen to.</summary>
+    private static double ToDouble(BigInteger value) =>
+        BigInteger.Abs(value) <= new BigInteger(double.MaxValue)
+            ? (double)value
+            : throw new PyRaise(new PyException(
+                PyExceptionType.OverflowError, "int too large to convert to float"));
+
     private static PyObject TrueDivide(PyObject left, PyObject right)
     {
         // `Path('/usr') / 'local'` is the idiomatic way to build a path, and `str / Path`
@@ -577,18 +584,28 @@ public static class Operators
                 $"unsupported operand type(s) for ** or pow(): '{left.TypeName}' and '{right.TypeName}'"));
         }
 
-        if (b < 0 && a == 0)
-        {
-            throw new PyRaise(PyErrors.ZeroDivisionError("zero to a negative power"));
-        }
-
         if (!useFloat)
         {
             var exponent = AsInt(right);
 
-            // A negative integer exponent produces a float, as `2 ** -1 == 0.5`.
             if (exponent >= 0)
             {
+                var baseValue = AsInt(left);
+
+                // 0, 1 and -1 have an answer at every exponent, however large, so they meet
+                // no size guard: `(-1) ** 2**63` is 1, not a refusal.
+                if (BigInteger.Abs(baseValue) <= BigInteger.One)
+                {
+                    return new PyInt(baseValue.Sign switch
+                    {
+                        0 => exponent.IsZero ? BigInteger.One : BigInteger.Zero,
+                        1 => BigInteger.One,
+                        _ => exponent.IsEven ? BigInteger.One : BigInteger.MinusOne,
+                    });
+                }
+
+                // The result is exact, so the only limit is what can be built: an exponent
+                // in the millions would produce a number no sandbox should try to hold.
                 if (exponent > 1_000_000)
                 {
                     throw new PyRaise(new PyException(PyExceptionType.OverflowError, "exponent too large"));
@@ -596,6 +613,16 @@ public static class Operators
 
                 return new PyInt(BigInteger.Pow(AsInt(left), (int)exponent));
             }
+
+            // A negative integer exponent produces a float, as `2 ** -1 == 0.5` — so both
+            // operands have to be representable as one before anything else is decided.
+            a = ToDouble(AsInt(left));
+            b = ToDouble(exponent);
+        }
+
+        if (b < 0 && a == 0)
+        {
+            throw new PyRaise(PyErrors.ZeroDivisionError("zero to a negative power"));
         }
 
         return new PyFloat(Math.Pow(a, b));

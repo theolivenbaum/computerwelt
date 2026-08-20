@@ -1,3 +1,5 @@
+<img src="logo.png" alt="Computerwelt" width="160" align="right" />
+
 # Computerwelt
 
 A sandboxed **shell and Python runtime for .NET 10** — a C# port of two Rust projects,

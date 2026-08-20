@@ -21,6 +21,16 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/theolivenbaum/computerwelt</RepositoryUrl>
     <Deterministic>true</Deterministic>
+    <PackageIcon>logo.png</PackageIcon>
+  </PropertyGroup>
+
+  <!-- One logo for every package, and for the icon the executables embed. -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <None Include="$(MSBuildThisFileDirectory)logo.png" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(OutputType)' == 'Exe'">
+    <ApplicationIcon>$(MSBuildThisFileDirectory)logo.ico</ApplicationIcon>
   </PropertyGroup>
 
 </Project>
