@@ -203,7 +203,10 @@ public static class DataclassesModule
         {
             type.SetAttribute("__init__", new PyBuiltinFunction(
                 $"{type.Name}.__init__",
-                (arguments, keywords) => Initialize(type, fields, arguments, keywords)));
+                (arguments, keywords) => Initialize(type, fields, arguments, keywords))
+            {
+                BindsAsMethod = true,
+            });
         }
 
         if (type.GetAttribute("__repr__") is null)

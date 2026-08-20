@@ -234,20 +234,53 @@ public class PyInt : PyObject
     public override bool PyEquals(PyObject other) => other switch
     {
         PyInt integer => Value == integer.Value,
-        PyFloat number => (double)Value == number.Value,
+        PyFloat number => Mixed(Value, number.Value) == 0,
         _ => false,
     };
 
     /// <inheritdoc />
-    public override BigInteger PyHash() => Value;
+    public override BigInteger PyHash() => Numbers.Hash(Value);
 
     /// <inheritdoc />
     public override int? PyCompare(PyObject other) => other switch
     {
         PyInt integer => Value.CompareTo(integer.Value),
-        PyFloat number => ((double)Value).CompareTo(number.Value),
+        PyFloat number => Mixed(Value, number.Value),
         _ => null,
     };
+
+    /// <summary>
+    /// Compares an integer against a float exactly, without rounding either to the other.
+    /// </summary>
+    /// <remarks>
+    /// Widening the integer to a double would make `10**30 == 1e30` — the two round to the
+    /// same double although they are different numbers. Splitting the float into its whole
+    /// and fractional parts keeps the comparison exact at every magnitude.
+    /// </remarks>
+    /// <param name="left">The integer.</param>
+    /// <param name="right">The float.</param>
+    /// <returns>The sign of left minus right, or null when the float is a NaN.</returns>
+    public static int? Mixed(BigInteger left, double right)
+    {
+        if (double.IsNaN(right))
+        {
+            return null;
+        }
+
+        if (double.IsInfinity(right))
+        {
+            return right > 0 ? -1 : 1;
+        }
+
+        // The floor of a finite double is itself a whole number, so this conversion is
+        // exact however large the value is.
+        var floor = Math.Floor(right);
+        var order = left.CompareTo(new BigInteger(floor));
+
+        // Equal whole parts leave the fraction to decide: any fraction at all puts the
+        // float above the integer.
+        return order != 0 ? order : right > floor ? -1 : 0;
+    }
 
     /// <summary>Converts to a 32-bit index, raising when it does not fit.</summary>
     public int ToIndex()
@@ -284,15 +317,12 @@ public sealed class PyFloat : PyObject
     {
         // `==` rather than `Equals`: NaN is unequal to itself, and -0.0 equals 0.0.
         PyFloat number => Value == number.Value,
-        PyInt integer => Value == (double)integer.Value,
+        PyInt integer => PyInt.Mixed(integer.Value, Value) == 0,
         _ => false,
     };
 
     /// <inheritdoc />
-    public override BigInteger PyHash() =>
-        double.IsFinite(Value) && double.IsInteger(Value) && Math.Abs(Value) < 1e18
-            ? new BigInteger(Value)
-            : new BigInteger(Value.GetHashCode());
+    public override BigInteger PyHash() => Numbers.Hash(Value);
 
     /// <inheritdoc />
     public override int? PyCompare(PyObject other)
@@ -306,7 +336,7 @@ public sealed class PyFloat : PyObject
         return other switch
         {
             PyFloat number => double.IsNaN(number.Value) ? null : Value.CompareTo(number.Value),
-            PyInt integer => Value.CompareTo((double)integer.Value),
+            PyInt integer => -PyInt.Mixed(integer.Value, Value),
             _ => null,
         };
     }

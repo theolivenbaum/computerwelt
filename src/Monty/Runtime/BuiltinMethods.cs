@@ -15,12 +15,26 @@ public static class BuiltinMethods
         PyDict => BindDict(machine, target, name),
         Modules.PyDefaultDict defaults => BindDict(machine, defaults.Entries, name),
         PySet => BindSet(target, name),
+        PyView view => BindView(view, name),
         PyTuple => BindTuple(target, name),
         PyBytes => BindBytes(target, name),
         PyInt => BindInt(target, name),
         PyFloat => BindFloat(target, name),
         _ => null,
     };
+
+    /// <summary>
+    /// The methods of a dict view: only <c>isdisjoint</c>, and only on the set-like ones.
+    /// </summary>
+    /// <remarks>
+    /// A values view is deliberately left without it — it is not set-like, and a script that
+    /// reaches for the method should hear that rather than get an answer.
+    /// </remarks>
+    private static PyObject? BindView(PyView receiver, string name) =>
+        name == "isdisjoint" && receiver.IsSetLike
+            ? Method(name, receiver, 1, 1, static (self, arguments, _) =>
+                PyBool.Of(!VirtualMachine.RequireIterable(arguments[0]).Any(((PyView)self).Contains)))
+            : null;
 
     private static PyBoundMethod Method(string name, PyObject receiver, Func<PyObject, PyObject[], PyDict?, PyObject> implementation) =>
         new(name, receiver, implementation);
@@ -762,21 +776,22 @@ public static class BuiltinMethods
                         ? value
                         : arguments.Length > 1 ? arguments[1] : PyNone.Instance);
 
-            // The three views are live-looking but materialised here; what matters is that
-            // they are not lists, so their type names and set behaviour are right.
+            // The three views read their dict on every access, so one taken before a
+            // mutation still shows what the dict holds now.
             case "keys":
                 return Method(name, receiver, 0, 0, static (self, _, _) =>
-                    new PyView("dict_keys", ((PyDict)self).Entries.Select(static e => e.Key), isSetLike: true));
+                    new PyView("dict_keys", (PyDict)self, static e => e.Key, isSetLike: true));
 
             case "values":
                 return Method(name, receiver, 0, 0, static (self, _, _) =>
-                    new PyView("dict_values", ((PyDict)self).Entries.Select(static e => e.Value), isSetLike: false));
+                    new PyView("dict_values", (PyDict)self, static e => e.Value, isSetLike: false));
 
             case "items":
                 return Method(name, receiver, 0, 0, static (self, _, _) =>
                     new PyView(
                         "dict_items",
-                        ((PyDict)self).Entries.Select(static e => (PyObject)new PyTuple([e.Key, e.Value])),
+                        (PyDict)self,
+                        static e => new PyTuple([e.Key, e.Value]),
                         isSetLike: true));
 
             case "pop":

@@ -462,7 +462,9 @@ public class PyDict : PyObject
         {
             foreach (var (key, value) in _entries)
             {
-                if (!dict.TryGetValue(key, out var otherValue) || !value.PyEquals(otherValue))
+                // Values compare through RichCompareBool upstream, so an identical object
+                // matches without `__eq__` being asked — even one that always says no.
+                if (!dict.TryGetValue(key, out var otherValue) || !SameOrEqual(value, otherValue))
                 {
                     return false;
                 }
@@ -604,7 +606,9 @@ internal readonly struct PyKey : IEquatable<PyKey>
         }
     }
 
-    public bool Equals(PyKey other) => Value.PyEquals(other.Value);
+    // Identity first, as `PyObject_RichCompareBool` does: a NaN is its own dict key even
+    // though it equals nothing, including itself.
+    public bool Equals(PyKey other) => PyObject.SameOrEqual(Value, other.Value);
 
     public override bool Equals(object? obj) => obj is PyKey other && Equals(other);
 
@@ -691,8 +695,16 @@ public sealed class PySet : PyObject
     }
 
     /// <inheritdoc />
-    public override bool PyEquals(PyObject other) =>
-        other is PySet set && set.Count == Count && _items.Keys.All(set._items.ContainsKey);
+    /// <remarks>
+    /// A set-like dict view compares equal to a set of the same members, from either side —
+    /// `{'a'} == d.keys()` and `d.keys() == {'a'}` both hold.
+    /// </remarks>
+    public override bool PyEquals(PyObject other) => other switch
+    {
+        PySet set => set.Count == Count && _items.Keys.All(set._items.ContainsKey),
+        PyView { IsSetLike: true } view => view.PyEquals(this),
+        _ => false,
+    };
 
     /// <summary>Adds a member. Returns false when it was already present.</summary>
     public bool Add(PyObject item) => _items.TryAdd(PyKey.For(item, "set element"), item);
@@ -909,18 +921,30 @@ public sealed class PyRange : PyObject
 /// </remarks>
 public sealed class PyView : PyObject
 {
-    private readonly List<PyObject> _items;
+    private readonly PyDict _source;
+    private readonly Func<KeyValuePair<PyObject, PyObject>, PyObject> _select;
 
     /// <summary>Creates a view.</summary>
     /// <param name="typeName">The Python type name, such as <c>dict_keys</c>.</param>
-    /// <param name="items">The members.</param>
+    /// <param name="source">The dict the view reads.</param>
+    /// <param name="select">What each entry contributes: its key, its value, or the pair.</param>
     /// <param name="isSetLike">Whether the view supports the set operators.</param>
-    public PyView(string typeName, IEnumerable<PyObject> items, bool isSetLike)
+    public PyView(
+        string typeName,
+        PyDict source,
+        Func<KeyValuePair<PyObject, PyObject>, PyObject> select,
+        bool isSetLike)
     {
         TypeName = typeName;
-        _items = [.. items];
+        _source = source;
+        _select = select;
         IsSetLike = isSetLike;
     }
+
+    // A view is a window on its dict, not a copy of it: what it yields is recomputed on
+    // every read, so a dict mutated after the view was taken shows the new contents.
+    private List<PyObject> Members => [.. _source.Entries.Select(_select)];
+
 
     /// <inheritdoc />
     public override string TypeName { get; }
@@ -929,28 +953,84 @@ public sealed class PyView : PyObject
     public bool IsSetLike { get; }
 
     /// <inheritdoc />
-    public override int? Length() => _items.Count;
+    public override int? Length() => Members.Count;
 
     /// <inheritdoc />
-    public override bool IsTruthy() => _items.Count > 0;
+    public override bool IsTruthy() => Members.Count > 0;
 
     /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => _items;
+    public override IEnumerable<PyObject>? Iterate() => Walk();
+
+    /// <summary>Walks the dict entry by entry, refusing to continue if it was resized.</summary>
+    /// <remarks>
+    /// The check is what CPython's `di_used` guard does: growing or shrinking a dict while
+    /// something iterates it would silently skip or repeat entries, so it raises instead.
+    /// </remarks>
+    private IEnumerable<PyObject> Walk()
+    {
+        var expected = _source.Entries.Count;
+
+        for (var i = 0; i < _source.Entries.Count; i++)
+        {
+            yield return _select(_source.Entries[i]);
+
+            if (_source.Entries.Count != expected)
+            {
+                throw new PyRaise(PyErrors.RuntimeError("dictionary changed size during iteration"));
+            }
+        }
+    }
 
     /// <inheritdoc />
-    public override bool Contains(PyObject item) => _items.Any(candidate => SameOrEqual(candidate, item));
+    /// <remarks>
+    /// An items view answers by looking the key up, so an unhashable one is an error rather
+    /// than a miss — a pair whose key could never be in a dict is not simply absent.
+    /// </remarks>
+    public override bool Contains(PyObject item)
+    {
+        // The set-like views answer by looking the key up, so an unhashable one is an error
+        // rather than a miss — a key that could never be in a dict is not simply absent. A
+        // values view is a linear scan by value and takes any probe at all.
+        var probe = TypeName switch
+        {
+            "dict_keys" => item,
+            "dict_items" when item is PyTuple { Items: [var key, _] } => key,
+            _ => null,
+        };
+
+        if (probe is not null)
+        {
+            _ = PyKey.For(probe, "dict key");
+        }
+
+        return Members.Any(candidate => SameOrEqual(candidate, item));
+    }
 
     /// <inheritdoc />
     public override string Repr() =>
-        TypeName + "([" + string.Join(", ", _items.Select(static i => i.Repr())) + "])";
+        TypeName + "([" + string.Join(", ", Members.Select(static i => i.Repr())) + "])";
 
     /// <inheritdoc />
-    public override bool PyEquals(PyObject other) => other switch
+    /// <remarks>
+    /// Only the set-like views compare by contents. A values view has no rich comparison at
+    /// all upstream, so it falls back to identity: two separate ones are never equal, even
+    /// over the same dict.
+    /// </remarks>
+    public override bool PyEquals(PyObject other)
     {
-        PyView view => _items.Count == view._items.Count
-            && _items.All(item => view._items.Any(item.PyEquals)),
+        if (ReferenceEquals(this, other))
+        {
+            return true;
+        }
 
-        PySet set => _items.Count == set.Count && _items.All(set.Contains),
-        _ => false,
-    };
+        return IsSetLike && other switch
+        {
+            PyView view => view.IsSetLike
+                && Members.Count == view.Members.Count
+                && Members.All(item => view.Members.Any(item.PyEquals)),
+
+            PySet set => Members.Count == set.Count && Members.All(set.Contains),
+            _ => false,
+        };
+    }
 }

@@ -126,30 +126,59 @@ public static class TypeRegistry
             // class, which is how a decorator or a factory builds one at runtime.
             if (arguments.Length == 3)
             {
-                PyBuiltinFunction.RejectKeywords("type", keywords);
+                // CPython validates name, then bases, then the namespace — and only then
+                // complains about keywords, which is why the order matters here.
+                var name = arguments[0] switch
+                {
+                    PyStr text => text.Value,
+                    var bad => throw new PyRaise(PyErrors.TypeError(
+                        $"type.__new__() argument 1 must be str, not {Clinic(bad)}")),
+                };
+
+                if (arguments[1] is not PyTuple)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"type.__new__() argument 2 must be tuple, not {Clinic(arguments[1])}"));
+                }
+
+                if (arguments[2] is not PyDict namespaceDict)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"type.__new__() argument 3 must be dict, not {Clinic(arguments[2])}"));
+                }
+
+                // Keywords reach `__init_subclass__`, which takes none — so the complaint
+                // names the class being built rather than `type`.
+                if (keywords is { Count: > 0 })
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"{name}.__init_subclass__() takes no keyword arguments"));
+                }
+
                 // The namespace is copied, so later edits to the caller's dict do not
                 // reach into the class.
                 var members = new PyDict();
 
-                if (arguments[2] is PyDict namespaceDict)
+                foreach (var (key, value) in namespaceDict.Entries)
                 {
-                    foreach (var (key, value) in namespaceDict.Entries)
-                    {
-                        members.Set(key, value);
-                    }
+                    members.Set(key, value);
                 }
 
-                return new PyClass(arguments[0].Display(), members);
+                return new PyClass(name, members);
             }
 
-            if (arguments.Length is not (0 or 1))
+            if (arguments.Length != 1)
             {
+                PyBuiltinFunction.RejectKeywords("type", keywords);
                 throw new PyRaise(PyErrors.TypeError("type() takes 1 or 3 arguments"));
             }
 
             PyBuiltinFunction.RejectKeywords("type", keywords);
-            return arguments.Length > 0 ? Of(arguments[0]) : Object;
+            return Of(arguments[0]);
         });
+
+    /// <summary>Names a value's type the way the argument clinic does: <c>None</c>, not <c>NoneType</c>.</summary>
+    private static string Clinic(PyObject value) => value is PyNone ? "None" : value.TypeName;
 
     /// <summary><c>NoneType</c>.</summary>
     public static PyType NoneType { get; } = Define(

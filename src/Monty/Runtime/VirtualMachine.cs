@@ -127,32 +127,47 @@ public sealed class VirtualMachine
 
         switch (type.GetAttribute("__init__"))
         {
+            // An initializer produces the instance by mutating it, so returning anything is
+            // a mistake worth reporting rather than quietly dropping.
             case PyFunction initializer:
-            {
-                // An initializer produces the instance by mutating it, so returning
-                // anything is a mistake worth reporting rather than quietly dropping.
-                var returned = CallFunction(initializer.Bind(instance), arguments, keywords);
+                Initialized(CallFunction(initializer.Bind(instance), arguments, keywords));
+                break;
 
-                if (returned is not PyNone)
+            // A decorator such as `@dataclass` installs a builtin `__init__`, which is
+            // unbound and therefore takes the receiver as its first argument. A builtin the
+            // class body merely assigned — `__init__ = print` — is not a descriptor and so
+            // gets the constructor's arguments alone.
+            case PyBuiltinFunction builtin:
+                Initialized(builtin.Invoke(
+                    builtin.BindsAsMethod ? [instance, .. arguments] : arguments, keywords));
+                break;
+
+            case null:
+                if (arguments.Length > 0 || keywords is { Count: > 0 })
                 {
-                    throw new PyRaise(PyErrors.TypeError(
-                        $"__init__() should return None, not '{returned.TypeName}'"));
+                    throw new PyRaise(PyErrors.TypeError($"{type.Name}() takes no arguments"));
                 }
 
                 break;
-            }
 
-            // A decorator such as `@dataclass` installs a builtin `__init__`, which is
-            // unbound and therefore takes the receiver as its first argument.
-            case PyBuiltinFunction builtin:
-                builtin.Invoke([instance, .. arguments], keywords);
+            // Anything else in the slot — a class, a bound method, a non-callable — is
+            // called as it stands, with no receiver of ours.
+            case var other:
+                Initialized(Call(other, arguments, keywords));
                 break;
-
-            case null when arguments.Length > 0 || keywords is { Count: > 0 }:
-                throw new PyRaise(PyErrors.TypeError($"{type.Name}() takes no arguments"));
         }
 
         return instance;
+    }
+
+    /// <summary>Rejects an <c>__init__</c> that returned anything but None.</summary>
+    private static void Initialized(PyObject returned)
+    {
+        if (returned is not PyNone)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"__init__() should return None, not '{returned.TypeName}'"));
+        }
     }
 
     /// <summary>

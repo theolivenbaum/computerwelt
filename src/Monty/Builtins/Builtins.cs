@@ -620,6 +620,8 @@ public static class BuiltinNamespace
     private static PyObject? Keyword(PyDict? keywords, string name) =>
         keywords is not null && keywords.TryGetValue(new PyStr(name), out var value) ? value : null;
 
+    private static bool IsNaN(PyObject value) => value is PyFloat number && double.IsNaN(number.Value);
+
     private static PyObject Extreme(VirtualMachine machine, PyObject[] arguments, PyDict? keywords, bool smallest)
     {
         var name = smallest ? "min" : "max";
@@ -658,9 +660,15 @@ public static class BuiltinNamespace
         foreach (var item in items.Skip(1))
         {
             var itemKey = key is null ? item : machine.Call(key, [item]);
+
+            // A NaN orders against nothing, so it never displaces the running best — the
+            // first element wins by default, exactly as CPython's loop leaves it. A pair
+            // with no ordering for any other reason is still an error.
             var comparison = itemKey.PyCompare(bestKey)
-                ?? throw new PyRaise(PyErrors.TypeError(
-                    $"'<' not supported between instances of '{itemKey.TypeName}' and '{bestKey.TypeName}'"));
+                ?? (IsNaN(itemKey) || IsNaN(bestKey)
+                    ? 0
+                    : throw new PyRaise(PyErrors.TypeError(
+                        $"'<' not supported between instances of '{itemKey.TypeName}' and '{bestKey.TypeName}'")));
 
             if (smallest ? comparison < 0 : comparison > 0)
             {

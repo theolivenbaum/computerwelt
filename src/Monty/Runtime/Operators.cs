@@ -108,6 +108,13 @@ public static class Operators
             }
         }
 
+        // A dict view takes any iterable on the other side, which a set does not — so its
+        // set operators are their own thing rather than a case of the set ones.
+        if (op is "&" or "|" or "^" or "-" && ViewOperation(op, left, right) is { } viewResult)
+        {
+            return viewResult;
+        }
+
         switch (op)
         {
             case "+": return Add(left, right);
@@ -283,7 +290,9 @@ public static class Operators
 
         if (order is not { } decided)
         {
-            return IsNaN(a) || IsNaN(b)
+            // A NaN answers False to every comparison against another number; against a
+            // non-number it is still a type mismatch, and says so.
+            return (IsNaN(a) && b is PyInt or PyFloat) || (IsNaN(b) && a is PyInt or PyFloat)
                 ? PyBool.False
                 : throw new PyRaise(PyErrors.TypeError(
                     $"'{op}' not supported between instances of '{a.TypeName}' and '{b.TypeName}'"));
@@ -428,8 +437,16 @@ public static class Operators
             }
         }
 
+        // A repeatable sequence with a count that is not an int names the count's type;
+        // a pair that is not a sequence-and-count at all names both operands.
+        if (sequence is PyStr or PyList or PyTuple or PyBytes)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"can't multiply sequence by non-int of type '{(left is PyInt ? right : left).TypeName}'"));
+        }
+
         throw new PyRaise(PyErrors.TypeError(
-            $"can't multiply sequence by non-int of type '{(left is PyInt ? right : left).TypeName}'"));
+            $"unsupported operand type(s) for *: '{left.TypeName}' and '{right.TypeName}'"));
     }
 
     private static PyObject TrueDivide(PyObject left, PyObject right)
@@ -605,7 +622,7 @@ public static class Operators
             return PyBool.Of(left.IsTruthy() && right.IsTruthy());
         }
 
-        return new PyInt(RequireInt(left, "&") & RequireInt(right, "&"));
+        return new PyInt(RequireInt(left, "&", left, right) & RequireInt(right, "&", left, right));
     }
 
     /// <summary>
@@ -721,6 +738,54 @@ public static class Operators
     /// <c>-</c> and <c>^</c>, so the operators are defined over anything set-like rather
     /// than over one class.
     /// </remarks>
+    /// <summary>
+    /// Applies a set operator with a dict view on one side, or returns null when neither
+    /// side is a set-like view and the ordinary handling should run.
+    /// </summary>
+    /// <remarks>
+    /// Views differ from sets in what they accept and in when they hash. Intersection walks
+    /// the other operand and probes the view, so a view over unhashable values still
+    /// intersects; the other three build a set from each side, left first, which is why a
+    /// non-iterable left operand is reported before the view's values are ever hashed.
+    /// </remarks>
+    private static PyObject? ViewOperation(string op, PyObject left, PyObject right)
+    {
+        if ((left as PyView)?.IsSetLike != true && (right as PyView)?.IsSetLike != true)
+        {
+            return null;
+        }
+
+        if (op == "&")
+        {
+            var (view, other) = left is PyView { IsSetLike: true } candidate
+                ? (candidate, right)
+                : ((PyView)right, left);
+
+            var found = new PySet();
+
+            foreach (var item in VirtualMachine.RequireIterable(other))
+            {
+                if (view.Contains(item))
+                {
+                    found.Add(item);
+                }
+            }
+
+            return found;
+        }
+
+        var x = new PySet(VirtualMachine.RequireIterable(left));
+        var y = new PySet(VirtualMachine.RequireIterable(right));
+
+        return op switch
+        {
+            "|" => new PySet(x.Items.Concat(y.Items)),
+            "^" => new PySet(x.Items.Where(item => !y.Contains(item))
+                .Concat(y.Items.Where(item => !x.Contains(item)))),
+            _ => new PySet(x.Items.Where(item => !y.Contains(item))),
+        };
+    }
+
     private static PySet? AsSet(PyObject value) => value switch
     {
         PySet set => set,
@@ -770,7 +835,7 @@ public static class Operators
             return PyBool.Of(left.IsTruthy() || right.IsTruthy());
         }
 
-        return new PyInt(RequireInt(left, "|") | RequireInt(right, "|"));
+        return new PyInt(RequireInt(left, "|", left, right) | RequireInt(right, "|", left, right));
     }
 
     private static PyObject BitwiseXor(PyObject left, PyObject right)
@@ -794,38 +859,45 @@ public static class Operators
             return PyBool.Of(left.IsTruthy() ^ right.IsTruthy());
         }
 
-        return new PyInt(RequireInt(left, "^") ^ RequireInt(right, "^"));
+        return new PyInt(RequireInt(left, "^", left, right) ^ RequireInt(right, "^", left, right));
     }
 
     private static PyObject ShiftLeft(PyObject left, PyObject right)
     {
-        var shift = RequireInt(right, "<<");
+        var shift = RequireInt(right, "<<", left, right);
 
         if (shift < 0)
         {
             throw new PyRaise(PyErrors.ValueError("negative shift count"));
         }
 
-        return new PyInt(RequireInt(left, "<<") << (int)shift);
+        return new PyInt(RequireInt(left, "<<", left, right) << (int)shift);
     }
 
     private static PyObject ShiftRight(PyObject left, PyObject right)
     {
-        var shift = RequireInt(right, ">>");
+        var shift = RequireInt(right, ">>", left, right);
 
         if (shift < 0)
         {
             throw new PyRaise(PyErrors.ValueError("negative shift count"));
         }
 
-        return new PyInt(RequireInt(left, ">>") >> (int)shift);
+        return new PyInt(RequireInt(left, ">>", left, right) >> (int)shift);
     }
 
-    private static BigInteger RequireInt(PyObject value, string op) =>
+    /// <summary>
+    /// Reads a bitwise operand, which must be an integer.
+    /// </summary>
+    /// <remarks>
+    /// The complaint names both operands even though only one of them is at fault — that is
+    /// how CPython words every binary-operator mismatch, and scripts match on it.
+    /// </remarks>
+    private static BigInteger RequireInt(PyObject value, string op, PyObject left, PyObject right) =>
         value is PyInt integer
             ? integer.Value
             : throw new PyRaise(PyErrors.TypeError(
-                $"unsupported operand type(s) for {op}: '{value.TypeName}'"));
+                $"unsupported operand type(s) for {op}: '{left.TypeName}' and '{right.TypeName}'"));
 
     private static BigInteger AsInt(PyObject value) => ((PyInt)value).Value;
 

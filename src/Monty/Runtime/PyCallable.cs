@@ -60,9 +60,16 @@ public sealed class PyFunction : PyCallable
     /// <inheritdoc />
     public override string Repr() => $"<function {Code.Name}>";
 
-    /// <summary>Returns a copy of this function bound to <paramref name="instance"/>.</summary>
+    /// <summary>
+    /// Returns a copy of this function bound to <paramref name="instance"/>, or the
+    /// function itself when it already carries a receiver.
+    /// </summary>
+    /// <remarks>
+    /// A bound method is not itself a descriptor, so storing one in a class body — as
+    /// `__init__ = recorder.record` does — keeps the receiver it was bound to.
+    /// </remarks>
     public PyFunction Bind(PyObject instance) =>
-        new(Code, Closure, Globals, Defaults) { BoundSelf = instance };
+        BoundSelf is not null ? this : new(Code, Closure, Globals, Defaults) { BoundSelf = instance };
 }
 
 /// <summary>A function implemented in C#.</summary>
@@ -115,6 +122,18 @@ public sealed class PyBuiltinFunction : PyCallable
     /// the Python spelling.
     /// </remarks>
     public string Kind { get; init; } = "builtin_function_or_method";
+
+    /// <summary>
+    /// Whether this stands in for a Python function and so takes its receiver when it is
+    /// found as a method.
+    /// </summary>
+    /// <remarks>
+    /// A <c>builtin_function_or_method</c> is not a descriptor in CPython, so
+    /// <c>__init__ = print</c> in a class body is called with the constructor's arguments
+    /// and no <c>self</c>. The methods <c>@dataclass</c> synthesizes are written in Python
+    /// upstream, so they bind — this flag tells the two apart.
+    /// </remarks>
+    public bool BindsAsMethod { get; init; }
 
     /// <inheritdoc />
     public override string TypeName => Kind;
@@ -267,14 +286,21 @@ public sealed class PyInstance : PyObject
     /// <inheritdoc />
     public override string Repr() =>
         Dunder("__repr__") is { } repr
-            ? Invoke(repr, []).Display()
+            ? Text(Invoke(repr, []), "__repr__")
             // The default repr names the class and the identity, as CPython's does; the
             // "address" is the same identity `id()` reports.
             : $"<{Class.Name} object at 0x{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this):x8}>";
 
     /// <inheritdoc />
     public override string Display() =>
-        Dunder("__str__") is { } str ? Invoke(str, []).Display() : Repr();
+        Dunder("__str__") is { } str ? Text(Invoke(str, []), "__str__") : Repr();
+
+    /// <summary>Takes the string a <c>__repr__</c> or <c>__str__</c> returned, which must be one.</summary>
+    private static string Text(PyObject returned, string dunder) =>
+        returned is PyStr text
+            ? text.Value
+            : throw new PyRaise(PyErrors.TypeError(
+                $"{dunder} returned non-string (type {returned.TypeName})"));
 
     /// <inheritdoc />
     public override bool IsTruthy()

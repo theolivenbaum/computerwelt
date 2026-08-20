@@ -89,10 +89,22 @@ public static class Sorting
         }
     }
 
-    private static bool Less(PyObject right, PyObject left) =>
-        (right.PyCompare(left)
-            ?? throw new PyRaise(PyErrors.TypeError(
-                $"'<' not supported between instances of '{right.TypeName}' and '{left.TypeName}'"))) < 0;
+    private static bool Less(PyObject right, PyObject left)
+    {
+        if (right.PyCompare(left) is { } order)
+        {
+            return order < 0;
+        }
+
+        // A NaN is neither less nor greater, so it never triggers a swap and stays where it
+        // is — CPython sorts such a list without complaint. A genuine mismatch still raises.
+        return IsNaN(right) || IsNaN(left)
+            ? false
+            : throw new PyRaise(PyErrors.TypeError(
+                $"'<' not supported between instances of '{right.TypeName}' and '{left.TypeName}'"));
+    }
+
+    private static bool IsNaN(PyObject value) => value is PyFloat number && double.IsNaN(number.Value);
 
     /// <summary>One element, paired with its sort key.</summary>
     private readonly record struct Entry(PyObject Key, PyObject Value);
