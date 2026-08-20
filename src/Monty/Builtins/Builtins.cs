@@ -545,7 +545,9 @@ public static class BuiltinNamespace
 
             // A class whose `__iter__` returns self must come back unwrapped: `iter(c) is c`
             // is the contract every hand-written iterator relies on.
-            if (arguments[0] is PyInstance instance && instance.Dunder("__iter__") is { } method)
+            // A filled-but-None `__iter__` opts out: the None is never called, and the
+            // object simply is not iterable.
+            if (arguments[0] is PyInstance instance && instance.Dunder("__iter__") is { } method and not PyNone)
             {
                 var iterator = instance.Invoke(method, []);
 

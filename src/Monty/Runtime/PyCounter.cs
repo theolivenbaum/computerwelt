@@ -77,7 +77,9 @@ public sealed class PyCounter : PyDict
         try
         {
             return "Counter({"
-                + string.Join(", ", MostCommon(null).Select(e => e.Key.Repr() + ": " + e.Value.Repr()))
+                // A snapshot: the ordering pass has already read every entry, so an item
+                // whose `__repr__` mutates the counter changes nothing here.
+                + string.Join(", ", MostCommon(null).ToList().Select(e => e.Key.Repr() + ": " + e.Value.Repr()))
                 + "})";
         }
         finally

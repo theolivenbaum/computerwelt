@@ -1057,7 +1057,23 @@ public sealed class VirtualMachine
             {
                 var iterable = frame.Pop();
                 var target = (PyList)frame.Peek(instruction.Operand - 1);
-                target.Items.AddRange(RequireIterable(iterable));
+
+                // A list or tuple display words a non-iterable's refusal its own way; a set
+                // display and a sequence unpack each word it differently again. A class that
+                // opted out with `__iter__ = None` keeps the plain wording everywhere.
+                var filled = iterable is PyInstance opted && opted.Dunder("__iter__") is PyNone;
+
+                try
+                {
+                    target.Items.AddRange(RequireIterable(iterable));
+                }
+                catch (PyRaise raise)
+                    when (!filled && raise.Exception.Message == $"'{iterable.TypeName}' object is not iterable")
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"Value after * must be an iterable, not {iterable.TypeName}"));
+                }
+
                 return false;
             }
 
@@ -1277,9 +1293,22 @@ public sealed class VirtualMachine
 
                 if (values.Count != wanted)
                 {
+                    // A list, a tuple and a dict are unpacked without the iterator protocol,
+                    // so their length is known and the surplus can be counted; anything else
+                    // stopped at the first extra item and never learned the total.
+                    var total = source switch
+                    {
+                        PyList list => list.Items.Count,
+                        PyDict dict => dict.Count,
+                        PyTuple tuple => tuple.Items.Count,
+                        _ => (int?)null,
+                    };
+
                     throw new PyRaise(PyErrors.ValueError(values.Count < wanted
                         ? $"not enough values to unpack (expected {wanted}, got {values.Count})"
-                        : $"too many values to unpack (expected {wanted})"));
+                        : total is { } known
+                            ? $"too many values to unpack (expected {wanted}, got {known})"
+                            : $"too many values to unpack (expected {wanted})"));
                 }
 
                 // Pushed in reverse so the first target pops first.
@@ -1295,7 +1324,7 @@ public sealed class VirtualMachine
             {
                 var starIndex = instruction.Operand >> 16;
                 var total = instruction.Operand & 0xFFFF;
-                var values = RequireIterable(frame.Pop()).ToList();
+                var values = Unpackable(frame.Pop()).ToList();
                 var after = total - starIndex - 1;
 
                 if (values.Count < total - 1)
@@ -1655,13 +1684,17 @@ public sealed class VirtualMachine
     /// </summary>
     private static IEnumerable<PyObject> Unpackable(PyObject source)
     {
+        // A class that sets `__iter__ = None` has the slot filled, so every site — unpacking
+        // included — reports it plainly rather than in its own words.
+        var optedOut = source is PyInstance instance && instance.Dunder("__iter__") is PyNone;
         IEnumerator<PyObject> items;
 
         try
         {
             items = RequireIterable(source).GetEnumerator();
         }
-        catch (PyRaise raise) when (raise.Exception.Message == $"'{source.TypeName}' object is not iterable")
+        catch (PyRaise raise)
+            when (!optedOut && raise.Exception.Message == $"'{source.TypeName}' object is not iterable")
         {
             throw new PyRaise(PyErrors.TypeError($"cannot unpack non-iterable {source.TypeName} object"));
         }

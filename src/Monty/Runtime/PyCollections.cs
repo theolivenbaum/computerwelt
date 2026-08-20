@@ -87,7 +87,22 @@ public sealed class PyList : PyObject
 
         try
         {
-            return "[" + string.Join(", ", Items.Select(static i => i.Repr())) + "]";
+            // Walked by index against the live list, as CPython's does: an element whose
+            // `__repr__` shortens or extends the list changes what the rest of the repr
+            // sees, and re-reading the count each step is also what keeps that safe.
+            var text = new System.Text.StringBuilder("[");
+
+            for (var i = 0; i < Items.Count; i++)
+            {
+                if (i > 0)
+                {
+                    text.Append(", ");
+                }
+
+                text.Append(Items[i].Repr());
+            }
+
+            return text.Append(']').ToString();
         }
         finally
         {
@@ -435,7 +450,23 @@ public class PyDict : PyObject
 
         try
         {
-            return "{" + string.Join(", ", _entries.Select(static e => e.Key.Repr() + ": " + e.Value.Repr())) + "}";
+            // Walked by index against the live dict, as CPython's does. The pair is read
+            // before either half is formatted, so an entry that deletes itself while its
+            // key prints still shows its value.
+            var text = new System.Text.StringBuilder("{");
+
+            for (var i = 0; i < _entries.Count; i++)
+            {
+                if (i > 0)
+                {
+                    text.Append(", ");
+                }
+
+                var (key, value) = _entries[i];
+                text.Append(key.Repr()).Append(": ").Append(value.Repr());
+            }
+
+            return text.Append('}').ToString();
         }
         finally
         {
@@ -689,7 +720,9 @@ public sealed class PySet : PyObject
             return IsFrozen ? "frozenset()" : "set()";
         }
 
-        var members = "{" + string.Join(", ", _items.Values.Select(static i => i.Repr())) + "}";
+        // A snapshot, unlike a list's or a dict's: a member whose `__repr__` mutates the set
+        // changes nothing about what this repr prints.
+        var members = "{" + string.Join(", ", _items.Values.ToList().Select(static i => i.Repr())) + "}";
         return IsFrozen ? "frozenset(" + members + ")" : members;
     }
 

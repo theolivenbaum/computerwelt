@@ -369,11 +369,16 @@ public sealed class PyInstance : PyObject
         Dunder("__len__") is { } length ? ((PyInt)Invoke(length, [])).ToIndex() : null;
 
     /// <inheritdoc />
+    /// <inheritdoc />
+    /// <remarks>
+    /// An <c>__iter__</c> of None opts out of iteration entirely: it is never called, and
+    /// there is no fallback to <c>__getitem__</c>, so the object is simply not iterable.
+    /// </remarks>
     public override IEnumerable<PyObject>? Iterate()
     {
         if (Dunder("__iter__") is { } iterator)
         {
-            return Drain(Invoke(iterator, []));
+            return iterator is PyNone ? null : Drain(Invoke(iterator, []));
         }
 
         // The legacy protocol: `__getitem__` from 0 until IndexError.
@@ -485,7 +490,8 @@ public sealed class PyInstance : PyObject
 
         if (iterator is not PyInstance instance || instance.Dunder("__next__") is not { } next)
         {
-            throw new PyRaise(PyErrors.TypeError("__iter__ returned a non-iterator"));
+            throw new PyRaise(PyErrors.TypeError(
+                $"iter() returned non-iterator of type '{iterator.TypeName}'"));
         }
 
         while (true)

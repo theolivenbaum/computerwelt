@@ -198,7 +198,21 @@ public static class BuiltinMethods
                     var builder = new StringBuilder();
                     var first = true;
 
-                    foreach (var item in VirtualMachine.RequireIterable(arguments[0]))
+                    // `join` words a non-iterable's refusal as a sentence of its own rather
+                    // than naming the type, which is what CPython's str.join does.
+                    IEnumerable<PyObject> pieces;
+
+                    try
+                    {
+                        pieces = VirtualMachine.RequireIterable(arguments[0]);
+                    }
+                    catch (PyRaise raise)
+                        when (raise.Exception.Message == $"'{arguments[0].TypeName}' object is not iterable")
+                    {
+                        throw new PyRaise(PyErrors.TypeError("can only join an iterable"));
+                    }
+
+                    foreach (var item in pieces)
                     {
                         if (item is not PyStr piece)
                         {

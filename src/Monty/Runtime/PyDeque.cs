@@ -92,7 +92,8 @@ public sealed class PyDeque : PyObject
 
         try
         {
-            var body = "deque([" + string.Join(", ", Items.Select(static i => i.Repr())) + "]";
+            // A snapshot: a member whose `__repr__` mutates the deque changes nothing here.
+            var body = "deque([" + string.Join(", ", Items.ToList().Select(static i => i.Repr())) + "]";
             return MaxLength is { } bound
                 ? body + ", maxlen=" + bound.ToString(CultureInfo.InvariantCulture) + ")"
                 : body + ")";
