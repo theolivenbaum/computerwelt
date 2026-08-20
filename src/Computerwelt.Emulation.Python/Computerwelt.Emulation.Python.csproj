@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Computerwelt.Emulation.Python</RootNamespace>
+    <AssemblyName>Computerwelt.Emulation.Python</AssemblyName>
+    <PackageId>Computerwelt.Emulation.Python</PackageId>
+    <Description>Minimal, secure Python interpreter for running LLM-written code. C# port of the Rust monty crate.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The Unicode character database, which the host runtime does not expose. -->
+    <EmbeddedResource Include="Runtime/UnicodeData.bin" LogicalName="Computerwelt.Emulation.Python.Runtime.UnicodeData.bin" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Computerwelt.Emulation.Python.SpecTests" />
+    <InternalsVisibleTo Include="Computerwelt.Emulation.Python.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -1,4 +1,4 @@
-using Bashkit;
+using Computerwelt.Emulation.Bash;
 using Xunit;
 
 namespace Computerwelt.Tests;

@@ -8,8 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../Bashkit/Bashkit.csproj" />
-    <ProjectReference Include="../Monty/Monty.csproj" />
+    <ProjectReference Include="../Computerwelt.Emulation.Bash/Computerwelt.Emulation.Bash.csproj" />
+    <ProjectReference Include="../Computerwelt.Emulation.Python/Computerwelt.Emulation.Python.csproj" />
   </ItemGroup>
 
   <ItemGroup>

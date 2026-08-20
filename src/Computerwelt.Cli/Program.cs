@@ -1,4 +1,4 @@
-using Bashkit;
+using Computerwelt.Emulation.Bash;
 using Computerwelt;
 
 // A thin driver over the library: enough to try a script by hand and to smoke-test the

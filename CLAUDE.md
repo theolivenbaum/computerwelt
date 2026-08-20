@@ -40,12 +40,14 @@ Bashkit's value is its security posture. The port must preserve all of it:
 
 ## Architecture
 
-Mirrors upstream module-for-module so the trees can be diffed by eye.
+Mirrors upstream module-for-module so the trees can be diffed by eye. The two halves ship
+as `Computerwelt.Emulation.Bash` and `Computerwelt.Emulation.Python`; each project's root
+namespace is its assembly name, so a file's namespace names the package it lands in.
 
-### Shell — `src/Bashkit/`
+### Shell — `src/Computerwelt.Emulation.Bash/`
 
-| Upstream (`crates/bashkit/src/`) | Port (`src/Bashkit/`)     | Purpose |
-|----------------------------------|---------------------------|---------|
+| Upstream (`crates/bashkit/src/`) | Port (`src/Computerwelt.Emulation.Bash/`) | Purpose |
+|---|---|---|
 | `parser/`                        | `Parsing/`                | Lexer, AST, recursive-descent parser, parse budget |
 | `interpreter/`                   | `Interpreter/`            | Evaluation, expansion, arithmetic, globbing, redirection, shell state |
 | `fs/`                            | `FileSystems/`            | `IFileSystem` + InMemory / Overlay / Mountable / ReadOnly / Real backends |
@@ -57,12 +59,12 @@ Mirrors upstream module-for-module so the trees can be diffed by eye.
 | `tool.rs`, `tool_def.rs`         | `Tooling/`                | `BashTool` LLM tool contract |
 | `lib.rs`                         | `Bash.cs`, `BashBuilder.cs` | Public facade |
 
-### Python — `src/Monty/` (not started)
+### Python — `src/Computerwelt.Emulation.Python/`
 
 Monty is a compiler plus a bytecode VM, not a tree walker, and the port keeps that shape:
 the speed and the snapshot-at-a-call-boundary feature both depend on it.
 
-| Upstream (`crates/monty/src/`) | Port (`src/Monty/`) | Purpose |
+| Upstream (`crates/monty/src/`) | Port (`src/Computerwelt.Emulation.Python/`) | Purpose |
 |---|---|---|
 | `parse.rs`, `fstring.rs`, `expressions.rs` | `Parsing/` | Python source → AST |
 | `bytecode/` | `Compilation/` | AST → bytecode, scope and name resolution |
@@ -107,18 +109,19 @@ Computerwelt.slnx
 Directory.Build.props        shared TFM / analyzers / warnings-as-errors
 Directory.Packages.props     central package versions
 src/
-  Bashkit/                   the shell library
-  Monty/                     the Python library
-  Computerwelt/              the two joined: `python` as a shell command over one VFS
-  Computerwelt.Cli/          a REPL / script runner over the whole product
-  Monty.Cli/                 a Python-only runner, for isolating that half
+  Computerwelt.Emulation.Bash/          the shell library
+  Computerwelt.Emulation.Python/        the Python library
+  Computerwelt/                         the two joined: `python` as a shell command over one VFS
+  Computerwelt.Cli/                     a REPL / script runner over the whole product
+  Computerwelt.Emulation.Python.Cli/    a Python-only runner, for isolating that half
 tests/
-  Bashkit.Tests/             shell unit tests
-  Bashkit.SpecTests/         shell conformance runner over `tests/spec/**/*.test.sh`
-  Monty.SpecTests/           python conformance runner over `tests/monty-spec/*.py`
-  Computerwelt.Tests/        integration: both interpreters over one filesystem
-  spec/                      shell acceptance corpus (from bashkit)
-  monty-spec/                python acceptance corpus (from monty)
+  Computerwelt.Emulation.Bash.Tests/        shell unit tests
+  Computerwelt.Emulation.Bash.SpecTests/    shell conformance over `tests/spec/**/*.test.sh`
+  Computerwelt.Emulation.Python.Tests/      python unit tests
+  Computerwelt.Emulation.Python.SpecTests/  python conformance over `tests/monty-spec/*.py`
+  Computerwelt.Tests/                       integration: both interpreters over one filesystem
+  spec/                                     shell acceptance corpus (from bashkit)
+  monty-spec/                               python acceptance corpus (from monty)
 .reference/bashkit/          vendored bashkit source (read-only)
 .reference/monty/            vendored monty source (read-only)
 ```
@@ -144,7 +147,7 @@ Bashkit ships **2,521 runnable cases** in a language-agnostic format:
 Directives: `### exit_code: N`, `### skip: reason`, `### bash_diff: reason`,
 `### paused_time`.
 
-`Bashkit.SpecTests` parses these and runs them. Because the port is incomplete, the runner
+`Computerwelt.Emulation.Bash.SpecTests` parses these and runs them. Because the port is incomplete, the runner
 is **ratchet-based**: `tests/spec/baseline.json` records the pass count per file. A run
 fails if any file regresses below its baseline. Raise the baseline when you make things
 pass — never lower it to make a build green.
@@ -166,12 +169,12 @@ Some fixtures instead pin an expected traceback in a trailing docstring
 makes them error-message conformance tests. `# xfail=monty` marks a case upstream itself
 does not pass.
 
-`Monty.SpecTests` will run these under the same ratchet discipline.
+`Computerwelt.Emulation.Python.SpecTests` will run these under the same ratchet discipline.
 
 ```bash
 dotnet test                                   # everything
-dotnet test tests/Bashkit.SpecTests           # shell conformance only
-dotnet test tests/Monty.SpecTests             # python conformance only
+dotnet test tests/Computerwelt.Emulation.Bash.SpecTests           # shell conformance only
+dotnet test tests/Computerwelt.Emulation.Python.SpecTests             # python conformance only
 ```
 
 ## Working rules
@@ -184,6 +187,6 @@ dotnet test tests/Monty.SpecTests             # python conformance only
 - **Port behaviour, not structure-for-its-own-sake.** Idiomatic C# is preferred where it
   does not change observable behaviour. Where it would, match Rust exactly.
 - **Every builtin lands with spec coverage.** If upstream has no spec case for a
-  behaviour, add a unit test in `Bashkit.Tests`.
+  behaviour, add a unit test in `Computerwelt.Emulation.Bash.Tests` or `Computerwelt.Emulation.Python.Tests`.
 - **Never weaken a limit or a check to make a test pass.**
 - Keep `todo.md` current — it is the port's progress ledger.

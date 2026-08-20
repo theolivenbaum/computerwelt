@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Computerwelt.Emulation.Python.Cli</RootNamespace>
+    <AssemblyName>Computerwelt.Emulation.Python.Cli</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Computerwelt.Emulation.Python/Computerwelt.Emulation.Python.csproj" />
+  </ItemGroup>
+
+</Project>

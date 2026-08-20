@@ -51,9 +51,9 @@ The one remaining fixture is a documented divergence, not a gap — see below.
 - [x] Solution, `Directory.Build.props`, `Directory.Packages.props` (net10.0, nullable,
       warnings-as-errors, central package management)
 - [x] Copy upstream spec cases into `tests/spec/`
-- [x] `Bashkit.SpecTests` harness: spec file parser + ratchet runner + `report` mode
+- [x] `Computerwelt.Emulation.Bash.SpecTests` harness: spec file parser + ratchet runner + `report` mode
 
-## Phase 1 — Core primitives  (`src/Bashkit/Core/`)
+## Phase 1 — Core primitives  (`src/Computerwelt.Emulation.Bash/Core/`)
 
 Upstream: `stream.rs`, `error.rs`, `interpreter/state.rs`, `fs/posix.rs`
 
@@ -65,7 +65,7 @@ Upstream: `stream.rs`, `error.rs`, `interpreter/state.rs`, `fs/posix.rs`
 - [x] `BashkitException` + error taxonomy (`Error` variants from `error.rs`)
 - [x] `ExitCodes` constants (127 not-found, 126 not-executable, 2 usage, 128+n signals)
 
-## Phase 2 — Limits  (`src/Bashkit/Limits/`)
+## Phase 2 — Limits  (`src/Computerwelt.Emulation.Bash/Limits/`)
 
 Upstream: `limits.rs` (73 KB), `profile.rs`
 
@@ -77,7 +77,7 @@ Upstream: `limits.rs` (73 KB), `profile.rs`
 - [ ] `MemoryLimits` / `MemoryBudget` — live intermediate byte tracking with leases
 - [ ] `ExecutionProfile` presets (strict / default / permissive)
 
-## Phase 3 — Virtual filesystem  (`src/Bashkit/FileSystems/`)
+## Phase 3 — Virtual filesystem  (`src/Computerwelt.Emulation.Bash/FileSystems/`)
 
 Upstream: `fs/` (~400 KB)
 
@@ -94,7 +94,7 @@ Upstream: `fs/` (~400 KB)
 - [ ] Namespace / `posix.rs` path-resolution conformance suite
       (`tests/support/filesystem_security_conformance.rs` upstream)
 
-## Phase 4 — Parser  (`src/Bashkit/Parsing/`)
+## Phase 4 — Parser  (`src/Computerwelt.Emulation.Bash/Parsing/`)
 
 Upstream: `parser/` (~340 KB)
 
@@ -114,7 +114,7 @@ Upstream: `parser/` (~340 KB)
 - [~] Parse fuel wired; parser wall-clock timeout not yet separate from execution timeout
 - [~] `Span` on nodes; not yet complete or used by analysis
 
-## Phase 5 — Interpreter  (`src/Bashkit/Interpreter/`)
+## Phase 5 — Interpreter  (`src/Computerwelt.Emulation.Bash/Interpreter/`)
 
 Upstream: `interpreter/` (~730 KB — the largest single area)
 
@@ -148,7 +148,7 @@ Upstream: `interpreter/` (~730 KB — the largest single area)
 - [ ] `time` keyword, `coproc`
 - [x] `IFS` field splitting with the whitespace / non-whitespace separator distinction
 
-## Phase 6 — Builtins  (`src/Bashkit/Builtins/`)
+## Phase 6 — Builtins  (`src/Computerwelt.Emulation.Bash/Builtins/`)
 
 ~160 commands. `IBuiltin`, `BuiltinContext` and the `ArgCursor` option parser are in
 place, along with `ShellHooks` for the builtins that call back into the shell
@@ -199,7 +199,7 @@ place, along with `ShellHooks` for the builtins that call back into the shell
 - [ ] `python`, `typescript`, `sqlite` embeddings — **out of scope**; upstream delegates
       to third-party Rust engines with no .NET equivalent. Track as "not ported".
 
-## Phase 7 — Public facade  (`src/Bashkit/`)
+## Phase 7 — Public facade  (`src/Computerwelt.Emulation.Bash/`)
 
 Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 
@@ -270,11 +270,11 @@ shortcut would foreclose them.
 
 - [x] Vendor upstream into `.reference/monty/` (CI/CD stripped)
 - [x] Copy the 568-fixture corpus into `tests/monty-spec/`
-- [x] `src/Monty/`, `src/Monty.Cli/` and `tests/Monty.SpecTests/`
+- [x] `src/Computerwelt.Emulation.Python/`, `src/Computerwelt.Emulation.Python.Cli/` and `tests/Computerwelt.Emulation.Python.SpecTests/`
 - [x] Fixture parser: `assert`-only cases, `# Raise=`, `TRACEBACK:`, `# xfail=` directives
 - [x] Ratchet runner + `tests/monty-spec/baseline.json`
 
-## Phase 12 — Front end  (`src/Monty/Parsing/`)
+## Phase 12 — Front end  (`src/Computerwelt.Emulation.Python/Parsing/`)
 
 Upstream: `parse.rs`, `expressions.rs`, `fstring.rs`, `source_map.rs`
 
@@ -293,7 +293,7 @@ Upstream: `parse.rs`, `expressions.rs`, `fstring.rs`, `source_map.rs`
 - [ ] Parse-error messages matching CPython's, since fixtures compare them
 - [ ] `match` statements — an upstream limitation, tracked but not required
 
-## Phase 13 — Compiler  (`src/Monty/Compilation/`)
+## Phase 13 — Compiler  (`src/Computerwelt.Emulation.Python/Compilation/`)
 
 Upstream: `bytecode/` (620 KB — the largest single area)
 
@@ -312,7 +312,7 @@ Upstream: `bytecode/` (620 KB — the largest single area)
 - [ ] Constant folding and the peepholes upstream applies
 - [ ] Compile-time limits: bytecode size, constant count, nesting depth
 
-## Phase 14 — Runtime  (`src/Monty/Runtime/`)
+## Phase 14 — Runtime  (`src/Computerwelt.Emulation.Python/Runtime/`)
 
 Upstream: `run.rs`, `function.rs`, `heap/`, `heap_data.rs`, `resource_checks.rs`
 
@@ -331,7 +331,7 @@ Upstream: `run.rs`, `function.rs`, `heap/`, `heap_data.rs`, `resource_checks.rs`
 - [ ] Object heap with cycle collection (currently the .NET GC)
 - [ ] Tracebacks quoting the offending source line
 
-## Phase 15 — Types and builtins  (`src/Monty/Types/`, `src/Monty/Builtins/`)
+## Phase 15 — Types and builtins  (`src/Computerwelt.Emulation.Python/Types/`, `src/Computerwelt.Emulation.Python/Builtins/`)
 
 Upstream: `types/` (1.1 MB), `builtins/` (188 KB)
 
@@ -354,7 +354,7 @@ Upstream: `types/` (1.1 MB), `builtins/` (188 KB)
 - [x] Arithmetic with Python's semantics: floor division toward negative infinity,
       modulo taking the divisor's sign, `**` promoting to float on a negative exponent
 
-## Phase 16 — Standard library subset  (`src/Monty/Modules/`)
+## Phase 16 — Standard library subset  (`src/Computerwelt.Emulation.Python/Modules/`)
 
 Upstream: `modules/` — the permitted set and nothing more.
 
@@ -374,7 +374,7 @@ Upstream: `modules/` — the permitted set and nothing more.
 Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.rs`
 
 - [x] `ExecutionLimits` and the `MontyRunner` facade
-- [x] `Monty.Cli` — run a script or `-c` source
+- [x] `Computerwelt.Emulation.Python.Cli` — run a script or `-c` source
 - [x] `Computerwelt.Cli` — the product driver, shell plus `python`
 - [x] External functions — the only route to anything outside the sandbox, mirroring how
       Monty blocks filesystem, environment and network by default

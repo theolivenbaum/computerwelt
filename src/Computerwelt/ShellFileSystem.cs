@@ -1,6 +1,6 @@
 using System.Text;
-using Bashkit;
-using Monty.Runtime;
+using Computerwelt.Emulation.Bash;
+using Computerwelt.Emulation.Python.Runtime;
 
 namespace Computerwelt;
 

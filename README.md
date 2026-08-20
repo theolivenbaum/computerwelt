@@ -40,6 +40,17 @@ await bash.ExecAsync("""
 // 42
 ```
 
+## Packages
+
+| Package | Contents |
+|---|---|
+| `Computerwelt` | both halves, joined over one virtual filesystem |
+| `Computerwelt.Emulation.Bash` | the shell on its own |
+| `Computerwelt.Emulation.Python` | the Python interpreter on its own |
+
+Each project's root namespace is its package name, so a type's namespace says which package
+it ships in.
+
 ## What "sandboxed" means here
 
 - **No process spawning.** Every command is a managed implementation. There is no `PATH`
@@ -58,15 +69,16 @@ behaves identically on Linux, macOS and Windows.
 
 | Path | What it is |
 |---|---|
-| `src/Bashkit/` | the shell library |
+| `src/Computerwelt.Emulation.Bash/` | the shell library |
 | `src/Computerwelt.Cli/` | a script runner and REPL over the whole product |
-| `src/Monty/` | the Python library |
+| `src/Computerwelt.Emulation.Python/` | the Python library |
 | `src/Computerwelt/` | the two joined: `python` as a shell command over one filesystem |
-| `src/Monty.Cli/` | a Python-only runner |
-| `tests/Monty.SpecTests/` | Python conformance runner |
+| `src/Computerwelt.Emulation.Python.Cli/` | a Python-only runner |
+| `tests/Computerwelt.Emulation.Python.Tests/` | Python unit tests |
+| `tests/Computerwelt.Emulation.Python.SpecTests/` | Python conformance runner |
 | `tests/Computerwelt.Tests/` | integration: both interpreters over one filesystem |
-| `tests/Bashkit.Tests/` | shell unit tests |
-| `tests/Bashkit.SpecTests/` | shell conformance runner |
+| `tests/Computerwelt.Emulation.Bash.Tests/` | shell unit tests |
+| `tests/Computerwelt.Emulation.Bash.SpecTests/` | shell conformance runner |
 | `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
 | `tests/monty-spec/` | 568 Python fixtures carried over from monty |
 | `.reference/` | the vendored Rust sources, read-only, used as the specification |
@@ -84,8 +96,8 @@ Python fixtures pass, and each suite fails on a regression. After making cases p
 the baseline:
 
 ```bash
-BASHKIT_UPDATE_BASELINE=1 dotnet test tests/Bashkit.SpecTests
-MONTY_UPDATE_BASELINE=1 dotnet test tests/Monty.SpecTests
+BASHKIT_UPDATE_BASELINE=1 dotnet test tests/Computerwelt.Emulation.Bash.SpecTests
+MONTY_UPDATE_BASELINE=1 dotnet test tests/Computerwelt.Emulation.Python.SpecTests
 ```
 
 Never lower a baseline to make a build green.

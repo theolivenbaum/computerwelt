@@ -1,8 +1,12 @@
 using System.Text;
-using Bashkit;
-using Bashkit.Builtins;
-using Monty;
-using Monty.Runtime;
+using Computerwelt.Emulation.Bash;
+using Computerwelt.Emulation.Bash.Builtins;
+using Computerwelt.Emulation.Python;
+using Computerwelt.Emulation.Python.Runtime;
+
+// Both halves have an `ExecutionLimits`, and the type `Computerwelt` below shadows the
+// namespace of the same name inside it — so the Python one is reached by alias.
+using PythonLimits = Computerwelt.Emulation.Python.Runtime.ExecutionLimits;
 
 namespace Computerwelt;
 
@@ -50,7 +54,7 @@ public sealed class PythonBuiltin : IBuiltin
             return error;
         }
 
-        var runner = new MontyRunner(new Monty.Runtime.ExecutionLimits
+        var runner = new MontyRunner(new PythonLimits
         {
             MaxInstructions = _options.MaxInstructions,
             MaxRecursionDepth = _options.MaxRecursionDepth,

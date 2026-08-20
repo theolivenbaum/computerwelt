@@ -1,16 +1,16 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Computerwelt.Cli/Computerwelt.Cli.csproj" />
-    <Project Path="src/Bashkit/Bashkit.csproj" />
+    <Project Path="src/Computerwelt.Emulation.Bash/Computerwelt.Emulation.Bash.csproj" />
     <Project Path="src/Computerwelt/Computerwelt.csproj" />
-    <Project Path="src/Monty.Cli/Monty.Cli.csproj" />
-    <Project Path="src/Monty/Monty.csproj" />
+    <Project Path="src/Computerwelt.Emulation.Python.Cli/Computerwelt.Emulation.Python.Cli.csproj" />
+    <Project Path="src/Computerwelt.Emulation.Python/Computerwelt.Emulation.Python.csproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/Bashkit.SpecTests/Bashkit.SpecTests.csproj" />
-    <Project Path="tests/Bashkit.Tests/Bashkit.Tests.csproj" />
+    <Project Path="tests/Computerwelt.Emulation.Bash.SpecTests/Computerwelt.Emulation.Bash.SpecTests.csproj" />
+    <Project Path="tests/Computerwelt.Emulation.Bash.Tests/Computerwelt.Emulation.Bash.Tests.csproj" />
     <Project Path="tests/Computerwelt.Tests/Computerwelt.Tests.csproj" />
-    <Project Path="tests/Monty.SpecTests/Monty.SpecTests.csproj" />
-    <Project Path="tests/Monty.Tests/Monty.Tests.csproj" />
+    <Project Path="tests/Computerwelt.Emulation.Python.SpecTests/Computerwelt.Emulation.Python.SpecTests.csproj" />
+    <Project Path="tests/Computerwelt.Emulation.Python.Tests/Computerwelt.Emulation.Python.Tests.csproj" />
   </Folder>
 </Solution>
