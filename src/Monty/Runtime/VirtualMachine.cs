@@ -151,10 +151,15 @@ public sealed class VirtualMachine
                 break;
 
             // Anything else in the slot — a class, a bound method, a non-callable — is
-            // called as it stands, with no receiver of ours.
+            // called as it stands, with no receiver of ours. It gets a recursion level of
+            // its own because `A.__init__ = A` re-enters here before any frame is pushed,
+            // and nothing else would charge the budget.
             case var other:
+            {
+                using var level = EnterRecursion();
                 Initialized(Call(other, arguments, keywords));
                 break;
+            }
         }
 
         return instance;
