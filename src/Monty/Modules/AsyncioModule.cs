@@ -38,7 +38,15 @@ public static class AsyncioModule
         // only the second one fail.
         module.Add("gather", new PyBuiltinFunction("gather", (arguments, keywords) =>
         {
-            _ = keywords;
+            // `return_exceptions` is the only keyword upstream defines, and it does not
+            // implement it either — so any keyword at all is refused rather than ignored.
+            if (keywords is { Count: > 0 })
+            {
+                throw new PyRaise(new PyException(
+                    PyExceptionType.NotImplementedError,
+                    "gather() does not yet support keyword arguments"));
+            }
+
             var awaited = arguments.ToArray();
 
             return new PyFuture(() =>

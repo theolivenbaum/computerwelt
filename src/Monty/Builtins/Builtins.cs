@@ -111,14 +111,54 @@ public static class BuiltinNamespace
 
 
 
+        // CPython parses enumerate's arguments by hand rather than through any of the
+        // shared parsers, and the quirks of that code are visible: with nothing positional
+        // a single keyword must be `iterable` and three keywords report the missing one
+        // instead, while a keyword alongside a positional must be `start`.
         Define("enumerate", static (arguments, keywords) =>
         {
-            string[] names = ["iterable", "start"];
-            var given = Bind("enumerate", names, arguments, keywords);
+            var named = keywords?.Entries.ToList() ?? [];
+            var given = new PyObject?[2];
+
+            if (arguments.Length == 0)
+            {
+                if (named.Count is 0 or > 2)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        "enumerate() missing required argument 'iterable'"));
+                }
+            }
+            else if (arguments.Length + named.Count > 2)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"enumerate() takes at most 2 arguments ({arguments.Length + named.Count} given)"));
+            }
+
+            for (var i = 0; i < arguments.Length; i++)
+            {
+                given[i] = arguments[i];
+            }
+
+            foreach (var (key, value) in named)
+            {
+                var word = key.Display();
+
+                // With a positional iterable only `start` remains; with a lone keyword only
+                // `iterable` is accepted; with two, either order will do.
+                var only = arguments.Length > 0 ? "start" : named.Count == 1 ? "iterable" : null;
+
+                if (only is not null ? word != only : word is not ("iterable" or "start"))
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"'{word}' is an invalid keyword argument for enumerate()"));
+                }
+
+                given[word == "iterable" ? 0 : 1] = value;
+            }
 
             if (given[0] is null)
             {
-                throw new PyRaise(PyErrors.TypeError("enumerate expected at least 1 argument, got 0"));
+                throw new PyRaise(PyErrors.TypeError("enumerate() missing required argument 'iterable'"));
             }
 
             // The iterable is checked first, so a bad one is reported before the start value
@@ -286,7 +326,7 @@ public static class BuiltinNamespace
             return new PyList(Sorting.Sort(machine, VirtualMachine.RequireIterable(arguments[0]), keywords));
         });
 
-        DefineArity("reversed", 1, 1, static arguments =>
+        DefineExact("reversed", 1, static arguments =>
         {
             // Being iterable is not enough: reversing needs a sequence with a length and
             // an order, which a one-shot iterator and an unordered set do not have.
@@ -309,6 +349,29 @@ public static class BuiltinNamespace
 
         Define("sum", static (arguments, keywords) =>
         {
+            var supplied = arguments.Length + (keywords?.Count ?? 0);
+
+            if (supplied > 2)
+            {
+                throw new PyRaise(PyErrors.TypeError($"sum() takes at most 2 arguments ({supplied} given)"));
+            }
+
+            // The iterable is positional-only, so naming it leaves its slot empty — which
+            // is reported before any keyword is looked at.
+            if (arguments.Length == 0)
+            {
+                throw new PyRaise(PyErrors.TypeError("sum() takes at least 1 positional argument (0 given)"));
+            }
+
+            foreach (var (key, _) in keywords?.Entries ?? [])
+            {
+                if (key.Display() != "start")
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"sum() got an unexpected keyword argument '{key.Display()}'"));
+                }
+            }
+
             var total = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "start") ?? new PyInt(0);
 
             // Summing strings is almost always a mistake and quadratic when it is not, so
@@ -350,8 +413,27 @@ public static class BuiltinNamespace
         // Both of round's parameters are keyword-capable in CPython.
         Define("round", static (arguments, keywords) =>
         {
+            var supplied = arguments.Length + (keywords?.Count ?? 0);
+
+            if (supplied > 2)
+            {
+                // With nothing positional the count being complained about is of keywords.
+                throw new PyRaise(PyErrors.TypeError(
+                    $"round() takes at most 2 {(arguments.Length == 0 ? "keyword arguments" : "arguments")} "
+                    + $"({supplied} given)"));
+            }
+
+            foreach (var (key, _) in keywords?.Entries ?? [])
+            {
+                if (key.Display() is not ("number" or "ndigits"))
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"round() got an unexpected keyword argument '{key.Display()}'"));
+                }
+            }
+
             var number = arguments.Length > 0 ? arguments[0] : Keyword(keywords, "number")
-                ?? throw new PyRaise(PyErrors.TypeError("round() missing required argument 'number'"));
+                ?? throw new PyRaise(PyErrors.TypeError("round() missing required argument 'number' (pos 1)"));
 
             var given = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "ndigits");
             var requested = given is null or PyNone ? BigInteger.Zero : RequireInt(given, "round");
@@ -912,8 +994,10 @@ public static class Conversions
 
         if (arguments.Length + keywordCount > 2)
         {
+            // With nothing positional the count being complained about is of keywords.
             throw new PyRaise(PyErrors.TypeError(
-                $"int() takes at most 2 arguments ({arguments.Length + keywordCount} given)"));
+                $"int() takes at most 2 {(arguments.Length == 0 ? "keyword arguments" : "arguments")} "
+                + $"({arguments.Length + keywordCount} given)"));
         }
 
         // The value is positional-only; `base` is the sole name a caller may spell.

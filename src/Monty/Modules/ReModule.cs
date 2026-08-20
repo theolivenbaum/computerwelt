@@ -151,20 +151,15 @@ public static class ReModule
     private static PyObject[] Bind(
         string name, PyObject[] arguments, PyDict? keywords, int minimum, params string[] names)
     {
-        if (arguments.Length > names.Length)
-        {
-            throw new PyRaise(PyErrors.TypeError(
-                $"{name}() takes from {minimum} to {names.Length} positional arguments "
-                + $"but {arguments.Length} were given"));
-        }
-
         var given = new PyObject?[names.Length];
 
-        for (var i = 0; i < arguments.Length; i++)
+        for (var i = 0; i < Math.Min(arguments.Length, names.Length); i++)
         {
             given[i] = arguments[i];
         }
 
+        // A Python `def` binds its keywords before it counts its positionals, so an unknown
+        // or duplicated keyword is reported even when there are surplus positionals too.
         foreach (var (key, value) in keywords?.Entries ?? [])
         {
             var position = Array.IndexOf(names, key.Display());
@@ -182,6 +177,13 @@ public static class ReModule
             }
 
             given[position] = value;
+        }
+
+        if (arguments.Length > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{name}() takes from {minimum} to {names.Length} positional arguments "
+                + $"but {arguments.Length} were given"));
         }
 
         // Only a leading run of supplied arguments is usable; a gap means the caller left

@@ -1110,9 +1110,12 @@ public sealed class VirtualMachine
                 var incoming = frame.Pop();
                 var keywordTarget = (PyDict)frame.Peek(instruction.Operand - 1);
 
-                // The callable sits under the positional list, which sits under the map.
+                // The callable sits under the positional list, which sits under the map. A
+                // bound method is named with its receiver's type, as CPython names it:
+                // `list.sort()`, not `sort()`.
                 var name = frame.Peek(instruction.Operand + 1) switch
                 {
+                    PyBoundMethod method => $"{method.Receiver.TypeName}.{method.Name}",
                     PyCallable callee => callee.Name,
                     PyExceptionType type => type.Name,
                     _ => "function",

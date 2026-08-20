@@ -185,7 +185,8 @@ public static class DatetimeModule
         int required,
         PyObject[] arguments,
         PyDict? keywords,
-        int? maxPositional = null)
+        int? maxPositional = null,
+        Action<int, PyObject>? check = null)
     {
         var positionalLimit = maxPositional ?? names.Length;
         var total = arguments.Length + (keywords?.Count ?? 0);
@@ -224,20 +225,31 @@ public static class DatetimeModule
 
             if (given[position] is not null)
             {
-                duplicate ??= position;
+                // Among several conflicts the earliest parameter is the one reported.
+                duplicate = duplicate is { } earlier ? Math.Min(earlier, position) : position;
                 continue;
             }
 
             given[position] = value;
         }
 
-        for (var i = 0; i < required; i++)
+        // The parameters are walked in order, checking each as it goes: a missing one is
+        // reported before a later parameter's value is even looked at, and a bad value
+        // before either of the leftover keyword complaints below.
+        for (var i = 0; i < names.Length; i++)
         {
             if (given[i] is null)
             {
-                throw new PyRaise(PyErrors.TypeError(
-                    $"{function} missing required argument '{names[i]}' (pos {i + 1})"));
+                if (i < required)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"{function} missing required argument '{names[i]}' (pos {i + 1})"));
+                }
+
+                continue;
             }
+
+            check?.Invoke(i, given[i]!);
         }
 
         if (duplicate is { } clash)
@@ -767,7 +779,13 @@ public static class DatetimeModule
         /// <inheritdoc />
         public PyObject Construct(PyObject[] arguments, PyDict? keywords)
         {
-            var given = Bind("function", ["year", "month", "day"], 3, arguments, keywords);
+            var given = Bind(
+                "function",
+                ["year", "month", "day"],
+                3,
+                arguments,
+                keywords,
+                check: static (_, value) => Component(value, 0));
 
             var fields = Checked(
                 Component(given[0], 1), Component(given[1], 1), Component(given[2], 1), 0, 0, 0, 0);
@@ -853,7 +871,18 @@ public static class DatetimeModule
             string[] names =
                 ["year", "month", "day", "hour", "minute", "second", "microsecond", "tzinfo", "fold"];
 
-            var given = Bind("function", names, 3, arguments, keywords, maxPositional: 8);
+            var given = Bind(
+                "function",
+                names,
+                3,
+                arguments,
+                keywords,
+                maxPositional: 8,
+                check: static (position, value) =>
+                {
+                    // Every parameter but the timezone is an integer component.
+                    _ = position == 7 ? Zone(value) : (object?)Component(value, 0);
+                });
 
             var fields = Checked(
                 Component(given[0], 1),

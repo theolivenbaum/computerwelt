@@ -64,13 +64,20 @@ public static class BuiltinMethods
         {
             if (arguments.Length < minimum || arguments.Length > maximum)
             {
-                // Sequence methods word this differently from mapping methods, and the
-                // fixtures compare the message.
-                throw new PyRaise(PyErrors.TypeError(self is PyList or PyTuple or PyStr or PySet
-                    ? $"{self.TypeName}.{name}() takes exactly {(minimum == 1 ? "one argument" : minimum + " arguments")} ({arguments.Length} given)"
-                    : arguments.Length < minimum
-                        ? $"{name} expected at least {minimum} argument{(minimum == 1 ? string.Empty : "s")}, got {arguments.Length}"
-                        : $"{name} expected at most {maximum} argument{(maximum == 1 ? string.Empty : "s")}, got {arguments.Length}"));
+                // Three wordings, and which one a method uses is not a matter of taste: a
+                // fixed-arity method of a sequence type names its type and says "exactly";
+                // one with a range of arities uses the argument clinic's "at least"; every
+                // other method uses the older "expected" form. Scripts match on all three.
+                throw new PyRaise(PyErrors.TypeError(
+                    self is PyList or PyTuple or PyStr or PySet && minimum == maximum
+                        ? $"{self.TypeName}.{name}() takes exactly {(minimum == 1 ? "one argument" : minimum + " arguments")} ({arguments.Length} given)"
+                        : self is PyStr
+                            ? arguments.Length < minimum
+                                ? $"{name}() takes at least {minimum} positional argument{(minimum == 1 ? string.Empty : "s")} ({arguments.Length} given)"
+                                : $"{name}() takes at most {maximum} argument{(maximum == 1 ? string.Empty : "s")} ({arguments.Length} given)"
+                            : arguments.Length < minimum
+                                ? $"{name} expected at least {minimum} argument{(minimum == 1 ? string.Empty : "s")}, got {arguments.Length}"
+                                : $"{name} expected at most {maximum} argument{(maximum == 1 ? string.Empty : "s")}, got {arguments.Length}"));
             }
 
             return implementation(self, arguments, keywords);
@@ -89,8 +96,11 @@ public static class BuiltinMethods
 
         if (total > maximum)
         {
+            // With nothing positional the count being complained about is of keywords.
+            var kind = arguments.Length == 0 ? "keyword argument" : "argument";
+
             throw new PyRaise(PyErrors.TypeError(
-                $"{method}() takes at most {maximum} argument{(maximum == 1 ? string.Empty : "s")} ({total} given)"));
+                $"{method}() takes at most {maximum} {kind}{(maximum == 1 ? string.Empty : "s")} ({total} given)"));
         }
     }
 
@@ -254,7 +264,7 @@ public static class BuiltinMethods
                 });
 
             case "replace":
-                return Method(name, receiver, 2, (self, arguments, keywords) =>
+                return Method(name, receiver, 2, 3, (self, arguments, keywords) =>
                 {
                     var text = ((PyStr)self).Value;
                     var from = Text(arguments[0], name, 1);
@@ -495,11 +505,15 @@ public static class BuiltinMethods
                 });
 
             case "encode":
-                return Method(name, receiver, 0, 2, static (self, arguments, keywords) =>
-                    new PyBytes(Codecs.Encode(
+                return Method(name, receiver, static (self, arguments, keywords) =>
+                {
+                    var given = Clinic("encode", ["encoding", "errors"], arguments, keywords);
+
+                    return new PyBytes(Codecs.Encode(
                         ((PyStr)self).Value,
-                        CodecArgument("encode", arguments, keywords, 0, "encoding", "utf-8"),
-                        CodecArgument("encode", arguments, keywords, 1, "errors", "strict"))));
+                        CodecArgument("encode", given, 0, "encoding", "utf-8"),
+                        CodecArgument("encode", given, 1, "errors", "strict")));
+                });
 
             case "casefold":
                 return Method(name, receiver, static (self, _, _) =>
@@ -893,7 +907,7 @@ public static class BuiltinMethods
                 });
 
             case "update":
-                return Method(name, receiver, static (self, arguments, keywords) =>
+                return Method(name, receiver, 0, 1, static (self, arguments, keywords) =>
                 {
                     var dict = (PyDict)self;
 
@@ -1245,11 +1259,15 @@ public static class BuiltinMethods
         switch (name)
         {
             case "decode":
-                return Method(name, receiver, 0, 2, static (self, arguments, keywords) =>
-                    new PyStr(Codecs.Decode(
+                return Method(name, receiver, static (self, arguments, keywords) =>
+                {
+                    var given = Clinic("decode", ["encoding", "errors"], arguments, keywords);
+
+                    return new PyStr(Codecs.Decode(
                         ((PyBytes)self).Value,
-                        CodecArgument("decode", arguments, keywords, 0, "encoding", "utf-8"),
-                        CodecArgument("decode", arguments, keywords, 1, "errors", "strict"))));
+                        CodecArgument("decode", given, 0, "encoding", "utf-8"),
+                        CodecArgument("decode", given, 1, "errors", "strict")));
+                });
 
             case "fromhex":
                 // A classmethod, so it also answers on an instance and ignores its value.
@@ -1320,22 +1338,67 @@ public static class BuiltinMethods
     /// or by name. A wrong type is reported the way CPython's argument clinic does, which
     /// spells a lone <c>None</c> as "None" rather than "NoneType".
     /// </summary>
-    private static string CodecArgument(
-        string method, PyObject[] arguments, PyDict? keywords, int position, string name, string fallback)
-    {
-        var given = arguments.Length > position ? arguments[position]
-            : keywords?.TryGetValue(new PyStr(name), out var named) == true ? named
-            : null;
-
-        return given switch
+    private static string CodecArgument(string method, PyObject?[] given, int position, string name, string fallback) =>
+        given[position] switch
         {
             null => fallback,
             PyStr text => text.Value,
             PyNone => throw new PyRaise(PyErrors.TypeError(
                 $"{method}() argument '{name}' must be str, not None")),
-            _ => throw new PyRaise(PyErrors.TypeError(
-                $"{method}() argument '{name}' must be str, not {given.TypeName}")),
+            var bad => throw new PyRaise(PyErrors.TypeError(
+                $"{method}() argument '{name}' must be str, not {bad.TypeName}")),
         };
+
+    /// <summary>
+    /// Binds a method's arguments the way the argument clinic does.
+    /// </summary>
+    /// <remarks>
+    /// Binding happens in full before any value is converted, which is why an unknown
+    /// keyword or a duplicated parameter is reported even when a positional also has the
+    /// wrong type.
+    /// </remarks>
+    private static PyObject?[] Clinic(string method, string[] names, PyObject[] arguments, PyDict? keywords)
+    {
+        Total(method, arguments, keywords, names.Length);
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            given[i] = arguments[i];
+        }
+
+        string? unknown = null;
+        int? conflict = null;
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                unknown ??= key.Display();
+            }
+            else if (given[position] is not null)
+            {
+                conflict ??= position;
+            }
+            else
+            {
+                given[position] = value;
+            }
+        }
+
+        if (conflict is { } clash)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"argument for {method}() given by name ('{names[clash]}') and position ({clash + 1})"));
+        }
+
+        return unknown is null
+            ? given
+            : throw new PyRaise(PyErrors.TypeError(
+                $"{method}() got an unexpected keyword argument '{unknown}'"));
     }
 
     /// <summary>
