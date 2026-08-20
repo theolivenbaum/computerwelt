@@ -55,76 +55,168 @@ public static class OsModule
 
         module.Add("fspath", new PyBuiltinFunction("fspath", (arguments, keywords) =>
         {
-            if (arguments.Length > 1)
-            {
-                throw new PyRaise(PyErrors.TypeError(
-                    $"fspath() takes at most 1 argument ({arguments.Length} given)"));
-            }
+            var given = Clinic("fspath", ["path"], arguments, keywords, maxPositional: 1, required: 1);
 
-            if (arguments.Length == 0 && keywords is { Count: > 1 })
+            return given[0] switch
             {
-                throw new PyRaise(PyErrors.TypeError(
-                    $"fspath() takes at most 1 keyword argument ({keywords.Count} given)"));
-            }
-
-            var value = arguments.Length > 0 ? arguments[0] : Keyword(keywords, "path");
-
-            return value switch
-            {
-                PyStr or PyBytes => value,
+                PyStr or PyBytes => given[0]!,
                 PyPath path => new PyStr(path.Value),
-                null => throw new PyRaise(PyErrors.TypeError(
-                    "fspath() missing required argument 'path' (pos 1)")),
                 _ => throw new PyRaise(PyErrors.TypeError(
-                    $"expected str, bytes or os.PathLike object, not {value.TypeName}")),
+                    $"expected str, bytes or os.PathLike object, not {given[0]!.TypeName}")),
             };
         }));
 
-        Add(module, "getcwd", 0, 0, (_, _) => new PyStr(fileSystem.WorkingDirectory));
-        Add(module, "listdir", 0, 1, (arguments, _) => new PyList(
-            [.. fileSystem.List(PathOf(arguments, 0, fileSystem.WorkingDirectory))
-                .OrderBy(static name => name, StringComparer.Ordinal)
-                .Select(static name => (PyObject)new PyStr(name))]));
-
-        Add(module, "mkdir", 1, 2, (arguments, _) =>
+        module.Add("getcwd", new PyBuiltinFunction("getcwd", (arguments, keywords) =>
         {
-            fileSystem.CreateDirectory(PathOf(arguments, 0, "."), parents: false, existsOk: false);
-            return PyNone.Instance;
-        });
+            _ = Clinic("getcwd", [], arguments, keywords, maxPositional: 0, required: 0);
+            return new PyStr(fileSystem.WorkingDirectory);
+        }));
 
-        Add(module, "makedirs", 1, 2, (arguments, keywords) =>
+        module.Add("listdir", new PyBuiltinFunction("listdir", (arguments, keywords) =>
         {
-            fileSystem.CreateDirectory(
-                PathOf(arguments, 0, "."),
-                parents: true,
-                existsOk: Keyword(keywords, "exist_ok")?.IsTruthy() ?? false);
+            var given = Clinic("listdir", ["path"], arguments, keywords, maxPositional: 1, required: 0);
 
-            return PyNone.Instance;
-        });
+            // A None path means the working directory, which is why this converter mentions
+            // it where the others do not.
+            var target = given[0] is null or PyNone
+                ? fileSystem.WorkingDirectory
+                : Located(given[0]!, "listdir", "path", "string, bytes, os.PathLike, integer or None");
 
-        Add(module, "remove", 1, 1, (arguments, _) =>
+            return new PyList(
+                [.. fileSystem.List(target)
+                    .OrderBy(static name => name, StringComparer.Ordinal)
+                    .Select(static name => (PyObject)new PyStr(name))]);
+        }));
+
+        module.Add("stat", new PyBuiltinFunction("stat", (arguments, keywords) =>
         {
-            fileSystem.Remove(PathOf(arguments, 0, "."));
-            return PyNone.Instance;
-        });
+            var given = Clinic(
+                "stat",
+                ["path", "dir_fd", "follow_symlinks"],
+                arguments,
+                keywords,
+                maxPositional: 1,
+                required: 1);
 
-        Add(module, "unlink", 1, 1, (arguments, _) =>
-        {
-            fileSystem.Remove(PathOf(arguments, 0, "."));
-            return PyNone.Instance;
-        });
+            var target = Located(given[0]!, "stat", "path", "string, bytes, os.PathLike or integer");
+            Descriptor(given[1]);
 
-        Add(module, "rmdir", 1, 1, (arguments, _) =>
-        {
-            fileSystem.RemoveDirectory(PathOf(arguments, 0, "."));
-            return PyNone.Instance;
-        });
+            return new PyStat(
+                fileSystem.Mode(target),
+                fileSystem.IsDirectory(target) ? 0 : fileSystem.Size(target),
+                fileSystem.ModifiedAt(target));
+        }));
 
-        Add(module, "rename", 2, 2, (arguments, _) =>
+        module.Add("mkdir", new PyBuiltinFunction("mkdir", (arguments, keywords) =>
         {
-            fileSystem.Rename(PathOf(arguments, 0, "."), PathOf(arguments, 1, "."));
+            var given = Clinic(
+                "mkdir",
+                ["path", "mode", "dir_fd"],
+                arguments,
+                keywords,
+                maxPositional: 2,
+                required: 1,
+                exactPositional: false);
+
+            var target = Located(given[0]!, "mkdir", "path", "string, bytes or os.PathLike");
+            Permissions(given[1]);
+            Descriptor(given[2]);
+
+            fileSystem.CreateDirectory(target, parents: false, existsOk: false);
             return PyNone.Instance;
-        });
+        }));
+
+        // `makedirs` is written in Python upstream rather than in C, so its arity and
+        // converter complaints are the interpreter's own rather than the clinic's.
+        module.Add("makedirs", new PyBuiltinFunction("makedirs", (arguments, keywords) =>
+        {
+            string[] names = ["name", "mode", "exist_ok"];
+
+            if (arguments.Length > names.Length)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"makedirs() takes from 1 to {names.Length} positional arguments but {arguments.Length} were given"));
+            }
+
+            var given = new PyObject?[names.Length];
+
+            for (var i = 0; i < arguments.Length; i++)
+            {
+                given[i] = arguments[i];
+            }
+
+            foreach (var (key, value) in keywords?.Entries ?? [])
+            {
+                var position = Array.IndexOf(names, key.Display());
+
+                if (position < 0)
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"makedirs() got an unexpected keyword argument '{key.Display()}'"));
+                }
+
+                given[position] = value;
+            }
+
+            if (given[0] is null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    "makedirs() missing 1 required positional argument: 'name'"));
+            }
+
+            var target = Text(given[0]!);
+            Permissions(given[1]);
+
+            fileSystem.CreateDirectory(target, parents: true, existsOk: given[2]?.IsTruthy() ?? false);
+            return PyNone.Instance;
+        }));
+
+        foreach (var name in new[] { "remove", "unlink" })
+        {
+            module.Add(name, new PyBuiltinFunction(name, (arguments, keywords) =>
+            {
+                var given = Clinic(name, ["path", "dir_fd"], arguments, keywords, maxPositional: 1, required: 1);
+                var target = Located(given[0]!, name, "path", "string, bytes or os.PathLike");
+                Descriptor(given[1]);
+
+                fileSystem.Remove(target);
+                return PyNone.Instance;
+            }));
+        }
+
+        module.Add("rmdir", new PyBuiltinFunction("rmdir", (arguments, keywords) =>
+        {
+            var given = Clinic("rmdir", ["path", "dir_fd"], arguments, keywords, maxPositional: 1, required: 1);
+            var target = Located(given[0]!, "rmdir", "path", "string, bytes or os.PathLike");
+            Descriptor(given[1]);
+
+            fileSystem.RemoveDirectory(target);
+            return PyNone.Instance;
+        }));
+
+        // `replace` overwrites where `rename` refuses to; the virtual filesystem's rename
+        // already does, so the two share one implementation.
+        foreach (var name in new[] { "rename", "replace" })
+        {
+            module.Add(name, new PyBuiltinFunction(name, (arguments, keywords) =>
+            {
+                var given = Clinic(
+                    name,
+                    ["src", "dst", "src_dir_fd", "dst_dir_fd"],
+                    arguments,
+                    keywords,
+                    maxPositional: 2,
+                    required: 2);
+
+                var from = Located(given[0]!, name, "src", "string, bytes or os.PathLike");
+                var to = Located(given[1]!, name, "dst", "string, bytes or os.PathLike");
+                Descriptor(given[2]);
+                Descriptor(given[3]);
+
+                fileSystem.Rename(from, to);
+                return PyNone.Instance;
+            }));
+        }
 
         module.Add("path", CreatePath(fileSystem));
         return module;
@@ -318,6 +410,160 @@ public static class OsModule
         _ => throw new PyRaise(PyErrors.TypeError(
             $"expected str, bytes or os.PathLike object, not {value.TypeName}")),
     };
+
+    /// <summary>
+    /// Binds an <c>os</c> function's arguments the way CPython's argument clinic does.
+    /// </summary>
+    /// <remarks>
+    /// The wording of every complaint here is the clinic's, down to which count the number
+    /// in parentheses refers to and which check fires first — scripts match on these, and
+    /// the order is not the obvious one: the total count is checked before the positional
+    /// count, and a missing required argument is reported before an unknown keyword.
+    /// </remarks>
+    /// <param name="name">The function's name.</param>
+    /// <param name="names">Every parameter name, in order.</param>
+    /// <param name="arguments">The positional arguments.</param>
+    /// <param name="keywords">The keyword arguments, if any.</param>
+    /// <param name="maxPositional">How many parameters may be given positionally.</param>
+    /// <param name="required">How many leading parameters must be supplied.</param>
+    /// <param name="exactPositional">
+    /// True when the positional count is fixed, which words the complaint "exactly" rather
+    /// than "at most".
+    /// </param>
+    /// <returns>One slot per name, null where nothing was given.</returns>
+    private static PyObject?[] Clinic(
+        string name,
+        string[] names,
+        PyObject[] arguments,
+        PyDict? keywords,
+        int maxPositional,
+        int required,
+        bool exactPositional = true)
+    {
+        var total = arguments.Length + (keywords?.Count ?? 0);
+
+        if (total > names.Length)
+        {
+            // With nothing positional the count being complained about is of keywords.
+            throw new PyRaise(PyErrors.TypeError(arguments.Length == 0
+                ? $"{name}() takes at most {names.Length} keyword argument{Plural(names.Length)} ({total} given)"
+                : $"{name}() takes at most {names.Length} argument{Plural(names.Length)} ({total} given)"));
+        }
+
+        if (arguments.Length > maxPositional)
+        {
+            throw new PyRaise(PyErrors.TypeError(exactPositional
+                ? $"{name}() takes exactly {maxPositional} positional argument{Plural(maxPositional)} ({arguments.Length} given)"
+                : $"{name}() takes at most {maxPositional} positional argument{Plural(maxPositional)} ({arguments.Length} given)"));
+        }
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            given[i] = arguments[i];
+        }
+
+        string? unknown = null;
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                unknown ??= key.Display();
+                continue;
+            }
+
+            if (given[position] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"argument for {name}() given by name ('{names[position]}') and position ({position + 1})"));
+            }
+
+            given[position] = value;
+        }
+
+        // A missing required argument is reported before an unknown keyword.
+        for (var i = 0; i < required; i++)
+        {
+            if (given[i] is null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{name}() missing required argument '{names[i]}' (pos {i + 1})"));
+            }
+        }
+
+        return unknown is null
+            ? given
+            : throw new PyRaise(PyErrors.TypeError(
+                $"{name}() got an unexpected keyword argument '{unknown}'"));
+    }
+
+    private static string Plural(int count) => count == 1 ? string.Empty : "s";
+
+    /// <summary>Reads a path argument, wording its refusal the way the named function does.</summary>
+    private static string Located(PyObject value, string function, string parameter, string kinds) =>
+        value switch
+        {
+            PyStr text => text.Value,
+            PyPath path => path.Value,
+            PyBytes bytes => Encoding.UTF8.GetString(bytes.Value),
+            _ => throw new PyRaise(PyErrors.TypeError(
+                $"{function}: {parameter} should be {kinds}, not {value.TypeName}")),
+        };
+
+    /// <summary>Checks a directory-descriptor argument, which this sandbox only accepts unset.</summary>
+    private static void Descriptor(PyObject? value)
+    {
+        if (value is null or PyNone)
+        {
+            return;
+        }
+
+        // The value goes through a C int before anything looks at it, so an out-of-range
+        // one is an overflow rather than a bad descriptor.
+        if (value is not PyInt number)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"argument should be integer or None, not {value.TypeName}"));
+        }
+
+        if (number.Value > int.MaxValue)
+        {
+            throw new PyRaise(new PyException(PyExceptionType.OverflowError, "fd is greater than maximum"));
+        }
+
+        if (number.Value < int.MinValue)
+        {
+            throw new PyRaise(new PyException(PyExceptionType.OverflowError, "fd is less than minimum"));
+        }
+
+        throw new PyRaise(new PyException(
+            PyExceptionType.NotImplementedError, "dir_fd unavailable on this platform"));
+    }
+
+    /// <summary>Checks a mode argument, which is converted through a C int before use.</summary>
+    private static void Permissions(PyObject? value)
+    {
+        switch (value)
+        {
+            case null or PyNone:
+                return;
+
+            case PyInt number when number.Value >= int.MinValue && number.Value <= int.MaxValue:
+                return;
+
+            case PyInt:
+                throw new PyRaise(new PyException(
+                    PyExceptionType.OverflowError, "Python int too large to convert to C int"));
+
+            default:
+                throw new PyRaise(PyErrors.TypeError(
+                    $"'{value.TypeName}' object cannot be interpreted as an integer"));
+        }
+    }
 
     private static void Add(
         PyModuleObject module,

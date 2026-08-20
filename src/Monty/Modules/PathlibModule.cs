@@ -287,8 +287,10 @@ public sealed class PyPath : PyObject
                 return new PyBuiltinFunction("open", (arguments, keywords) =>
                     OsModule.Open(Storage(), [this, .. arguments], keywords));
 
+            // The decode is strict, as `read_text` is: a file that is not UTF-8 raises
+            // rather than coming back with replacement characters in it.
             case "read_text":
-                return Builtin(name, _ => new PyStr(System.Text.Encoding.UTF8.GetString(Storage().Read(Value))));
+                return Builtin(name, _ => new PyStr(Codecs.Decode(Storage().Read(Value), "utf-8", "strict")));
 
             case "read_bytes":
                 return Builtin(name, _ => new PyBytes(Storage().Read(Value)));
@@ -296,6 +298,18 @@ public sealed class PyPath : PyObject
             case "write_text":
                 return Builtin(name, arguments =>
                 {
+                    if (arguments.Length == 0)
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            "Path.write_text() missing 1 required positional argument: 'data'"));
+                    }
+
+                    if (arguments[0] is not PyStr)
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            $"data must be str, not {arguments[0].TypeName}"));
+                    }
+
                     // The count is of characters written, not of the bytes they encode to.
                     var text = Text(arguments[0]);
                     Storage().Write(Value, System.Text.Encoding.UTF8.GetBytes(text));
@@ -306,7 +320,18 @@ public sealed class PyPath : PyObject
             case "write_bytes":
                 return Builtin(name, arguments =>
                 {
-                    var bytes = arguments[0] is PyBytes payload ? payload.Value : [];
+                    if (arguments.Length == 0)
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            "Path.write_bytes() missing 1 required positional argument: 'data'"));
+                    }
+
+                    // The argument goes through a memoryview upstream, which is what names
+                    // itself when the value is not bytes-like.
+                    var bytes = arguments[0] is PyBytes payload
+                        ? payload.Value
+                        : throw new PyRaise(PyErrors.TypeError(
+                            $"memoryview: a bytes-like object is required, not '{arguments[0].TypeName}'"));
                     Storage().Write(Value, bytes);
                     return new PyInt(bytes.Length);
                 });

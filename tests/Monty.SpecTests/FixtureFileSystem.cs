@@ -58,27 +58,67 @@ public sealed class FixtureFileSystem : IPyFileSystem
     public bool IsDirectory(string path) => _directories.Contains(Absolute(path));
 
     /// <inheritdoc />
-    public byte[] Read(string path) =>
-        _files.TryGetValue(Absolute(path), out var content)
-            ? content
-            : throw new PyRaise(new PyException(
-                PyExceptionType.FileNotFoundError,
-                $"[Errno 2] No such file or directory: '{path}'"));
+    public byte[] Read(string path)
+    {
+        var full = Reachable(path);
+
+        if (_files.TryGetValue(full, out var content))
+        {
+            return content;
+        }
+
+        throw new PyRaise(new PyException(
+            _directories.Contains(full) ? PyExceptionType.IsADirectoryError : PyExceptionType.FileNotFoundError,
+            _directories.Contains(full)
+                ? $"[Errno 21] Is a directory: '{path}'"
+                : $"[Errno 2] No such file or directory: '{path}'"));
+    }
 
     /// <inheritdoc />
-    public void Write(string path, byte[] content) => _files[Absolute(path)] = content;
+    public void Write(string path, byte[] content) => _files[Writable(path)] = content;
 
     /// <inheritdoc />
     public void Append(string path, byte[] content)
     {
-        var full = Absolute(path);
+        var full = Writable(path);
         _files[full] = _files.TryGetValue(full, out var existing) ? [.. existing, .. content] : content;
+    }
+
+    /// <summary>Resolves a path to write to, refusing one that cannot hold a file.</summary>
+    private string Writable(string path)
+    {
+        var full = Reachable(path);
+
+        if (_directories.Contains(full))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.IsADirectoryError,
+                $"[Errno 21] Is a directory: '{path}'"));
+        }
+
+        if (!_directories.Contains(Parent(full)))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.FileNotFoundError,
+                $"[Errno 2] No such file or directory: '{path}'"));
+        }
+
+        return full;
     }
 
     /// <inheritdoc />
     public void Remove(string path)
     {
-        if (!_files.Remove(Absolute(path)))
+        var full = Reachable(path);
+
+        if (_directories.Contains(full))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.IsADirectoryError,
+                $"[Errno 21] Is a directory: '{path}'"));
+        }
+
+        if (!_files.Remove(full))
         {
             throw new PyRaise(new PyException(
                 PyExceptionType.FileNotFoundError,
@@ -89,7 +129,16 @@ public sealed class FixtureFileSystem : IPyFileSystem
     /// <inheritdoc />
     public void CreateDirectory(string path, bool parents, bool existsOk)
     {
-        var full = Absolute(path);
+        var full = Reachable(path);
+
+        // A file already occupying the name is a FileExistsError whatever `exist_ok` says:
+        // the path exists, and it is not the directory that was asked for.
+        if (_files.ContainsKey(full))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.FileExistsError,
+                $"[Errno 17] File exists: '{path}'"));
+        }
 
         if (_directories.Contains(full))
         {
@@ -129,7 +178,30 @@ public sealed class FixtureFileSystem : IPyFileSystem
     }
 
     /// <inheritdoc />
-    public void RemoveDirectory(string path) => _directories.Remove(Absolute(path));
+    public void RemoveDirectory(string path)
+    {
+        var full = Reachable(path);
+
+        if (_directories.Contains(full) && Occupied(full))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.OSError,
+                $"[Errno 39] Directory not empty: '{path}'"));
+        }
+
+        // Removing something that is not there is an error, not a no-op — and a file in a
+        // directory's place is a different error again.
+        if (!_directories.Contains(full))
+        {
+            throw new PyRaise(new PyException(
+                _files.ContainsKey(full) ? PyExceptionType.NotADirectoryError : PyExceptionType.FileNotFoundError,
+                _files.ContainsKey(full)
+                    ? $"[Errno 20] Not a directory: '{path}'"
+                    : $"[Errno 2] No such file or directory: '{path}'"));
+        }
+
+        _directories.Remove(full);
+    }
 
     /// <inheritdoc />
     public IReadOnlyList<string> List(string path)
@@ -173,23 +245,80 @@ public sealed class FixtureFileSystem : IPyFileSystem
     /// <inheritdoc />
     public void Rename(string from, string to)
     {
-        var source = Absolute(from);
+        var source = Reachable(from);
+        var target = Reachable(to);
 
-        if (!_files.TryGetValue(source, out var content))
+        if (_files.TryGetValue(source, out var content))
+        {
+            _files.Remove(source);
+            _files[target] = content;
+            return;
+        }
+
+        if (!_directories.Contains(source))
         {
             throw new PyRaise(new PyException(
                 PyExceptionType.FileNotFoundError,
                 $"[Errno 2] No such file or directory: '{from}'"));
         }
 
-        _files.Remove(source);
-        _files[Absolute(to)] = content;
+        // A directory may be renamed onto an empty directory, taking its place; onto one
+        // that still holds anything it may not.
+        if (_directories.Contains(target) && Occupied(target))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.OSError,
+                $"[Errno 39] Directory not empty: '{to}'"));
+        }
+
+        var prefix = source + "/";
+
+        foreach (var directory in _directories.Where(d => d == source || d.StartsWith(prefix, StringComparison.Ordinal)).ToList())
+        {
+            _directories.Remove(directory);
+            _directories.Add(target + directory[source.Length..]);
+        }
+
+        foreach (var file in _files.Keys.Where(f => f.StartsWith(prefix, StringComparison.Ordinal)).ToList())
+        {
+            _files[target + file[source.Length..]] = _files[file];
+            _files.Remove(file);
+        }
+    }
+
+    /// <summary>Whether a directory still holds anything.</summary>
+    private bool Occupied(string directory)
+    {
+        var prefix = directory + "/";
+
+        return _files.Keys.Any(f => f.StartsWith(prefix, StringComparison.Ordinal))
+            || _directories.Any(d => d.StartsWith(prefix, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Resolves a path, refusing one no POSIX filesystem would accept.
+    /// </summary>
+    /// <remarks>
+    /// The limits are the usual ones — 255 bytes per component, 4096 for the whole path —
+    /// and they are checked before the tree is, because that is when the kernel checks them.
+    /// </remarks>
+    private string Reachable(string path)
+    {
+        var full = Absolute(path);
+
+        var tooLong = Encoding.UTF8.GetByteCount(full) > 4096
+            || full.Split('/').Any(static part => Encoding.UTF8.GetByteCount(part) > 255);
+
+        return tooLong
+            ? throw new PyRaise(new PyException(
+                PyExceptionType.OSError, $"[Errno 36] File name too long: '{path}'"))
+            : full;
     }
 
     /// <inheritdoc />
     public int Mode(string path)
     {
-        var full = Absolute(path);
+        var full = Reachable(path);
 
         if (_directories.Contains(full))
         {
