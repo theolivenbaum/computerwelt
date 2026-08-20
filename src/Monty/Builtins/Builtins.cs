@@ -116,23 +116,35 @@ public static class BuiltinNamespace
 
         DefinePositional("zip", static arguments =>
         {
-            var sequences = arguments.Select(static a => VirtualMachine.RequireIterable(a).ToList()).ToList();
+            // Lazy, so zipping against an endless source such as `itertools.count()`
+            // terminates: the shortest side ends it.
+            var sources = arguments.Select(static a => VirtualMachine.RequireIterable(a).GetEnumerator()).ToList();
+            var spent = sources.Count == 0;
 
-            if (sequences.Count == 0)
-            {
-                return new PyIterator([]);
-            }
+            return new PyIterator(
+                () =>
+                {
+                    if (spent)
+                    {
+                        return null;
+                    }
 
-            // Zipping stops at the shortest sequence.
-            var length = sequences.Min(static s => s.Count);
-            var rows = new List<PyObject>(length);
+                    var row = new List<PyObject>(sources.Count);
 
-            for (var i = 0; i < length; i++)
-            {
-                rows.Add(new PyTuple(sequences.Select(sequence => sequence[i]).ToList()));
-            }
+                    foreach (var source in sources)
+                    {
+                        if (!source.MoveNext())
+                        {
+                            spent = true;
+                            return null;
+                        }
 
-            return new PyIterator(rows);
+                        row.Add(source.Current);
+                    }
+
+                    return new PyTuple(row);
+                },
+                "zip");
         });
 
         builtins.Set(new PyStr("map"), new PyBuiltinFunction("map", arguments =>
@@ -144,35 +156,61 @@ public static class BuiltinNamespace
             }
 
             var function = arguments[0];
-            var sequences = arguments.Skip(1).Select(static a => VirtualMachine.RequireIterable(a).ToList()).ToList();
-            var length = sequences.Count == 0 ? 0 : sequences.Min(static s => s.Count);
-            var results = new List<PyObject>(length);
+            var sources = arguments.Skip(1)
+                .Select(static a => VirtualMachine.RequireIterable(a).GetEnumerator()).ToList();
 
-            for (var i = 0; i < length; i++)
-            {
-                results.Add(machine.Call(function, [.. sequences.Select(sequence => sequence[i])]));
-            }
+            var spent = false;
 
-            return new PyIterator(results);
+            return new PyIterator(
+                () =>
+                {
+                    if (spent)
+                    {
+                        return null;
+                    }
+
+                    var row = new List<PyObject>(sources.Count);
+
+                    foreach (var source in sources)
+                    {
+                        if (!source.MoveNext())
+                        {
+                            spent = true;
+                            return null;
+                        }
+
+                        row.Add(source.Current);
+                    }
+
+                    return machine.Call(function, [.. row]);
+                },
+                "map");
         }));
 
         DefineArity("filter", 2, 2, arguments =>
         {
             var predicate = arguments[0];
-            var results = new List<PyObject>();
+            var source = VirtualMachine.RequireIterable(arguments[1]).GetEnumerator();
 
-            foreach (var item in VirtualMachine.RequireIterable(arguments[1]))
-            {
-                // A None predicate filters on truthiness alone.
-                var keep = predicate is PyNone ? item.IsTruthy() : machine.Call(predicate, [item]).IsTruthy();
-
-                if (keep)
+            return new PyIterator(
+                () =>
                 {
-                    results.Add(item);
-                }
-            }
+                    while (source.MoveNext())
+                    {
+                        // A None predicate filters on truthiness alone.
+                        var keep = predicate is PyNone
+                            ? source.Current.IsTruthy()
+                            : machine.Call(predicate, [source.Current]).IsTruthy();
 
-            return new PyIterator(results);
+                        if (keep)
+                        {
+                            return source.Current;
+                        }
+                    }
+
+                    return null;
+                },
+                "filter");
         });
 
         Define("sorted", (arguments, keywords) =>

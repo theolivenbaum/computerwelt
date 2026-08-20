@@ -568,8 +568,17 @@ public sealed class PyIterator : PyObject
     /// <inheritdoc />
     public override string TypeName { get; }
 
+    /// <summary>
+    /// A repr for an iterator that shows its state, such as <c>count(2, 2)</c>.
+    /// </summary>
+    /// <remarks>
+    /// Most iterators print as an opaque object, but itertools' generators show their
+    /// arguments — and <c>count</c> shows its current position rather than its start.
+    /// </remarks>
+    public Func<string>? Describe { get; init; }
+
     /// <inheritdoc />
-    public override string Repr() => $"<{TypeName} object>";
+    public override string Repr() => Describe?.Invoke() ?? $"<{TypeName} object>";
 
     /// <summary>Advances the iterator. Returns null when exhausted.</summary>
     public PyObject? Next() => _advance();

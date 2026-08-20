@@ -1550,6 +1550,50 @@ public sealed class VirtualMachine
         value.Iterate()
         ?? (value as PyGenerator)?.Iterate()
         ?? throw new PyRaise(PyErrors.TypeError($"'{value.TypeName}' object is not iterable"));
+
+    /// <summary>
+    /// A pull function over an iterable, returning null at the end.
+    /// </summary>
+    /// <remarks>
+    /// This is not <c>RequireIterable().GetEnumerator()</c>: a C# iterator block that
+    /// throws reports itself finished afterwards, so a Python source whose
+    /// <c>__next__</c> raises would silently be skipped rather than raising again on the
+    /// next call. Pulling from the object itself keeps the source in place.
+    /// </remarks>
+    public static Func<PyObject?> Puller(PyObject value)
+    {
+        switch (value)
+        {
+            case PyIterator iterator:
+                return iterator.Next;
+
+            case PyGenerator generator:
+                return generator.Next;
+
+            case PyInstance instance when instance.Dunder("__next__") is not null:
+                return () =>
+                {
+                    try
+                    {
+                        return instance.Invoke(instance.Dunder("__next__")!, []);
+                    }
+                    catch (PyRaise raise)
+                        when (raise.Exception.ExceptionType == PyExceptionType.StopIteration)
+                    {
+                        return null;
+                    }
+                };
+
+            case PyInstance outer when outer.Dunder("__iter__") is { } start:
+                return Puller(outer.Invoke(start, []));
+
+            default:
+            {
+                var items = RequireIterable(value).GetEnumerator();
+                return () => items.MoveNext() ? items.Current : null;
+            }
+        }
+    }
 }
 
 /// <summary>Per-run resource caps.</summary>

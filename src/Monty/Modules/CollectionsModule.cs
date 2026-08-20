@@ -68,53 +68,260 @@ public static class SupportModules
     {
         var module = new PyModuleObject("itertools");
 
-        module.Add("chain", static arguments =>
-            new PyIterator(arguments.SelectMany(VirtualMachine.RequireIterable).ToList()));
-
-        module.Add("islice", static arguments =>
+        // The adaptors are lazy: each holds its source and pulls one item at a time, so an
+        // infinite source such as `count()` composes with `islice` the way it does upstream.
+        module.Add("chain", new PyBuiltinFunction("chain", static (arguments, keywords) =>
         {
-            var items = VirtualMachine.RequireIterable(arguments[0]).ToList();
+            PyBuiltinFunction.RejectKeywords("chain", keywords);
 
-            // `islice(it, stop)` and `islice(it, start, stop[, step])` are both valid.
-            var (start, stop, step) = arguments.Length switch
+            var index = 0;
+            Func<PyObject?>? current = null;
+            var spent = false;
+
+            return Adaptor("chain", () =>
             {
-                2 => (0, Bound(arguments[1], items.Count), 1),
-                3 => (Bound(arguments[1], items.Count), Bound(arguments[2], items.Count), 1),
-                _ => (Bound(arguments[1], items.Count), Bound(arguments[2], items.Count), (int)((PyInt)arguments[3]).Value),
+                while (!spent)
+                {
+                    if (current is null)
+                    {
+                        if (index == arguments.Length)
+                        {
+                            spent = true;
+                            return null;
+                        }
+
+                        // A source that will not iterate ends the chain: CPython drops the
+                        // source, so the arguments after it are never reached. One whose
+                        // `__next__` raises stays in place and raises again.
+                        try
+                        {
+                            current = VirtualMachine.Puller(arguments[index++]);
+                        }
+                        catch (PyRaise)
+                        {
+                            spent = true;
+                            throw;
+                        }
+                    }
+
+                    if (current() is { } item)
+                    {
+                        return item;
+                    }
+
+                    current = null;
+                }
+
+                return null;
+            });
+        }));
+
+        module.Add("islice", new PyBuiltinFunction("islice", static (arguments, keywords) =>
+        {
+            PyBuiltinFunction.RejectKeywords("islice", keywords);
+            Arity.Between("islice", arguments, 2, 4);
+
+            // `islice(it, stop)` and `islice(it, start[, stop[, step]])` are both valid,
+            // and the two-argument form names the stop in its error.
+            var single = arguments.Length == 2;
+            var start = single ? 0 : Index(arguments[1], single);
+            var stop = Index(single ? arguments[1] : arguments.Length > 2 ? arguments[2] : PyNone.Instance, single);
+            var step = arguments.Length > 3 ? Step(arguments[3]) : 1;
+
+            var source = VirtualMachine.RequireIterable(arguments[0]).GetEnumerator();
+            var position = 0;
+
+            return Adaptor("islice", () =>
+            {
+                while (position < start && source.MoveNext())
+                {
+                    position++;
+                }
+
+                if (position < start || (stop is { } limit && position >= limit))
+                {
+                    return null;
+                }
+
+                if (!source.MoveNext())
+                {
+                    return null;
+                }
+
+                var item = source.Current;
+                position++;
+
+                // The step is consumed eagerly so the next call starts on an item.
+                for (var i = 1; i < step && (stop is null || position < stop) && source.MoveNext(); i++)
+                {
+                    position++;
+                }
+
+                return item;
+            });
+        }));
+
+        module.Add("count", new PyBuiltinFunction("count", static (arguments, keywords) =>
+        {
+            Accept(arguments, keywords, "count", "start", "step");
+
+            // The start and step may be floats, so they stay Python values rather than
+            // being narrowed to integers.
+            var start = Argument(arguments, keywords, 0, "start", "count") is { } from
+                ? Number(from)
+                : new PyInt(0);
+
+            var step = Argument(arguments, keywords, 1, "step", "count") is { } by
+                ? Number(by)
+                : new PyInt(1);
+
+            var next = start;
+
+            return new PyIterator(
+                () =>
+                {
+                    var value = next;
+                    next = Operators.Binary("+", next, step);
+                    return value;
+                },
+                "itertools.count")
+            {
+                // The step is shown unless it is an integer equal to 1, and the position
+                // shown is the current one, not the start.
+                Describe = () => step is PyInt { Value.IsOne: true }
+                    ? $"count({next.Repr()})"
+                    : $"count({next.Repr()}, {step.Repr()})",
             };
+        }));
 
-            var result = new List<PyObject>();
-
-            for (var i = start; i < Math.Min(stop, items.Count); i += Math.Max(1, step))
+        module.Add("repeat", new PyBuiltinFunction("repeat", static (arguments, keywords) =>
+        {
+            // The total arity is checked first, then the required argument, and only then
+            // an unexpected keyword — which is the order CPython reports them in.
+            if (arguments.Length + (keywords?.Count ?? 0) > 2)
             {
-                result.Add(items[i]);
+                throw new PyRaise(PyErrors.TypeError(
+                    $"repeat() takes at most 2 arguments ({arguments.Length + (keywords?.Count ?? 0)} given)"));
             }
 
-            return new PyIterator(result);
-        });
+            var value = Argument(arguments, keywords, 0, "object", "repeat")
+                ?? throw new PyRaise(PyErrors.TypeError(
+                    "repeat() missing required argument 'object' (pos 1)"));
 
-        module.Add("count", static arguments =>
-        {
-            var start = arguments.Length > 0 ? RequireNumber(arguments[0]) : BigInteger.Zero;
-            var step = arguments.Length > 1 ? RequireNumber(arguments[1]) : BigInteger.One;
+            Accept(arguments, keywords, "repeat", "object", "times");
 
-            // Unbounded in Python; bounded here, because an infinite iterator materialized
-            // into a list would never terminate. The cap is generous and documented.
-            var values = new List<PyObject>(10_000);
+            var times = Argument(arguments, keywords, 1, "times", "repeat") is { } count
+                ? Ssize(count)
+                : (BigInteger?)null;
 
-            for (var i = 0; i < 10_000; i++)
+            var produced = 0;
+
+            return new PyIterator(
+                () => times is { } limit && produced >= limit ? null : Produce(ref produced, value),
+                "itertools.repeat")
             {
-                values.Add(new PyInt(start + (i * step)));
-            }
+                // The count shown is what remains, and an endless repeat shows none.
+                Describe = () => times is { } limit
+                    ? $"repeat({value.Repr()}, {BigInteger.Max(0, limit - produced)})"
+                    : $"repeat({value.Repr()})",
+            };
+        }));
 
-            return new PyIterator(values);
-        });
-
-        module.Add("repeat", static arguments =>
+        module.Add("cycle", new PyBuiltinFunction("cycle", static (arguments, keywords) =>
         {
-            var times = arguments.Length > 1 ? (int)RequireNumber(arguments[1]) : 10_000;
-            return new PyIterator(Enumerable.Repeat(arguments[0], Math.Max(0, times)).ToList());
-        });
+            PyBuiltinFunction.RejectKeywords("cycle", keywords);
+            Arity.ExactCount("cycle", arguments, 1);
+
+            // Unlike chain, cycle resolves its source at once.
+            var source = VirtualMachine.RequireIterable(arguments[0]).GetEnumerator();
+            var saved = new List<PyObject>();
+            var index = 0;
+            var draining = true;
+
+            return Adaptor("cycle", () =>
+            {
+                if (draining)
+                {
+                    if (source.MoveNext())
+                    {
+                        saved.Add(source.Current);
+                        return source.Current;
+                    }
+
+                    draining = false;
+                }
+
+                if (saved.Count == 0)
+                {
+                    return null;
+                }
+
+                var item = saved[index];
+                index = (index + 1) % saved.Count;
+                return item;
+            });
+        }));
+
+        module.Add("compress", new PyBuiltinFunction("compress", static (arguments, keywords) =>
+        {
+            Accept(arguments, keywords, "compress", "data", "selectors");
+
+            var data = Argument(arguments, keywords, 0, "data", "compress")
+                ?? throw new PyRaise(PyErrors.TypeError(
+                    "compress() missing required argument 'data' (pos 1)"));
+
+            var selectors = Argument(arguments, keywords, 1, "selectors", "compress")
+                ?? throw new PyRaise(PyErrors.TypeError(
+                    "compress() missing required argument 'selectors' (pos 2)"));
+
+            var items = VirtualMachine.RequireIterable(data).GetEnumerator();
+            var flags = VirtualMachine.RequireIterable(selectors).GetEnumerator();
+
+            return Adaptor("compress", () =>
+            {
+                // Both sides advance together, so the shorter one ends it.
+                while (items.MoveNext() && flags.MoveNext())
+                {
+                    if (flags.Current.IsTruthy())
+                    {
+                        return items.Current;
+                    }
+                }
+
+                return null;
+            });
+        }));
+
+        module.Add("pairwise", new PyBuiltinFunction("pairwise", static (arguments, keywords) =>
+        {
+            PyBuiltinFunction.RejectKeywords("pairwise", keywords);
+            Arity.ExactCount("pairwise", arguments, 1);
+
+            var source = VirtualMachine.RequireIterable(arguments[0]).GetEnumerator();
+            PyObject? previous = null;
+
+            return Adaptor("pairwise", () =>
+            {
+                if (previous is null)
+                {
+                    if (!source.MoveNext())
+                    {
+                        return null;
+                    }
+
+                    previous = source.Current;
+                }
+
+                if (!source.MoveNext())
+                {
+                    return null;
+                }
+
+                var pair = new PyTuple([previous, source.Current]);
+                previous = source.Current;
+                return pair;
+            });
+        }));
 
         module.Add("product", static (arguments, keywords) =>
         {
@@ -166,19 +373,6 @@ public static class SupportModules
             }
 
             return new PyIterator(totals);
-        });
-
-        module.Add("pairwise", static arguments =>
-        {
-            var items = VirtualMachine.RequireIterable(arguments[0]).ToList();
-            var pairs = new List<PyObject>(Math.Max(0, items.Count - 1));
-
-            for (var i = 0; i + 1 < items.Count; i++)
-            {
-                pairs.Add(new PyTuple([items[i], items[i + 1]]));
-            }
-
-            return new PyIterator(pairs);
         });
 
         module.Add("takewhile", arguments =>
@@ -274,6 +468,98 @@ public static class SupportModules
         return module;
     }
 
+    /// <summary>Wraps a pull function as one of itertools' iterator types.</summary>
+    private static PyIterator Adaptor(string name, Func<PyObject?> advance) =>
+        new(advance, "itertools." + name);
+
+    /// <summary>Yields the repeated value, counting the ones produced.</summary>
+    private static PyObject Produce(ref int produced, PyObject value)
+    {
+        produced++;
+        return value;
+    }
+
+    /// <summary>
+    /// Enforces an arity counted over positionals and keywords together, and rejects a
+    /// keyword that names no parameter.
+    /// </summary>
+    private static void Accept(PyObject[] arguments, PyDict? keywords, string function, params string[] names)
+    {
+        var total = arguments.Length + (keywords?.Count ?? 0);
+
+        if (total > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{function}() takes at most {names.Length} arguments ({total} given)"));
+        }
+
+        foreach (var (key, _) in keywords?.Entries ?? [])
+        {
+            if (!names.Contains(key.Display()))
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{function}() got an unexpected keyword argument '{key.Display()}'"));
+            }
+        }
+    }
+
+    /// <summary>Reads an argument given positionally or by name, rejecting a duplicate.</summary>
+    private static PyObject? Argument(
+        PyObject[] arguments, PyDict? keywords, int position, string name, string function)
+    {
+        var named = keywords?.TryGetValue(new PyStr(name), out var value) == true ? value : null;
+
+        if (arguments.Length > position)
+        {
+            return named is null
+                ? arguments[position]
+                : throw new PyRaise(PyErrors.TypeError(
+                    $"{function}() got multiple values for argument '{name}'"));
+        }
+
+        return named;
+    }
+
+    /// <summary>Reads a count that must fit the host's index type, as CPython's `n` unit does.</summary>
+    private static BigInteger Ssize(PyObject value)
+    {
+        if (value is not PyInt count)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"'{value.TypeName}' object cannot be interpreted as an integer"));
+        }
+
+        return BigInteger.Abs(count.Value) > long.MaxValue
+            ? throw new PyRaise(new PyException(
+                PyExceptionType.OverflowError, "Python int too large to convert to C ssize_t"))
+            : count.Value;
+    }
+
+    /// <summary>Reads one of islice's bounds, which must be a non-negative integer or None.</summary>
+    private static int? Index(PyObject value, bool single)
+    {
+        if (value is PyNone)
+        {
+            return null;
+        }
+
+        // The two-argument form has only one bound to blame, so it names it.
+        var message = single
+            ? "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize."
+            : "Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.";
+
+        return value is PyInt index && index.Value >= 0 && index.Value <= int.MaxValue
+            ? (int)index.Value
+            : throw new PyRaise(PyErrors.ValueError(message));
+    }
+
+    private static int Step(PyObject value) =>
+        value is PyNone ? 1
+        : value is PyInt step && step.Value > 0 && step.Value <= int.MaxValue
+            ? (int)step.Value
+            : throw new PyRaise(PyErrors.ValueError(
+                "Step for islice() must be a positive integer or None."));
+
     private static int Bound(PyObject value, int length) =>
         value is PyNone ? length : (int)RequireNumber(value);
 
@@ -282,6 +568,17 @@ public static class SupportModules
         PyInt integer => integer.Value,
         _ => throw new PyRaise(PyErrors.TypeError(
             $"'{value.TypeName}' object cannot be interpreted as an integer")),
+    };
+
+    /// <summary>
+    /// Accepts any number, which is what <c>count</c> takes — its start and step may be
+    /// floats. A bool widens to the int it is.
+    /// </summary>
+    private static PyObject Number(PyObject value) => value switch
+    {
+        PyBool flag => new PyInt(flag.Value ? 1 : 0),
+        PyInt or PyFloat => value,
+        _ => throw new PyRaise(PyErrors.TypeError("a number is required")),
     };
 
     private static IEnumerable<List<PyObject>> Permute(List<PyObject> items, int length)
