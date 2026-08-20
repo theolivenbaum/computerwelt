@@ -750,6 +750,19 @@ public sealed class PyRange : PyObject
                 : [new PyInt(count), new PyInt(Start), new PyInt(Step)]).PyHash();
     }
 
+    /// <summary>
+    /// The number of values the range yields, as <c>len()</c> reports it.
+    /// </summary>
+    /// <remarks>
+    /// CPython's <c>len</c> returns an ssize_t, so a range of up to 2**63-1 members has a
+    /// length while a longer one raises — a boundary two fixtures pin exactly.
+    /// </remarks>
+    public BigInteger LongCount =>
+        Count <= long.MaxValue
+            ? Count
+            : throw new PyRaise(new PyException(
+                PyExceptionType.OverflowError, "Python int too large to convert to C ssize_t"));
+
     /// <summary>The number of values the range yields.</summary>
     public BigInteger Count
     {
@@ -774,11 +787,14 @@ public sealed class PyRange : PyObject
         var count = Count;
 
         // A range may be longer than an int can hold; `len()` on one is an OverflowError
-        // in CPython too, not a host crash.
+        // in CPython too, not a host crash. `len()` itself goes through LongCount, which
+        // has ssize_t's reach — this is the narrower host-side limit.
         if (count > int.MaxValue)
         {
             throw new PyRaise(new PyException(
-                PyExceptionType.OverflowError, "cannot fit 'int' into an index-sized integer"));
+                PyExceptionType.OverflowError, count > long.MaxValue
+                    ? "Python int too large to convert to C ssize_t"
+                    : "cannot fit 'int' into an index-sized integer"));
         }
 
         return (int)count;
@@ -789,8 +805,56 @@ public sealed class PyRange : PyObject
         Step.IsOne ? $"range({Start}, {Stop})" : $"range({Start}, {Stop}, {Step})";
 
     /// <inheritdoc />
-    public override bool PyEquals(PyObject other) =>
-        other is PyRange range && Start == range.Start && Stop == range.Stop && Step == range.Step;
+    /// <remarks>
+    /// Two ranges are equal when they yield the same sequence, not when they were spelled
+    /// alike: `range(0, 3, 2) == range(0, 4, 2)`, and every empty range equals every other.
+    /// </remarks>
+    public override bool PyEquals(PyObject other)
+    {
+        if (other is not PyRange range)
+        {
+            return false;
+        }
+
+        var count = Count;
+
+        return count == range.Count
+            && (count.IsZero || (Start == range.Start && (count.IsOne || Step == range.Step)));
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Membership is arithmetic, never a scan: a range may hold more members than could be
+    /// enumerated in any amount of time, and `x in range(-(2**63), 2**63 - 1, 3)` is
+    /// expected to answer at once. A non-number is simply absent rather than a type error.
+    /// </remarks>
+    public override bool Contains(PyObject item)
+    {
+        BigInteger value;
+
+        switch (item)
+        {
+            case PyInt integer:
+                value = integer.Value;
+                break;
+
+            // A float belongs only when it is exactly one of the members; 2.0**63 is a
+            // whole number but still outside a range that stops at 2**63-1.
+            case PyFloat { Value: var number }
+                when !double.IsNaN(number) && !double.IsInfinity(number) && Math.Floor(number) == number:
+                value = new BigInteger(number);
+                break;
+
+            default:
+                return false;
+        }
+
+        var offset = value - Start;
+
+        return !BigInteger.Remainder(offset, Step).IsZero
+            ? false
+            : offset / Step is var index && index >= 0 && index < Count;
+    }
 
     /// <inheritdoc />
     public override IEnumerable<PyObject>? Iterate()
@@ -806,6 +870,18 @@ public sealed class PyRange : PyObject
     /// <inheritdoc />
     public override PyObject GetItem(PyObject index)
     {
+        // Slicing a range yields a range rather than a list — the point of the type is that
+        // it never materialises its members.
+        if (index is PySlice slice)
+        {
+            var length = Length() ?? 0;
+            var (from, _, by, taken) = slice.Resolve(length);
+            var first = Start + (from * Step);
+            var stride = Step * by;
+
+            return new PyRange(first, first + (taken * stride), taken == 0 ? Step : stride);
+        }
+
         if (index is not PyInt integer)
         {
             throw new PyRaise(PyErrors.TypeError($"range indices must be integers, not {index.TypeName}"));

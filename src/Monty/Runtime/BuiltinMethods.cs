@@ -716,11 +716,33 @@ public static class BuiltinMethods
             case "sort":
                 return Method(name, receiver, (self, _, keywords) =>
                 {
+                    // CPython detaches the buffer for the duration of the sort, so a `key`
+                    // callback that looks at the list sees it empty; re-populating it is a
+                    // ValueError, raised only after the sorted buffer is put back.
                     var items = ((PyList)self).Items;
-                    var sorted = Sorting.Sort(machine, items, keywords);
+                    var detached = new List<PyObject>(items);
+                    items.Clear();
+
+                    List<PyObject> sorted;
+
+                    try
+                    {
+                        sorted = Sorting.Sort(machine, detached, keywords);
+                    }
+                    catch
+                    {
+                        items.Clear();
+                        items.AddRange(detached);
+                        throw;
+                    }
+
+                    var modified = items.Count != 0;
                     items.Clear();
                     items.AddRange(sorted);
-                    return PyNone.Instance;
+
+                    return modified
+                        ? throw new PyRaise(PyErrors.ValueError("list modified during sort"))
+                        : PyNone.Instance;
                 });
 
             default:
@@ -1051,10 +1073,20 @@ public static class BuiltinMethods
     }
 
     /// <summary>Resolves a sequence bound, counting a negative one from the end.</summary>
+    /// <remarks>
+    /// The arithmetic is done in <see cref="BigInteger"/> because these bounds clip rather
+    /// than overflow: `lst.index(x, -(2**63))` is a plain search from the start, not an error.
+    /// </remarks>
     private static int Bound(PyObject value, int length)
     {
-        var index = value is PyInt integer ? integer.ToIndex() : 0;
-        return Math.Clamp(index < 0 ? length + index : index, 0, length);
+        var index = value is PyInt integer ? integer.Value : BigInteger.Zero;
+
+        if (index < 0)
+        {
+            index += length;
+        }
+
+        return (int)BigInteger.Clamp(index, 0, length);
     }
 
     // ---- tuple, bytes, int, float ----

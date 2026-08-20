@@ -170,10 +170,7 @@ public static class TypeRegistry
         "float", static value => value is PyFloat, static (arguments, _) => Builtins.Conversions.ToFloat(arguments));
 
     /// <summary><c>str</c>.</summary>
-    public static PyType Str { get; } = Define(
-        "str",
-        static value => value is PyStr,
-        static (arguments, _) => new PyStr(arguments.Length == 0 ? string.Empty : arguments[0].Display()));
+    public static PyType Str { get; } = Define("str", static value => value is PyStr, BuildStr);
 
     /// <summary><c>bytes</c>.</summary>
     public static PyType Bytes { get; } = Define(
@@ -227,7 +224,9 @@ public static class TypeRegistry
             0 => throw new PyRaise(PyErrors.TypeError("slice expected at least 1 argument, got 0")),
             1 => new PySlice(null, arguments[0], null),
             2 => new PySlice(arguments[0], arguments[1], null),
-            _ => new PySlice(arguments[0], arguments[1], arguments[2]),
+            3 => new PySlice(arguments[0], arguments[1], arguments[2]),
+            _ => throw new PyRaise(PyErrors.TypeError(
+                $"slice expected at most 3 arguments, got {arguments.Length}")),
         });
 
     /// <summary><c>function</c>.</summary>
@@ -417,6 +416,88 @@ public static class TypeRegistry
 
         return dict;
     }
+
+    /// <summary>
+    /// Builds a <c>str</c>: the display of one object, or a decoding of a bytes-like one.
+    /// </summary>
+    /// <remarks>
+    /// CPython reaches this by two different routes, and their arity messages differ — the
+    /// vectorcall fast path is taken when there are no keywords, the argument clinic parser
+    /// otherwise. Scripts see both wordings, so both are reproduced.
+    /// </remarks>
+    private static PyObject BuildStr(PyObject[] arguments, PyDict? keywords)
+    {
+        string[] names = ["object", "encoding", "errors"];
+        var keywordCount = keywords?.Entries.Count() ?? 0;
+
+        if (keywordCount == 0 && arguments.Length > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"str expected at most {names.Length} arguments, got {arguments.Length}"));
+        }
+
+        if (arguments.Length + keywordCount > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"str() takes at most {names.Length} arguments ({arguments.Length + keywordCount} given)"));
+        }
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            given[i] = arguments[i];
+        }
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"str() got an unexpected keyword argument '{key.Display()}'"));
+            }
+
+            if (given[position] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"argument for str() given by name ('{names[position]}') and position ({position + 1})"));
+            }
+
+            given[position] = value;
+        }
+
+        // A missing object is the empty string even when a codec was named — there is
+        // nothing to decode, so the decoding arguments are never looked at.
+        if (given[0] is null)
+        {
+            return new PyStr(string.Empty);
+        }
+
+        if (given[1] is null && given[2] is null)
+        {
+            return new PyStr(given[0]!.Display());
+        }
+
+        var source = given[0] switch
+        {
+            PyBytes bytes => bytes.Value,
+            PyStr => throw new PyRaise(PyErrors.TypeError("decoding str is not supported")),
+            var other => throw new PyRaise(PyErrors.TypeError(
+                $"decoding to str: need a bytes-like object, {other!.TypeName} found")),
+        };
+
+        return new PyStr(Codecs.Decode(source, Codec(given[1], "encoding", "utf-8"), Codec(given[2], "errors", "strict")));
+    }
+
+    /// <summary>Reads a codec name argument, which must be a string when it is given at all.</summary>
+    private static string Codec(PyObject? value, string name, string fallback) => value switch
+    {
+        null => fallback,
+        PyStr text => text.Value,
+        _ => throw new PyRaise(PyErrors.TypeError($"str() argument '{name}' must be str, not {value.TypeName}")),
+    };
 
     private static PyObject BuildRange(PyObject[] arguments, PyDict? keywords)
     {

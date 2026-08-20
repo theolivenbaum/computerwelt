@@ -250,6 +250,11 @@ public static class Operators
             (PyBool, _) or (_, PyBool) => false,
             (PyInt a, PyInt b) => a.Value == b.Value && BigInteger.Abs(a.Value) < 257,
             (PyStr a, PyStr b) => string.Equals(a.Value, b.Value, StringComparison.Ordinal),
+
+            // The empty tuple is a singleton in CPython, so `() is ()` holds. A named
+            // tuple with no fields is still a distinct object, hence the exclusion.
+            (PyTuple { Items.Count: 0 } a, PyTuple { Items.Count: 0 } b) =>
+                a is not PyNamedTuple && b is not PyNamedTuple,
             _ => false,
         };
     }
@@ -359,6 +364,22 @@ public static class Operators
 
         if (count >= 0)
         {
+            // An empty sequence repeats to an empty one however large the count is: nothing
+            // is materialised, so the count never has to fit an index.
+            var length = sequence switch
+            {
+                PyStr text => text.Value.Length,
+                PyList list => list.Items.Count,
+                PyTuple tuple => tuple.Items.Count,
+                PyBytes bytes => bytes.Value.Length,
+                _ => -1,
+            };
+
+            if (length == 0)
+            {
+                count = 0;
+            }
+
             if (count > 100_000_000)
             {
                 throw new PyRaise(new PyException(

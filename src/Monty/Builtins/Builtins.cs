@@ -84,9 +84,14 @@ public static class BuiltinNamespace
             return PyNone.Instance;
         });
 
-        DefineArity("len", 1, 1, arguments =>
-            new PyInt(arguments[0].Length()
-                ?? throw new PyRaise(PyErrors.TypeError($"object of type '{arguments[0].TypeName}' has no len()"))));
+        DefineArity("len", 1, 1, arguments => arguments[0] switch
+        {
+            // A range knows its length without materialising it, so `len` reaches as far as
+            // an ssize_t does rather than as far as a host int.
+            PyRange range => new PyInt(range.LongCount),
+            var value => new PyInt(value.Length()
+                ?? throw new PyRaise(PyErrors.TypeError($"object of type '{value.TypeName}' has no len()"))),
+        });
 
         DefineArity("repr", 1, 1, static arguments => new PyStr(arguments[0].Repr()));
 

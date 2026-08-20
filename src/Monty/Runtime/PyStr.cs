@@ -436,6 +436,11 @@ public sealed class PySlice : PyObject
     public override string Repr() =>
         $"slice({Start?.Repr() ?? "None"}, {Stop?.Repr() ?? "None"}, {Step?.Repr() ?? "None"})";
 
+    /// <inheritdoc />
+    /// <remarks>Slices compare as the (start, stop, step) triple they carry.</remarks>
+    public override bool PyEquals(PyObject other) =>
+        other is PySlice slice && Same(Start, slice.Start) && Same(Stop, slice.Stop) && Same(Step, slice.Step);
+
     /// <summary>
     /// Resolves the slice against a sequence of <paramref name="length"/> elements,
     /// returning the first index, the exclusive end, the step and the element count.
@@ -446,7 +451,7 @@ public sealed class PySlice : PyObject
     /// </remarks>
     public (int Start, int Stop, int Step, int Count) Resolve(int length)
     {
-        var step = Step is null or PyNone ? 1 : ToInt(Step, "slice step");
+        var step = Step is null or PyNone ? 1 : ToInt(Step, "slice step", length);
 
         if (step == 0)
         {
@@ -457,13 +462,13 @@ public sealed class PySlice : PyObject
 
         if (step > 0)
         {
-            start = Start is null or PyNone ? 0 : Clamp(ToInt(Start, "slice index"), length, 0, length);
-            stop = Stop is null or PyNone ? length : Clamp(ToInt(Stop, "slice index"), length, 0, length);
+            start = Start is null or PyNone ? 0 : Clamp(ToInt(Start, "slice index", length), length, 0, length);
+            stop = Stop is null or PyNone ? length : Clamp(ToInt(Stop, "slice index", length), length, 0, length);
         }
         else
         {
-            start = Start is null or PyNone ? length - 1 : Clamp(ToInt(Start, "slice index"), length, -1, length - 1);
-            stop = Stop is null or PyNone ? -1 : Clamp(ToInt(Stop, "slice index"), length, -1, length - 1);
+            start = Start is null or PyNone ? length - 1 : Clamp(ToInt(Start, "slice index", length), length, -1, length - 1);
+            stop = Stop is null or PyNone ? -1 : Clamp(ToInt(Stop, "slice index", length), length, -1, length - 1);
         }
 
         var span = step > 0 ? stop - start : start - stop;
@@ -472,10 +477,24 @@ public sealed class PySlice : PyObject
         return (start, stop, step, count);
     }
 
-    private static int ToInt(PyObject value, string what) =>
-        value is PyInt integer
-            ? integer.ToIndex()
-            : throw new PyRaise(PyErrors.TypeError($"{what} must be an integer or None"));
+    private static bool Same(PyObject? left, PyObject? right) =>
+        (left ?? PyNone.Instance).PyEquals(right ?? PyNone.Instance);
+
+    /// <summary>Reads a slice bound or step, clipping it to the sequence it applies to.</summary>
+    /// <remarks>
+    /// Slice components clip rather than overflow: `'hello'[::-(2**63)]` is a legal slice,
+    /// and any magnitude past the length behaves exactly as the length itself does.
+    /// </remarks>
+    private static int ToInt(PyObject value, string what, int length)
+    {
+        if (value is not PyInt integer)
+        {
+            throw new PyRaise(PyErrors.TypeError($"{what} must be an integer or None"));
+        }
+
+        var bound = BigInteger.Min((BigInteger)length + 1, int.MaxValue);
+        return (int)BigInteger.Clamp(integer.Value, -bound, bound);
+    }
 
     private static int Clamp(int index, int length, int low, int high)
     {
