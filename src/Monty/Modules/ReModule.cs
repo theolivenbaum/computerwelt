@@ -29,6 +29,12 @@ public static class ReModule
         module.Add("S", new PyInt(16));
         module.Add("VERBOSE", new PyInt(64));
         module.Add("X", new PyInt(64));
+        module.Add("ASCII", new PyInt(256));
+        module.Add("A", new PyInt(256));
+
+        // A str pattern is Unicode by definition, so this flag only documents the default.
+        module.Add("UNICODE", new PyInt(32));
+        module.Add("U", new PyInt(32));
 
         // The classes are exposed so a script can name them in `isinstance`.
         module.Add("Pattern", new PyType(
@@ -45,66 +51,145 @@ public static class ReModule
         module.Add("error", PyExceptionType.Registry["PatternError"]);
         module.Add("PatternError", PyExceptionType.Registry["PatternError"]);
 
-        module.Add("compile", static arguments =>
+        module.Add("compile", new PyBuiltinFunction("compile", static (arguments, keywords) =>
         {
-            Require("compile", arguments, 1, 2, "pattern", "flags");
-            return new PyPattern(arguments[0].Display(), Options(arguments, 1));
-        });
+            var bound = Bind("compile", arguments, keywords, 1, "pattern", "flags");
 
-        module.Add("match", static arguments =>
-        {
-            Require("match", arguments, 2, 3, "pattern", "string", "flags");
-            return Pattern(arguments).MatchAt(Subject(arguments), anchored: true);
-        });
+            // A compiled pattern comes straight back, and combining it with flags is an
+            // error rather than a silent recompile.
+            if (bound[0] is PyPattern compiled)
+            {
+                return bound.Length > 1
+                    ? throw new PyRaise(PyErrors.ValueError(
+                        "cannot process flags argument with a compiled pattern"))
+                    : compiled;
+            }
 
-        module.Add("fullmatch", static arguments =>
-        {
-            Require("fullmatch", arguments, 2, 3, "pattern", "string", "flags");
-            return Pattern(arguments).FullMatch(Subject(arguments));
-        });
+            return new PyPattern(
+                bound[0] is PyStr source
+                    ? source.Value
+                    : throw new PyRaise(PyErrors.TypeError(
+                        "first argument must be string or compiled pattern")),
+                Options(bound, 1),
+                Raw(bound, 1));
+        }));
 
-        module.Add("search", static arguments =>
+        module.Add("match", new PyBuiltinFunction("match", static (arguments, keywords) =>
         {
-            Require("search", arguments, 2, 3, "pattern", "string", "flags");
-            return Pattern(arguments).MatchAt(Subject(arguments), anchored: false);
-        });
+            var bound = Bind("match", arguments, keywords, 2, "pattern", "string", "flags");
+            return Pattern(bound).MatchAt(Subject(bound), anchored: true);
+        }));
 
-        module.Add("findall", static arguments =>
+        module.Add("fullmatch", new PyBuiltinFunction("fullmatch", static (arguments, keywords) =>
         {
-            Require("findall", arguments, 2, 3, "pattern", "string", "flags");
-            return Pattern(arguments).FindAll(Subject(arguments));
-        });
+            var bound = Bind("fullmatch", arguments, keywords, 2, "pattern", "string", "flags");
+            return Pattern(bound).FullMatch(Subject(bound));
+        }));
 
-        module.Add("finditer", static arguments =>
+        module.Add("search", new PyBuiltinFunction("search", static (arguments, keywords) =>
         {
-            Require("finditer", arguments, 2, 3, "pattern", "string", "flags");
-            return new PyIterator(VirtualMachine.RequireIterable(Pattern(arguments).FindIter(Subject(arguments))));
-        });
+            var bound = Bind("search", arguments, keywords, 2, "pattern", "string", "flags");
+            return Pattern(bound).MatchAt(Subject(bound), anchored: false);
+        }));
 
-        module.Add("sub", static arguments =>
+        module.Add("findall", new PyBuiltinFunction("findall", static (arguments, keywords) =>
         {
-            Require("sub", arguments, 3, 5, "pattern", "repl", "string", "count", "flags");
+            var bound = Bind("findall", arguments, keywords, 2, "pattern", "string", "flags");
+            return Pattern(bound).FindAll(Subject(bound));
+        }));
+
+        module.Add("finditer", new PyBuiltinFunction("finditer", static (arguments, keywords) =>
+        {
+            var bound = Bind("finditer", arguments, keywords, 2, "pattern", "string", "flags");
+            return new PyIterator(VirtualMachine.RequireIterable(Pattern(bound).FindIter(Subject(bound))));
+        }));
+
+        module.Add("sub", new PyBuiltinFunction("sub", static (arguments, keywords) =>
+        {
+            var bound = Bind("sub", arguments, keywords, 3, "pattern", "repl", "string", "count", "flags");
 
             // The pattern's own flags argument is the fifth here, not the third.
-            var pattern = arguments[0] is PyPattern compiled
-                ? compiled
-                : new PyPattern(arguments[0].Display(), Options(arguments, 4));
+            var pattern = Pattern(bound, 4);
 
             return new PyStr(pattern.Substitute(
-                Text(arguments[1], "repl"),
-                Text(arguments[2], "string"),
-                arguments.Length > 3 ? Count(arguments[3]) : 0));
-        });
+                Text(bound[1], "repl"),
+                Text(bound[2], "string"),
+                bound.Length > 3 ? Count(bound[3]) : 0));
+        }));
 
-        module.Add("split", static arguments =>
+        module.Add("split", new PyBuiltinFunction("split", static (arguments, keywords) =>
         {
-            Require("split", arguments, 2, 4, "pattern", "string", "maxsplit", "flags");
-            return Pattern(arguments).Split(Subject(arguments));
-        });
+            var bound = Bind("split", arguments, keywords, 2, "pattern", "string", "maxsplit", "flags");
 
-        module.Add("escape", static arguments => new PyStr(Regex.Escape(arguments[0].Display())));
+            // split's flags are the fourth argument; the third is the split limit.
+            return Pattern(bound, 3).Split(Subject(bound), bound.Length > 2 ? Count(bound[2]) : 0);
+        }));
+
+        module.Add("escape", new PyBuiltinFunction("escape", static (arguments, keywords) =>
+        {
+            if (arguments.Length > 1)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"escape() takes 1 positional argument but {arguments.Length} were given"));
+            }
+
+            var bound = Bind("escape", arguments, keywords, 1, "pattern");
+
+            return new PyStr(Escape(bound[0] is PyStr text
+                ? text.Value
+                : throw new PyRaise(PyErrors.TypeError(
+                    $"decoding to str: need a bytes-like object, {bound[0].TypeName} found"))));
+        }));
 
         return module;
+    }
+
+    /// <summary>
+    /// Binds a module function's arguments, which are positional-or-keyword because
+    /// CPython writes these in Python rather than in C.
+    /// </summary>
+    private static PyObject[] Bind(
+        string name, PyObject[] arguments, PyDict? keywords, int minimum, params string[] names)
+    {
+        if (arguments.Length > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{name}() takes from {minimum} to {names.Length} positional arguments "
+                + $"but {arguments.Length} were given"));
+        }
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            given[i] = arguments[i];
+        }
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{name}() got an unexpected keyword argument '{key.Display()}'"));
+            }
+
+            if (given[position] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{name}() got multiple values for argument '{names[position]}'"));
+            }
+
+            given[position] = value;
+        }
+
+        // Only a leading run of supplied arguments is usable; a gap means the caller left
+        // an earlier parameter out, which the arity check then reports.
+        PyObject[] bound = [.. given.TakeWhile(static value => value is not null).Select(static value => value!)];
+        Require(name, bound, minimum, names.Length, names);
+
+        return bound;
     }
 
     /// <summary>
@@ -124,6 +209,65 @@ public static class ReModule
                     ? $"'{missing[0]}'"
                     : string.Join(", ", missing.Take(missing.Count - 1).Select(m => $"'{m}'"))
                         + (missing.Count == 2 ? " and " : ", and ") + $"'{missing[^1]}'")));
+        }
+
+        if (arguments.Length > maximum)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{name}() takes at most {maximum} arguments ({arguments.Length} given)"));
+        }
+    }
+
+    /// <summary>
+    /// Binds a pattern method's arguments, which are positional-or-keyword but count
+    /// their total the way a C-level parser does.
+    /// </summary>
+    private static PyObject[] Method(
+        string name, PyObject[] arguments, PyDict? keywords, int minimum, params string[] names)
+    {
+        var total = arguments.Length + (keywords?.Count ?? 0);
+
+        if (total > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{name}() takes at most {names.Length} arguments ({total} given)"));
+        }
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            given[i] = arguments[i];
+        }
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{name}() got an unexpected keyword argument '{key.Display()}'"));
+            }
+
+            given[position] = value;
+        }
+
+        PyObject[] bound = [.. given.TakeWhile(static value => value is not null).Select(static value => value!)];
+        Positional(name, bound, minimum, names.Length, names);
+
+        return bound;
+    }
+
+    /// <summary>
+    /// Enforces a method's arity, naming the first missing argument and its position.
+    /// </summary>
+    private static void Positional(string name, PyObject[] arguments, int minimum, int maximum, params string[] names)
+    {
+        if (arguments.Length < minimum)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{name}() missing required argument '{names[arguments.Length]}' (pos {arguments.Length + 1})"));
         }
 
         if (arguments.Length > maximum)
@@ -163,16 +307,62 @@ public static class ReModule
             : (int)count.Value;
     }
 
-    private static PyPattern Pattern(PyObject[] arguments) =>
-        arguments[0] is PyPattern compiled ? compiled : new PyPattern(arguments[0].Display(), Options(arguments, 2));
+    private static PyPattern Pattern(PyObject[] arguments) => Pattern(arguments, 2);
+
+    private static PyPattern Pattern(PyObject[] arguments, int flagIndex) => arguments[0] switch
+    {
+        PyPattern compiled when arguments.Length > flagIndex =>
+            throw new PyRaise(PyErrors.ValueError("cannot process flags argument with a compiled pattern")),
+        PyPattern compiled => compiled,
+        PyStr source => new PyPattern(source.Value, Options(arguments, flagIndex), Raw(arguments, flagIndex)),
+        _ => throw new PyRaise(PyErrors.TypeError("first argument must be string or compiled pattern")),
+    };
 
     private static string Subject(PyObject[] arguments) => Text(arguments[1], "string");
 
+    /// <summary>
+    /// Escapes the characters Python's <c>re.escape</c> escapes.
+    /// </summary>
+    /// <remarks>
+    /// Not <c>Regex.Escape</c>: .NET leaves <c>]</c> and <c>}</c> alone and escapes
+    /// whitespace as <c>\n</c>-style sequences, while Python backslashes every character
+    /// that is special anywhere.
+    /// </remarks>
+    private static string Escape(string text)
+    {
+        const string Special = "()[]{}?*+-|^$\\.&~# \t\n\r\v\f";
+        var builder = new StringBuilder(text.Length);
+
+        foreach (var c in text)
+        {
+            if (Special.Contains(c, StringComparison.Ordinal))
+            {
+                builder.Append('\\');
+            }
+
+            builder.Append(c);
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>The flag bits as given, including any with no .NET equivalent.</summary>
+    private static int Raw(PyObject[] arguments, int index) =>
+        index < arguments.Length && arguments[index] is PyInt flags ? (int)flags.Value : 0;
+
     private static RegexOptions Options(PyObject[] arguments, int index)
     {
-        if (index >= arguments.Length || arguments[index] is not PyInt flags)
+        if (index >= arguments.Length)
         {
             return RegexOptions.None;
+        }
+
+        // CPython masks the flags with an int, so a non-integer is reported by the `&`
+        // that fails rather than by a bespoke check.
+        if (arguments[index] is not PyInt flags)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"unsupported operand type(s) for &: '{arguments[index].TypeName}' and 'int'"));
         }
 
         var options = RegexOptions.None;
@@ -198,6 +388,13 @@ public static class ReModule
             options |= RegexOptions.IgnorePatternWhitespace;
         }
 
+        // `re.ASCII` narrows the character classes to ASCII, which .NET spells as the
+        // ECMAScript matching behaviour.
+        if ((value & 256) != 0)
+        {
+            options |= RegexOptions.ECMAScript;
+        }
+
         return options;
     }
 
@@ -205,14 +402,19 @@ public static class ReModule
     public sealed class PyPattern : PyObject
     {
         private readonly Regex _regex;
+        private readonly Dictionary<string, int> _names = new(StringComparer.Ordinal);
+        private readonly int _count;
 
         /// <summary>Compiles <paramref name="pattern"/>.</summary>
-        public PyPattern(string pattern, RegexOptions options)
+        public PyPattern(string pattern, RegexOptions options, int raw = 0)
         {
             Source = pattern;
 
-            // CPython's flags always include re.UNICODE, which a str pattern implies.
-            Flags = 32
+            // CPython's flags always include re.UNICODE, which a str pattern implies —
+            // unless re.ASCII narrowed the character classes. Bits with no .NET equivalent
+            // are carried through from the argument, because `flags` reports them.
+            Flags = raw
+                | (options.HasFlag(RegexOptions.ECMAScript) ? 256 : 32)
                 | (options.HasFlag(RegexOptions.IgnoreCase) ? 2 : 0)
                 | (options.HasFlag(RegexOptions.Multiline) ? 8 : 0)
                 | (options.HasFlag(RegexOptions.Singleline) ? 16 : 0)
@@ -220,7 +422,7 @@ public static class ReModule
 
             try
             {
-                _regex = new Regex(Translate(pattern), options, MatchTimeout);
+                _regex = new Regex(Translate(pattern, _names, out _count), options, MatchTimeout);
             }
             catch (ArgumentException e)
             {
@@ -231,6 +433,24 @@ public static class ReModule
 
         /// <summary>The pattern text as written.</summary>
         public string Source { get; }
+
+        /// <summary>The named groups, mapped to their numbers.</summary>
+        public IReadOnlyDictionary<string, int> Names => _names;
+
+        /// <summary>How many capturing groups the pattern has.</summary>
+        public int GroupCount => _count;
+
+        private PyDict GroupIndex()
+        {
+            var index = new PyDict();
+
+            foreach (var (name, number) in _names)
+            {
+                index.Set(new PyStr(name), new PyInt(number));
+            }
+
+            return index;
+        }
 
         /// <summary>The flag bits, as CPython reports them.</summary>
         public int Flags { get; }
@@ -274,6 +494,11 @@ public static class ReModule
                 names.Add("re.VERBOSE");
             }
 
+            if ((Flags & 256) != 0)
+            {
+                names.Add("re.ASCII");
+            }
+
             return names.Count == 0
                 ? $"re.compile({PyStr.Quote(Source)})"
                 : $"re.compile({PyStr.Quote(Source)}, {string.Join('|', names)})";
@@ -284,7 +509,8 @@ public static class ReModule
         {
             "pattern" => new PyStr(Source),
             "flags" => new PyInt(Flags),
-            "groups" => new PyInt(_regex.GetGroupNumbers().Length - 1),
+            "groups" => new PyInt(_count),
+            "groupindex" => GroupIndex(),
 
             "match" => new PyBuiltinFunction("match", arguments => MatchAt(arguments[0].Display(), anchored: true)),
             "fullmatch" => new PyBuiltinFunction("fullmatch", arguments => FullMatch(arguments[0].Display())),
@@ -293,16 +519,20 @@ public static class ReModule
             "finditer" => new PyBuiltinFunction("finditer", arguments =>
                 new PyIterator(VirtualMachine.RequireIterable(FindIter(arguments[0].Display())))),
 
-            "split" => new PyBuiltinFunction("split", arguments => Split(arguments[0].Display())),
-
-            "sub" => new PyBuiltinFunction("sub", arguments =>
+            "split" => new PyBuiltinFunction("split", (arguments, keywords) =>
             {
-                Require("sub", arguments, 2, 3, "repl", "string", "count");
+                var bound = Method("split", arguments, keywords, 1, "string", "maxsplit");
+                return Split(Text(bound[0], "string"), bound.Length > 1 ? Count(bound[1]) : 0);
+            }),
+
+            "sub" => new PyBuiltinFunction("sub", (arguments, keywords) =>
+            {
+                var bound = Method("sub", arguments, keywords, 2, "repl", "string", "count");
 
                 return new PyStr(Substitute(
-                    Text(arguments[0], "repl"),
-                    Text(arguments[1], "string"),
-                    arguments.Length > 2 ? Count(arguments[2]) : 0));
+                    Text(bound[0], "repl"),
+                    Text(bound[1], "string"),
+                    bound.Length > 2 ? Count(bound[2]) : 0));
             }),
 
             _ => null,
@@ -315,17 +545,24 @@ public static class ReModule
                 ? _regex.Match(subject) is { Success: true, Index: 0 } atStart ? atStart : Match.Empty
                 : _regex.Match(subject);
 
-            return match.Success ? new PyMatch(match, subject) : PyNone.Instance;
+            return match.Success ? new PyMatch(match, subject, this) : PyNone.Instance;
         }
 
         /// <summary>Matches the whole subject.</summary>
+        /// <remarks>
+        /// The whole subject must match, so the pattern is anchored at both ends rather
+        /// than matched and then measured: `a|ab` against `ab` has to try the second
+        /// alternative, which a plain match would never reach.
+        /// </remarks>
         public PyObject FullMatch(string subject)
         {
-            var match = _regex.Match(subject);
+            var anchored = new Regex(
+                @"\A(?:" + Translate(Source, new Dictionary<string, int>(StringComparer.Ordinal), out _) + @")\z",
+                _regex.Options,
+                MatchTimeout);
+            var match = anchored.Match(subject);
 
-            return match.Success && match.Index == 0 && match.Length == subject.Length
-                ? new PyMatch(match, subject)
-                : PyNone.Instance;
+            return match.Success ? new PyMatch(match, subject, this) : PyNone.Instance;
         }
 
         /// <summary>
@@ -353,11 +590,19 @@ public static class ReModule
 
         /// <summary>Every match, as match objects.</summary>
         public PyObject FindIter(string subject) =>
-            new PyList([.. _regex.Matches(subject).Select(match => (PyObject)new PyMatch(match, subject))]);
+            new PyList([.. _regex.Matches(subject).Select(match => (PyObject)new PyMatch(match, subject, this))]);
 
         /// <summary>Splits the subject on the pattern.</summary>
-        public PyObject Split(string subject) =>
-            new PyList([.. _regex.Split(subject).Select(static piece => (PyObject)new PyStr(piece))]);
+        /// <remarks>
+        /// A <c>maxsplit</c> of zero means "no limit"; a negative one means no splitting at
+        /// all, so the subject comes back whole.
+        /// </remarks>
+        public PyObject Split(string subject, int maxsplit) =>
+            maxsplit < 0
+                ? new PyList([new PyStr(subject)])
+                : new PyList([.. _regex
+                    .Split(subject, maxsplit == 0 ? int.MaxValue : maxsplit + 1)
+                    .Select(static piece => (PyObject)new PyStr(piece))]);
 
         /// <summary>Replaces matches. A count of 0 means "all", as in Python.</summary>
         /// <remarks>
@@ -365,18 +610,95 @@ public static class ReModule
         /// .NET spells as zero rather than as -1.
         /// </remarks>
         public string Substitute(string replacement, string subject, int count) =>
-            _regex.Replace(subject, TranslateReplacement(replacement), count == 0 ? -1 : Math.Max(0, count));
+            _regex.Replace(subject, TranslateReplacement(replacement, _names), count == 0 ? -1 : Math.Max(0, count));
 
         /// <summary>
-        /// Translates the Python-only constructs .NET spells differently.
+        /// Translates the Python-only constructs .NET spells differently, and gives every
+        /// capturing group an explicit name.
         /// </summary>
-        private static string Translate(string pattern) =>
-            pattern.Replace("(?P<", "(?<", StringComparison.Ordinal)
-                .Replace("(?P=", @"\k<", StringComparison.Ordinal)
-                .Replace(@"\Z", @"\z", StringComparison.Ordinal);
+        /// <remarks>
+        /// The naming is what keeps the numbering Python's: .NET numbers the unnamed groups
+        /// first and the named ones after, so a pattern mixing the two would renumber, and
+        /// <c>\2</c> would point at a different group than the script wrote.
+        /// </remarks>
+        private static string Translate(string pattern, Dictionary<string, int> names, out int count)
+        {
+            var builder = new StringBuilder(pattern.Length);
+            var group = 0;
+            var inClass = false;
+            count = 0;
+
+            for (var i = 0; i < pattern.Length; i++)
+            {
+                var c = pattern[i];
+
+                if (c == '\\' && i + 1 < pattern.Length)
+                {
+                    // `\Z` is `\z` in .NET; every other escape passes through.
+                    builder.Append(c).Append(pattern[i + 1] == 'Z' ? 'z' : pattern[++i]);
+
+                    if (pattern[i] == 'Z')
+                    {
+                        i++;
+                    }
+
+                    continue;
+                }
+
+                if (inClass)
+                {
+                    inClass = c != ']';
+                    builder.Append(c);
+                    continue;
+                }
+
+                if (c == '[')
+                {
+                    inClass = true;
+                    builder.Append(c);
+                    continue;
+                }
+
+                if (c != '(')
+                {
+                    builder.Append(c);
+                    continue;
+                }
+
+                // `(?P<name>` names a group, `(?P=name)` back-references one, and every
+                // other `(?` form is a non-capturing construct that keeps its spelling.
+                if (pattern.AsSpan(i).StartsWith("(?P<", StringComparison.Ordinal))
+                {
+                    var close = pattern.IndexOf('>', i);
+                    names[pattern[(i + 4)..close]] = ++group;
+                    builder.Append("(?<g").Append(group).Append('>');
+                    i = close;
+                    continue;
+                }
+
+                if (pattern.AsSpan(i).StartsWith("(?P=", StringComparison.Ordinal))
+                {
+                    var close = pattern.IndexOf(')', i);
+                    builder.Append("\\k<g").Append(names[pattern[(i + 4)..close]]).Append('>');
+                    i = close;
+                    continue;
+                }
+
+                if (i + 1 < pattern.Length && pattern[i + 1] == '?')
+                {
+                    builder.Append(c);
+                    continue;
+                }
+
+                builder.Append("(?<g").Append(++group).Append('>');
+            }
+
+            count = group;
+            return builder.ToString();
+        }
 
         /// <summary>Python's replacement uses <c>\1</c> and <c>\g&lt;name&gt;</c>; .NET uses <c>$1</c>.</summary>
-        private static string TranslateReplacement(string replacement)
+        private static string TranslateReplacement(string replacement, IReadOnlyDictionary<string, int> names)
         {
             var builder = new StringBuilder(replacement.Length);
 
@@ -398,7 +720,17 @@ public static class ReModule
 
                 if (char.IsAsciiDigit(next))
                 {
-                    builder.Append('$').Append(next);
+                    // The groups were renamed to keep Python's numbering, so a numeric
+                    // back-reference names one rather than indexing .NET's order.
+                    var digits = next.ToString();
+
+                    while (i + 1 < replacement.Length && char.IsAsciiDigit(replacement[i + 1]))
+                    {
+                        digits += replacement[++i];
+                    }
+
+                    // Group zero is the whole match, which .NET spells `$0`.
+                    builder.Append(digits.TrimStart('0').Length == 0 ? "$0" : "${g" + digits + "}");
                     continue;
                 }
 
@@ -408,7 +740,15 @@ public static class ReModule
 
                     if (close > 0)
                     {
-                        builder.Append("${").Append(replacement[(i + 2)..close]).Append('}');
+                        var reference = replacement[(i + 2)..close];
+
+                        var target = names.TryGetValue(reference, out var number)
+                            ? number.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                            : reference;
+
+                        // Group zero is the whole match, which .NET spells `$0`.
+                        builder.Append(target == "0" ? "$0" : "${g" + target + "}");
+
                         i = close;
                         continue;
                     }
@@ -429,7 +769,7 @@ public static class ReModule
     }
 
     /// <summary>A match object.</summary>
-    public sealed class PyMatch(Match match, string subject) : PyObject
+    public sealed class PyMatch(Match match, string subject, PyPattern pattern) : PyObject
     {
         /// <inheritdoc />
         public override string TypeName => "re.Match";
@@ -457,9 +797,12 @@ public static class ReModule
             {
                 var fallback = arguments.Length > 0 ? arguments[0] : PyNone.Instance;
 
-                return new PyTuple([.. match.Groups.Keys
-                    .Where(static key => key != "0")
-                    .Select(key => match.Groups[key].Success ? new PyStr(match.Groups[key].Value) : fallback)]);
+                // The groups come back in Python's order, which is the order they were
+                // written in, and an unparticipating one takes the default.
+                return new PyTuple([.. Enumerable.Range(1, pattern.GroupCount)
+                    .Select(number => match.Groups["g" + number] is { Success: true } group
+                        ? new PyStr(group.Value)
+                        : fallback)]);
             }),
 
             "groupdict" => new PyBuiltinFunction("groupdict", (arguments, keywords) =>
@@ -485,13 +828,13 @@ public static class ReModule
 
                 var dict = new PyDict();
 
-                // Only named groups appear in a groupdict; .NET reports numbered ones
-                // under their digits, so those are filtered out.
-                foreach (var key in match.Groups.Keys.Where(static k => !IsNumeric(k)))
+                foreach (var (name, number) in pattern.Names)
                 {
                     dict.Set(
-                        new PyStr(key),
-                        match.Groups[key].Success ? new PyStr(match.Groups[key].Value) : fallback);
+                        new PyStr(name),
+                        match.Groups["g" + number] is { Success: true } group
+                            ? new PyStr(group.Value)
+                            : fallback);
                 }
 
                 return dict;
@@ -514,9 +857,6 @@ public static class ReModule
             _ => null,
         };
 
-        private static bool IsNumeric(string key) =>
-            int.TryParse(key, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out _);
-
         private Group GroupOf(PyObject[] arguments) =>
             arguments.Length == 0 ? match : Resolve(arguments[0]);
 
@@ -533,20 +873,14 @@ public static class ReModule
         {
             // A string key names a group; it is never read as a number, so `m.group('1')`
             // is a missing name rather than group one.
-            if (key is PyInt index)
+            var number = key switch
             {
-                var numbered = match.Groups[(int)index.Value];
+                PyInt index when index.Value >= 0 && index.Value <= pattern.GroupCount => (int)index.Value,
+                PyStr name when pattern.Names.TryGetValue(name.Value, out var found) => found,
+                _ => throw new PyRaise(PyErrors.IndexError("no such group")),
+            };
 
-                return numbered is null || (!numbered.Success && !match.Groups.Keys.Contains(numbered.Name))
-                    ? throw new PyRaise(PyErrors.IndexError("no such group"))
-                    : numbered;
-            }
-
-            var name = key.Display();
-
-            return !IsNumeric(name) && match.Groups.ContainsKey(name)
-                ? match.Groups[name]
-                : throw new PyRaise(PyErrors.IndexError("no such group"));
+            return number == 0 ? match : match.Groups["g" + number];
         }
 
         /// <inheritdoc />
