@@ -148,7 +148,7 @@ public sealed class VirtualMachine
                 builtin.Invoke([instance, .. arguments], keywords);
                 break;
 
-            case null when arguments.Length > 0:
+            case null when arguments.Length > 0 || keywords is { Count: > 0 }:
                 throw new PyRaise(PyErrors.TypeError($"{type.Name}() takes no arguments"));
         }
 

@@ -206,21 +206,25 @@ public sealed class PyClass : PyCallable
     public override string Repr() => $"<class '{Name}'>";
 
     /// <inheritdoc />
+    /// <remarks>
+    /// A class's own name always wins over a member of the same name — <c>C.__name__</c>
+    /// is <c>'C'</c> even when the body assigns <c>__name__</c>, which only an instance
+    /// then sees.
+    /// </remarks>
     public override PyObject? GetAttribute(string name)
     {
+        if (name is "__name__" or "__qualname__")
+        {
+            return new PyStr(Name);
+        }
+
         if (Members.TryGetValue(new PyStr(name), out var value))
         {
             return value;
         }
 
-        return name switch
-        {
-            "__name__" or "__qualname__" => new PyStr(Name),
-
-            // A class with no docstring still has `__doc__`, holding None.
-            "__doc__" => PyNone.Instance,
-            _ => null,
-        };
+        // A class with no docstring still has `__doc__`, holding None.
+        return name == "__doc__" ? PyNone.Instance : null;
     }
 
     /// <inheritdoc />
@@ -509,7 +513,11 @@ public sealed class PyInstance : PyObject
             return Class;
         }
 
-        var classAttribute = Class.GetAttribute(name);
+        // The class namespace is read directly rather than through the class object, so a
+        // member named `__name__` is visible here even though it is shadowed there.
+        var classAttribute = Class.Members.TryGetValue(new PyStr(name), out var member)
+            ? member
+            : Class.GetAttribute(name);
 
         // A function found on the class becomes a bound method when reached through an
         // instance; that binding is what supplies `self`.

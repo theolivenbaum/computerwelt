@@ -1087,6 +1087,15 @@ public sealed class Compiler
             compiler.EmitStore(AnnotationsName, line);
         }
 
+        // A class's leading string literal is its docstring, which becomes `__doc__` in
+        // the namespace — unless the body assigns one itself, which then wins.
+        if (isClassBody && body is [ExpressionStatement { Value: Literal { Value: string docstring } }, ..])
+        {
+            compiler.Declare("__doc__");
+            compiler.Emit(OpCode.LoadConst, compiler._code.AddConstant(new PyStr(docstring)), line);
+            compiler.EmitStore("__doc__", line);
+        }
+
         compiler.CompileStatements(body);
         compiler.Emit(OpCode.LoadConst, compiler._code.AddConstant(PyNone.Instance), line);
         compiler.Emit(OpCode.Return, 0, line);
@@ -1270,6 +1279,10 @@ public sealed class Compiler
             case NamedExpr named:
                 CompileExpression(named.Value);
                 Emit(OpCode.Duplicate, 0, named.Line);
+
+                // A walrus binds in the scope it appears in, which the declaration pre-pass
+                // does not reach: it walks statements, and this is an expression.
+                Declare(named.Target.Id);
                 EmitStore(named.Target.Id, named.Line);
                 break;
 
