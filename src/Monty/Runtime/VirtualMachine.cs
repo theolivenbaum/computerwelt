@@ -107,7 +107,7 @@ public sealed class VirtualMachine
             case PyNamedTupleType namedTuple:
                 return namedTuple.Instantiate(arguments, keywords);
 
-            case PyCallable constructible when Monty.Modules.DatetimeModule.TryConstruct(constructible, arguments) is { } built:
+            case PyCallable constructible when Monty.Modules.DatetimeModule.TryConstruct(constructible, arguments, keywords) is { } built:
                 return built;
 
             case PyExceptionType exceptionType:

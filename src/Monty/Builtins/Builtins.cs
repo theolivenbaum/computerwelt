@@ -338,7 +338,7 @@ public static class BuiltinNamespace
         {
             PyInt integer => new PyInt(BigInteger.Abs(integer.Value)),
             PyFloat number => new PyFloat(Math.Abs(number.Value)),
-            var other => throw new PyRaise(PyErrors.TypeError($"bad operand type for abs(): '{other.TypeName}'")),
+            var other => Operators.Unary("abs", other),
         });
 
         DefineArity("all", 1, 1, static arguments =>

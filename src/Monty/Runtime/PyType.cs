@@ -418,6 +418,11 @@ public static class TypeRegistry
 
                 return builtin.Matches(value);
 
+            // A class object a module supplies — the datetime types among them — answers
+            // for itself.
+            case Modules.DatetimeModule.IPyClassLike classLike:
+                return classLike.Matches(value);
+
             // A value that is plainly not a type — a string, a number, a container — is a
             // mistake in the call rather than a false answer. Anything else that acts as a
             // constructor is left to answer for itself.

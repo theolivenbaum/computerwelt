@@ -108,6 +108,13 @@ public static class Operators
             }
         }
 
+        // The datetime types define their own arithmetic, none of which the general numeric
+        // and sequence rules below would get right.
+        if (Modules.DatetimeModule.TryBinary(op, left, right) is { } moment)
+        {
+            return moment;
+        }
+
         // A dict view takes any iterable on the other side, which a set does not — so its
         // set operators are their own thing rather than a case of the set ones.
         if (op is "&" or "|" or "^" or "-" && ViewOperation(op, left, right) is { } viewResult)
@@ -137,9 +144,15 @@ public static class Operators
     }
 
     /// <summary>Applies a unary operator.</summary>
-    public static PyObject Unary(string op, PyObject operand) => op switch
+    public static PyObject Unary(string op, PyObject operand) =>
+        Modules.DatetimeModule.TryUnary(op, operand) ?? Apply(op, operand);
+
+    private static PyObject Apply(string op, PyObject operand) => op switch
     {
         "not" => PyBool.Of(!operand.IsTruthy()),
+
+        // `abs` reaches here only for a type the builtin itself does not handle.
+        "abs" => throw new PyRaise(PyErrors.TypeError($"bad operand type for abs(): '{operand.TypeName}'")),
 
         "-" => operand switch
         {
@@ -149,7 +162,6 @@ public static class Operators
             PyBool flag => new PyInt(flag.Value ? -1 : 0),
             PyInt integer => new PyInt(-integer.Value),
             PyFloat number => new PyFloat(-number.Value),
-            Modules.DatetimeModule.PyTimeDelta span => new Modules.DatetimeModule.PyTimeDelta(-span.Value),
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary -: '{operand.TypeName}'")),
         },
 
@@ -159,7 +171,7 @@ public static class Operators
             PyInstance instance when instance.Dunder("__pos__") is { } plus =>
                 instance.Invoke(plus, []),
             PyBool flag => new PyInt(flag.Value ? 1 : 0),
-            PyInt or PyFloat or Modules.DatetimeModule.PyTimeDelta => operand,
+            PyInt or PyFloat => operand,
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary +: '{operand.TypeName}'")),
         },
 
