@@ -257,6 +257,44 @@ public sealed class VirtualMachine
         return cells;
     }
 
+    /// <summary>
+    /// Reports an unknown or duplicated keyword, which CPython does before it complains
+    /// about surplus positional arguments.
+    /// </summary>
+    private static void RejectBadKeywords(PyFunction function, PyDict? keywords, HashSet<string> bound)
+    {
+        var parameters = function.Code.Parameters;
+
+        foreach (var (key, _) in keywords?.Entries ?? [])
+        {
+            var name = key.Display();
+
+            if (bound.Contains(name))
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{function.Code.Name}() got multiple values for argument '{name}'"));
+            }
+
+            var known = parameters.Parameters.Any(parameter => parameter.Name == name)
+                || parameters.KeywordOnly.Any(parameter => parameter.Name == name);
+
+            if (!known && parameters.KeywordArgs is null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{function.Code.Name}() got an unexpected keyword argument '{name}'"));
+            }
+        }
+    }
+
+    /// <summary>Formats a list of parameter names the way CPython's arity errors do.</summary>
+    private static string Join(IReadOnlyList<string> names) => names.Count switch
+    {
+        1 => $"'{names[0]}'",
+        2 => $"'{names[0]}' and '{names[1]}'",
+        _ => string.Join(", ", names.Take(names.Count - 1).Select(name => $"'{name}'"))
+            + $", and '{names[^1]}'",
+    };
+
     /// <summary>Binds call arguments to parameter slots, applying defaults and packing varargs.</summary>
     private PyObject?[] BindArguments(PyFunction function, PyObject[] arguments, PyDict? keywords)
     {
@@ -290,8 +328,30 @@ public sealed class VirtualMachine
         }
         else if (extra.Count > 0)
         {
+            // A keyword error is reported first, because CPython binds the keywords before
+            // it counts the positionals.
+            RejectBadKeywords(function, keywords, bound);
+
+            // With defaults the arity is a range, and CPython says so.
+            var required = declared.Count(parameter =>
+                !function.Defaults.TryGetValue(new PyStr(parameter.Name), out _));
+
+            // Keyword-only arguments that bound are counted in a suffix, so the numbers in
+            // the message add up to what the caller actually passed.
+            var keywordOnly = parameters.KeywordOnly
+                .Count(parameter => keywords?.TryGetValue(new PyStr(parameter.Name), out _) == true);
+
             throw new PyRaise(PyErrors.TypeError(
-                $"{code.Name}() takes {declared.Count} positional arguments but {positional.Count} were given"));
+                $"{code.Name}() takes "
+                + (required == declared.Count
+                    ? $"{declared.Count} positional argument{(declared.Count == 1 ? string.Empty : "s")}"
+                    : $"from {required} to {declared.Count} positional arguments")
+                + " but "
+                + (keywordOnly == 0
+                    ? $"{positional.Count} were given"
+                    : $"{positional.Count} positional arguments "
+                        + $"(and {keywordOnly} keyword-only argument{(keywordOnly == 1 ? string.Empty : "s")}) "
+                        + "were given")));
         }
 
         var leftoverKeywords = new PyDict();
@@ -347,6 +407,10 @@ public sealed class VirtualMachine
             locals[code.LocalNames.IndexOf(keywordArgs)] = leftoverKeywords;
         }
 
+        // Every missing parameter is collected before reporting, because CPython names
+        // them all in one message.
+        var missing = new List<string>();
+
         foreach (var parameter in declared.Concat(parameters.KeywordOnly))
         {
             if (bound.Contains(parameter.Name))
@@ -362,8 +426,14 @@ public sealed class VirtualMachine
                 continue;
             }
 
+            missing.Add(parameter.Name);
+        }
+
+        if (missing.Count > 0)
+        {
             throw new PyRaise(PyErrors.TypeError(
-                $"{code.Name}() missing 1 required positional argument: '{parameter.Name}'"));
+                $"{code.Name}() missing {missing.Count} required positional "
+                + $"argument{(missing.Count == 1 ? string.Empty : "s")}: {Join(missing)}"));
         }
 
         return locals;
@@ -924,14 +994,19 @@ public sealed class VirtualMachine
                 var incoming = frame.Pop();
                 var keywordTarget = (PyDict)frame.Peek(instruction.Operand - 1);
 
+                // The callable sits under the positional list, which sits under the map.
+                var name = frame.Peek(instruction.Operand + 1) switch
+                {
+                    PyCallable callee => callee.Name,
+                    PyExceptionType type => type.Name,
+                    _ => "function",
+                };
+
                 if (incoming is not PyDict merged)
                 {
                     throw new PyRaise(PyErrors.TypeError(
-                        $"argument after ** must be a mapping, not {incoming.TypeName}"));
+                        $"{name}() argument after ** must be a mapping, not {incoming.TypeName}"));
                 }
-
-                // The callable sits under the positional list, which sits under the map.
-                var name = frame.Peek(instruction.Operand + 1) is PyCallable callee ? callee.Name : "function";
 
                 foreach (var (key, value) in merged.Entries)
                 {
@@ -952,10 +1027,12 @@ public sealed class VirtualMachine
                 var mapping = frame.Pop();
                 var target = (PyDict)frame.Peek(instruction.Operand - 1);
 
+                // A dict display words this differently from a call, which names the
+                // callable and the `**`.
                 if (mapping is not PyDict source)
                 {
                     throw new PyRaise(PyErrors.TypeError(
-                        $"argument after ** must be a mapping, not {mapping.TypeName}"));
+                        $"'{mapping.TypeName}' object is not a mapping"));
                 }
 
                 foreach (var (key, value) in source.Entries)
