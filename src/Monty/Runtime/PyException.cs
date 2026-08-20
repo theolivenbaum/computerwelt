@@ -244,6 +244,9 @@ public sealed class PyExceptionType : PyObject
     /// <summary><c>PermissionError</c>.</summary>
     public static PyExceptionType PermissionError { get; } = Define("PermissionError", OSError);
 
+    /// <summary><c>re.PatternError</c>, also spelled <c>re.error</c>.</summary>
+    public static PyExceptionType PatternError { get; } = Define("PatternError", ValueError);
+
     /// <summary><c>UnicodeError</c>.</summary>
     public static PyExceptionType UnicodeError { get; } = Define("UnicodeError", ValueError);
 

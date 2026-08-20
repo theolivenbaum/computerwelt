@@ -35,6 +35,15 @@ public sealed class Compiler
 
     private bool _isClassBody;
 
+    /// <summary>
+    /// Whether this scope is a comprehension's implicit function.
+    /// </summary>
+    /// <remarks>
+    /// A walrus inside a comprehension binds in the *enclosing* scope, not the
+    /// comprehension's, so this scope must not claim the target as a local.
+    /// </remarks>
+    private bool _isComprehension;
+
     private Compiler(string name, string fileName, Compiler? parent, bool isFunctionScope)
     {
         _code = new CodeObject(name, fileName);
@@ -1281,8 +1290,12 @@ public sealed class Compiler
                 Emit(OpCode.Duplicate, 0, named.Line);
 
                 // A walrus binds in the scope it appears in, which the declaration pre-pass
-                // does not reach: it walks statements, and this is an expression.
-                Declare(named.Target.Id);
+                // does not reach: it walks statements, and this is an expression. Inside a
+                // comprehension the binding belongs to the enclosing scope instead.
+                if (!_isComprehension)
+                {
+                    Declare(named.Target.Id);
+                }
                 EmitStore(named.Target.Id, named.Line);
                 break;
 
@@ -1536,7 +1549,11 @@ public sealed class Compiler
     {
         const string IterableParameter = ".0";
 
-        var compiler = new Compiler("<comprehension>", _code.FileName, this, isFunctionScope: true);
+        var compiler = new Compiler("<comprehension>", _code.FileName, this, isFunctionScope: true)
+        {
+            _isComprehension = true,
+        };
+
         compiler._locals.Add(IterableParameter);
         compiler._code.LocalSlot(IterableParameter);
         compiler._code.Parameters = new ParameterList([new Parameter(IterableParameter, null, null)], null, [], null);

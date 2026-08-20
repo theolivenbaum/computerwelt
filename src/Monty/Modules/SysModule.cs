@@ -19,7 +19,7 @@ public static class SysModule
         module.Add("maxsize", new PyInt(long.MaxValue));
         module.Add("argv", new PyList([new PyStr("<script>")]));
         module.Add("path", new PyList());
-        module.Add("version", new PyStr("3.14.0 (monty)"));
+        module.Add("version", new PyStr("3.14.0 (Monty)"));
 
         // A structseq, not a namedtuple: named fields but none of the `_`-prefixed helpers.
         module.Add("version_info", new PyNamedTuple(
