@@ -351,10 +351,30 @@ public sealed class PyInstance : PyObject
     }
 
     /// <inheritdoc />
-    public override bool Contains(PyObject item) =>
-        Dunder("__contains__") is { } contains
-            ? Invoke(contains, [item]).IsTruthy()
+    /// <remarks>
+    /// A <c>__contains__</c> of None opts out of <c>in</c> entirely: it is never called,
+    /// and there is no fallback to iteration, so a class that also defines
+    /// <c>__iter__</c> still refuses.
+    /// </remarks>
+    public override bool Contains(PyObject item)
+    {
+        var contains = Dunder("__contains__");
+
+        if (contains is PyNone)
+        {
+            throw new PyRaise(PyErrors.TypeError($"'{Class.Name}' object is not a container"));
+        }
+
+        if (contains is not null)
+        {
+            return Invoke(contains, [item]).IsTruthy();
+        }
+
+        return Iterate() is null
+            ? throw new PyRaise(PyErrors.TypeError(
+                $"argument of type '{Class.Name}' is not a container or iterable"))
             : base.Contains(item);
+    }
 
     /// <inheritdoc />
     public override PyObject GetItem(PyObject index) =>

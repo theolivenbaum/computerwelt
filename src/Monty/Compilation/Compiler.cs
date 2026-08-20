@@ -335,7 +335,9 @@ public sealed class Compiler
         switch (Resolve(name))
         {
             case Binding.Local:
-                Emit(OpCode.LoadLocal, _code.LocalSlot(name), line);
+                // A class body's members are dynamic: a name read before it is bound falls
+                // through to the module rather than raising.
+                Emit(_isClassBody ? OpCode.LoadName : OpCode.LoadLocal, _code.LocalSlot(name), line);
                 break;
 
             case Binding.Cell:

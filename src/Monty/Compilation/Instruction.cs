@@ -28,6 +28,16 @@ public enum OpCode
     /// <summary>Push a global or builtin by name.</summary>
     LoadGlobal,
 
+    /// <summary>
+    /// Pushes a name looked up first in the frame's locals, then in globals.
+    /// </summary>
+    /// <remarks>
+    /// This is CPython's <c>LOAD_NAME</c>, and a class body is the only scope that uses
+    /// it: <c>class C: x = x + 1</c> reads the module's <c>x</c> because the class's own
+    /// <c>x</c> is not bound yet.
+    /// </remarks>
+    LoadName,
+
     /// <summary>Pop and store into the module globals.</summary>
     StoreGlobal,
 

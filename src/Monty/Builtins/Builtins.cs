@@ -78,8 +78,8 @@ public static class BuiltinNamespace
 
         Define("print", (arguments, keywords) =>
         {
-            var separator = Keyword(keywords, "sep")?.Display() ?? " ";
-            var end = Keyword(keywords, "end")?.Display() ?? "\n";
+            var separator = Text(Keyword(keywords, "sep"), "sep") ?? " ";
+            var end = Text(Keyword(keywords, "end"), "end") ?? "\n";
             machine.Write(string.Join(separator, arguments.Select(static a => a.Display())) + end);
             return PyNone.Instance;
         });
@@ -183,6 +183,20 @@ public static class BuiltinNamespace
 
         DefineArity("reversed", 1, 1, static arguments =>
         {
+            // Being iterable is not enough: reversing needs a sequence with a length and
+            // an order, which a one-shot iterator and an unordered set do not have.
+            if (arguments[0] is not (PyList or PyTuple or PyStr or PyBytes or PyRange or PyDict)
+                && (arguments[0] as PyInstance)?.Dunder("__reversed__") is null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"'{arguments[0].TypeName}' object is not reversible"));
+            }
+
+            if (arguments[0] is PyInstance instance && instance.Dunder("__reversed__") is { } reverse)
+            {
+                return instance.Invoke(reverse, []);
+            }
+
             var items = VirtualMachine.RequireIterable(arguments[0]).ToList();
             items.Reverse();
             return new PyIterator(items);
@@ -509,6 +523,17 @@ public static class BuiltinNamespace
     /// The type name of the iterator a value produces, which CPython derives from the
     /// container: <c>list_iterator</c>, <c>str_iterator</c>, and so on.
     /// </summary>
+    /// <summary>
+    /// Reads a keyword that must be a string, or null when it was absent or None.
+    /// </summary>
+    private static string? Text(PyObject? value, string name) => value switch
+    {
+        null or PyNone => null,
+        PyStr text => text.Value,
+        _ => throw new PyRaise(PyErrors.TypeError(
+            $"{name} must be None or a string, not {value.TypeName}")),
+    };
+
     private static string IteratorName(PyObject value) => value switch
     {
         PyList => "list_iterator",

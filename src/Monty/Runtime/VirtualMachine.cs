@@ -604,6 +604,31 @@ public sealed class VirtualMachine
                 return false;
             }
 
+            case OpCode.LoadName:
+            {
+                var name = code.LocalNames[instruction.Operand];
+
+                if (frame.Locals[instruction.Operand] is { } bound)
+                {
+                    frame.Push(bound);
+                    return false;
+                }
+
+                var key = new PyStr(name);
+
+                if (frame.Globals.TryGetValue(key, out var global))
+                {
+                    frame.Push(global);
+                    return false;
+                }
+
+                frame.Push(Builtins.TryGetValue(key, out var builtin)
+                    ? builtin
+                    : throw new PyRaise(PyErrors.NameError(name)));
+
+                return false;
+            }
+
             case OpCode.StoreLocal:
             {
                 var value = frame.Pop();
@@ -1032,13 +1057,26 @@ public sealed class VirtualMachine
 
             case OpCode.UnpackSequence:
             {
-                var values = RequireIterable(frame.Pop()).ToList();
+                var source = frame.Pop();
+                var wanted = instruction.Operand;
 
-                if (values.Count != instruction.Operand)
+                // One item past the target count is enough to detect a surplus, and stopping
+                // there leaves the rest of an iterator available — which is what CPython does.
+                var values = new List<PyObject>(wanted);
+
+                using (var items = Unpackable(source).GetEnumerator())
                 {
-                    throw new PyRaise(PyErrors.ValueError(values.Count < instruction.Operand
-                        ? $"not enough values to unpack (expected {instruction.Operand}, got {values.Count})"
-                        : $"too many values to unpack (expected {instruction.Operand})"));
+                    while (values.Count <= wanted && items.MoveNext())
+                    {
+                        values.Add(items.Current);
+                    }
+                }
+
+                if (values.Count != wanted)
+                {
+                    throw new PyRaise(PyErrors.ValueError(values.Count < wanted
+                        ? $"not enough values to unpack (expected {wanted}, got {values.Count})"
+                        : $"too many values to unpack (expected {wanted})"));
                 }
 
                 // Pushed in reverse so the first target pops first.
@@ -1192,8 +1230,18 @@ public sealed class VirtualMachine
             case OpCode.SetupWith:
             {
                 var manager = frame.Pop();
-                var enter = Attributes.Get(this, manager, "__enter__");
-                var exit = Attributes.Get(this, manager, "__exit__");
+
+                // `__exit__` is checked first, so an object with neither is reported
+                // against it — which is the half CPython names.
+                var exit = Attributes.TryGet(this, manager, "__exit__")
+                    ?? throw new PyRaise(PyErrors.TypeError(
+                        $"'{manager.TypeName}' object does not support the context manager "
+                        + "protocol (missed __exit__ method)"));
+
+                var enter = Attributes.TryGet(this, manager, "__enter__")
+                    ?? throw new PyRaise(PyErrors.TypeError(
+                        $"'{manager.TypeName}' object does not support the context manager "
+                        + "protocol (missed __enter__ method)"));
 
                 frame.Push(exit);
                 frame.Blocks.Add(new Block(BlockKind.With, -1, frame.Stack.Count));
@@ -1326,6 +1374,32 @@ public sealed class VirtualMachine
         var values = frame.Stack.GetRange(start, count);
         frame.Stack.RemoveRange(start, count);
         return values;
+    }
+
+    /// <summary>
+    /// The items of an unpacking source, wording a non-iterable's refusal the way
+    /// unpacking does rather than the way <c>iter()</c> does.
+    /// </summary>
+    private static IEnumerable<PyObject> Unpackable(PyObject source)
+    {
+        IEnumerator<PyObject> items;
+
+        try
+        {
+            items = RequireIterable(source).GetEnumerator();
+        }
+        catch (PyRaise raise) when (raise.Exception.Message == $"'{source.TypeName}' object is not iterable")
+        {
+            throw new PyRaise(PyErrors.TypeError($"cannot unpack non-iterable {source.TypeName} object"));
+        }
+
+        using (items)
+        {
+            while (items.MoveNext())
+            {
+                yield return items.Current;
+            }
+        }
     }
 
     /// <summary>

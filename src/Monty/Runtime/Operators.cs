@@ -38,16 +38,34 @@ public static class Operators
     {
         // An augmented assignment arrives with its `=` still attached: `x += y` is `+=`,
         // which mutates a mutable container instead of building a new one.
-        if (op.Length > 1 && op[^1] == '=')
+        if (op.Length <= 1 || op[^1] != '=')
         {
-            op = op[..^1];
-
-            if (InPlace(op, left, right) is { } mutated)
-            {
-                return mutated;
-            }
+            return Apply(op, left, right);
         }
 
+        var plain = op[..^1];
+
+        if (InPlace(plain, left, right) is { } mutated)
+        {
+            return mutated;
+        }
+
+        try
+        {
+            return Apply(plain, left, right);
+        }
+        catch (PyRaise raise) when (raise.Exception.Message
+            == $"unsupported operand type(s) for {plain}: '{left.TypeName}' and '{right.TypeName}'")
+        {
+            // The fallback ran the plain operator, so its complaint names the plain one;
+            // the script wrote the augmented form and expects to see it.
+            throw new PyRaise(PyErrors.TypeError(
+                $"unsupported operand type(s) for {op}: '{left.TypeName}' and '{right.TypeName}'"));
+        }
+    }
+
+    private static PyObject Apply(string op, PyObject left, PyObject right)
+    {
         // A user class defines an operator by its dunder; the reflected form is tried when
         // the left operand does not implement the forward one.
         if ((left is PyInstance || right is PyInstance) && ArithmeticDunders.TryGetValue(op, out var dunders))
@@ -232,11 +250,12 @@ public static class Operators
                 return new PyBytes([.. x.Value, .. y.Value]);
         }
 
-        // Concatenating a string with anything else is the most common Python type error,
-        // so its message is worth matching exactly.
-        if (left is PyStr)
+        // Concatenating a sequence with something that is not one is the most common
+        // Python type error, so its message is worth matching exactly.
+        if (left is PyStr or PyList or PyTuple)
         {
-            throw new PyRaise(PyErrors.TypeError($"can only concatenate str (not \"{right.TypeName}\") to str"));
+            throw new PyRaise(PyErrors.TypeError(
+                $"can only concatenate {left.TypeName} (not \"{right.TypeName}\") to {left.TypeName}"));
         }
 
         throw new PyRaise(PyErrors.TypeError(
