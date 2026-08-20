@@ -149,6 +149,7 @@ public static class Operators
             PyBool flag => new PyInt(flag.Value ? -1 : 0),
             PyInt integer => new PyInt(-integer.Value),
             PyFloat number => new PyFloat(-number.Value),
+            Modules.DatetimeModule.PyTimeDelta span => new Modules.DatetimeModule.PyTimeDelta(-span.Value),
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary -: '{operand.TypeName}'")),
         },
 
@@ -158,7 +159,7 @@ public static class Operators
             PyInstance instance when instance.Dunder("__pos__") is { } plus =>
                 instance.Invoke(plus, []),
             PyBool flag => new PyInt(flag.Value ? 1 : 0),
-            PyInt or PyFloat => operand,
+            PyInt or PyFloat or Modules.DatetimeModule.PyTimeDelta => operand,
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary +: '{operand.TypeName}'")),
         },
 
@@ -898,7 +899,18 @@ public static class Operators
             throw new PyRaise(PyErrors.ValueError("negative shift count"));
         }
 
-        return new PyInt(RequireInt(left, "<<", left, right) << (int)shift);
+        var value = RequireInt(left, "<<", left, right);
+
+        // Nothing shifted stays nothing however far it moves, so a count too large to apply
+        // is only a problem when there is something to move.
+        if (value.IsZero)
+        {
+            return new PyInt(BigInteger.Zero);
+        }
+
+        return shift > 1_000_000
+            ? throw new PyRaise(new PyException(PyExceptionType.OverflowError, "shift count too large"))
+            : new PyInt(value << (int)shift);
     }
 
     private static PyObject ShiftRight(PyObject left, PyObject right)
@@ -910,7 +922,13 @@ public static class Operators
             throw new PyRaise(PyErrors.ValueError("negative shift count"));
         }
 
-        return new PyInt(RequireInt(left, ">>", left, right) >> (int)shift);
+        var value = RequireInt(left, ">>", left, right);
+
+        // Shifting past the last bit leaves the sign behind: 0 for a positive value, -1 for
+        // a negative one, whatever the count.
+        return shift > 1_000_000
+            ? new PyInt(value.Sign < 0 ? BigInteger.MinusOne : BigInteger.Zero)
+            : new PyInt(value >> (int)shift);
     }
 
     /// <summary>

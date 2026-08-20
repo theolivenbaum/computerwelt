@@ -13,7 +13,6 @@ public static class BuiltinMethods
         PyStr => BindString(target, name),
         PyList => BindList(machine, target, name),
         PyDict => BindDict(machine, target, name),
-        Modules.PyDefaultDict defaults => BindDict(machine, defaults.Entries, name),
         PySet => BindSet(target, name),
         PyView view => BindView(view, name),
         PyTuple => BindTuple(target, name),
@@ -896,9 +895,11 @@ public static class BuiltinMethods
                 return Method(name, receiver, static (self, _, _) => ((PyDict)self).Copy());
 
             case "fromkeys":
-                return Method(name, receiver, 1, 2, static (_, arguments, _) =>
+                return Method(name, receiver, 1, 2, static (self, arguments, _) =>
                 {
-                    var dict = new PyDict();
+                    // A classmethod upstream, so it builds `cls()` — for a subclass that is
+                    // an instance of the subclass, freshly constructed with no arguments.
+                    var dict = ((PyDict)self).Fresh();
                     var value = arguments.Length > 1 ? arguments[1] : PyNone.Instance;
 
                     foreach (var key in VirtualMachine.RequireIterable(arguments[0]))

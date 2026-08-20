@@ -21,9 +21,6 @@ public static class BuiltinNamespace
         void Define(string name, Func<PyObject[], PyDict?, PyObject> implementation) =>
             builtins.Set(new PyStr(name), new PyBuiltinFunction(name, implementation));
 
-        void DefinePositional(string name, Func<PyObject[], PyObject> implementation) =>
-            builtins.Set(new PyStr(name), new PyBuiltinFunction(name, implementation));
-
         // Builtins that dereference a fixed number of arguments declare it, so a missing
         // one becomes a TypeError rather than a host index error escaping to the script.
         void DefineArity(string name, int minimum, int maximum, Func<PyObject[], PyObject> implementation) =>
@@ -78,6 +75,15 @@ public static class BuiltinNamespace
 
         Define("print", (arguments, keywords) =>
         {
+            foreach (var (key, _) in keywords?.Entries ?? [])
+            {
+                if (key.Display() is not ("sep" or "end" or "file" or "flush"))
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"print() got an unexpected keyword argument '{key.Display()}'"));
+                }
+            }
+
             var separator = Text(Keyword(keywords, "sep"), "sep") ?? " ";
             var end = Text(Keyword(keywords, "end"), "end") ?? "\n";
             machine.Write(string.Join(separator, arguments.Select(static a => a.Display())) + end);
@@ -105,22 +111,41 @@ public static class BuiltinNamespace
 
 
 
-        DefineArity("enumerate", 1, 2, static arguments =>
+        Define("enumerate", static (arguments, keywords) =>
         {
-            var start = arguments.Length > 1 ? RequireInt(arguments[1], "enumerate") : BigInteger.Zero;
-            var items = new List<PyObject>();
-            var index = start;
+            string[] names = ["iterable", "start"];
+            var given = Bind("enumerate", names, arguments, keywords);
 
-            foreach (var item in VirtualMachine.RequireIterable(arguments[0]))
+            if (given[0] is null)
             {
-                items.Add(new PyTuple([new PyInt(index++), item]));
+                throw new PyRaise(PyErrors.TypeError("enumerate expected at least 1 argument, got 0"));
             }
 
-            return new PyIterator(items);
+            // The iterable is checked first, so a bad one is reported before the start value
+            // is even looked at — and lazily, so an endless source is fine to enumerate.
+            var source = VirtualMachine.RequireIterable(given[0]!).GetEnumerator();
+            var index = given[1] is null ? BigInteger.Zero : RequireInt(given[1]!, "enumerate");
+
+            return new PyIterator(
+                () => source.MoveNext() ? new PyTuple([new PyInt(index++), source.Current]) : null,
+                "enumerate");
         });
 
-        DefinePositional("zip", static arguments =>
+        Define("zip", static (arguments, keywords) =>
         {
+            var strict = false;
+
+            foreach (var (key, value) in keywords?.Entries ?? [])
+            {
+                if (key.Display() != "strict")
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"zip() got an unexpected keyword argument '{key.Display()}'"));
+                }
+
+                strict = value.IsTruthy();
+            }
+
             // Lazy, so zipping against an endless source such as `itertools.count()`
             // terminates: the shortest side ends it.
             var sources = arguments.Select(static a => VirtualMachine.RequireIterable(a).GetEnumerator()).ToList();
@@ -136,15 +161,37 @@ public static class BuiltinNamespace
 
                     var row = new List<PyObject>(sources.Count);
 
-                    foreach (var source in sources)
+                    for (var i = 0; i < sources.Count; i++)
                     {
-                        if (!source.MoveNext())
+                        if (sources[i].MoveNext())
                         {
-                            spent = true;
-                            return null;
+                            row.Add(sources[i].Current);
+                            continue;
                         }
 
-                        row.Add(source.Current);
+                        spent = true;
+
+                        // Under `strict` the lengths must agree: the argument that ran out
+                        // is named, and so is whether it was short or the others were.
+                        if (strict && i > 0)
+                        {
+                            throw new PyRaise(PyErrors.ValueError(
+                                $"zip() argument {i + 1} is shorter than argument{Plural(i)}"));
+                        }
+
+                        if (strict)
+                        {
+                            for (var j = 1; j < sources.Count; j++)
+                            {
+                                if (sources[j].MoveNext())
+                                {
+                                    throw new PyRaise(PyErrors.ValueError(
+                                        $"zip() argument {j + 1} is longer than argument{Plural(j)}"));
+                                }
+                            }
+                        }
+
+                        return null;
                     }
 
                     return new PyTuple(row);
@@ -220,7 +267,22 @@ public static class BuiltinNamespace
 
         Define("sorted", (arguments, keywords) =>
         {
-            Arity.AtLeast("sorted", arguments, 1);
+            if (arguments.Length != 1)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"sorted expected 1 argument, got {arguments.Length}"));
+            }
+
+            // The keywords are those of `list.sort`, which is what the complaint names.
+            foreach (var (key, _) in keywords?.Entries ?? [])
+            {
+                if (key.Display() is not ("key" or "reverse"))
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"sort() got an unexpected keyword argument '{key.Display()}'"));
+                }
+            }
+
             return new PyList(Sorting.Sort(machine, VirtualMachine.RequireIterable(arguments[0]), keywords));
         });
 
@@ -617,6 +679,52 @@ public static class BuiltinNamespace
         _ => "iterator",
     };
 
+    /// <summary>Binds positional and keyword arguments to a builtin's parameter names.</summary>
+    /// <param name="function">The builtin's name, for the error messages.</param>
+    /// <param name="names">The parameter names, in order.</param>
+    /// <param name="arguments">The positional arguments.</param>
+    /// <param name="keywords">The keyword arguments, if any.</param>
+    /// <returns>One slot per name, null where nothing was given.</returns>
+    private static PyObject?[] Bind(string function, string[] names, PyObject[] arguments, PyDict? keywords)
+    {
+        if (arguments.Length > names.Length)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{function} expected at most {names.Length} arguments, got {arguments.Length}"));
+        }
+
+        var given = new PyObject?[names.Length];
+
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            given[i] = arguments[i];
+        }
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            var position = Array.IndexOf(names, key.Display());
+
+            if (position < 0)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{function}() got an unexpected keyword argument '{key.Display()}'"));
+            }
+
+            if (given[position] is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"{function}() got multiple values for argument '{names[position]}'"));
+            }
+
+            given[position] = value;
+        }
+
+        return given;
+    }
+
+    /// <summary>Names the arguments before position <paramref name="count"/>, singular or as a range.</summary>
+    private static string Plural(int count) => count == 1 ? " 1" : $"s 1-{count}";
+
     private static PyObject? Keyword(PyDict? keywords, string name) =>
         keywords is not null && keywords.TryGetValue(new PyStr(name), out var value) ? value : null;
 
@@ -645,6 +753,14 @@ public static class BuiltinNamespace
             ? VirtualMachine.RequireIterable(arguments[0]).ToList()
             : [.. arguments];
 
+        // A default only makes sense for the one-iterable form: with several candidates
+        // there is always an answer, so asking for a fallback is a mistake.
+        if (arguments.Length > 1 && Keyword(keywords, "default") is not null)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"Cannot specify a default for {name}() with multiple positional arguments"));
+        }
+
         if (items.Count == 0)
         {
             var fallback = Keyword(keywords, "default");
@@ -668,7 +784,8 @@ public static class BuiltinNamespace
                 ?? (IsNaN(itemKey) || IsNaN(bestKey)
                     ? 0
                     : throw new PyRaise(PyErrors.TypeError(
-                        $"'<' not supported between instances of '{itemKey.TypeName}' and '{bestKey.TypeName}'")));
+                        $"'{(smallest ? "<" : ">")}' not supported between instances of "
+                        + $"'{itemKey.TypeName}' and '{bestKey.TypeName}'")));
 
             if (smallest ? comparison < 0 : comparison > 0)
             {
@@ -781,16 +898,66 @@ public static class Conversions
     /// <summary>Implements <c>int()</c>.</summary>
     public static PyObject ToInt(PyObject[] arguments, PyDict? keywords = null)
     {
-        if (arguments.Length == 0)
+        // CPython reaches int() by two routes whose arity messages differ: the vectorcall
+        // fast path when there are no keywords, the argument clinic parser otherwise.
+        var keywordCount = keywords?.Entries.Count ?? 0;
+
+        if (keywordCount == 0 && arguments.Length > 2)
         {
-            return new PyInt(0);
+            throw new PyRaise(PyErrors.TypeError(
+                $"int expected at most 2 arguments, got {arguments.Length}"));
         }
 
-        var given = arguments.Length > 1 ? arguments[1]
-            : keywords is not null && keywords.TryGetValue(new PyStr("base"), out var named) ? named
-            : null;
+        if (arguments.Length + keywordCount > 2)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"int() takes at most 2 arguments ({arguments.Length + keywordCount} given)"));
+        }
 
-        var radix = given is null ? 10 : (int)BuiltinNamespace.RequireInt(given, "int");
+        // The value is positional-only; `base` is the sole name a caller may spell.
+        PyObject? given = arguments.Length > 1 ? arguments[1] : null;
+
+        foreach (var (key, value) in keywords?.Entries ?? [])
+        {
+            if (key.Display() != "base")
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"int() got an unexpected keyword argument '{key.Display()}'"));
+            }
+
+            if (given is not null)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    "int() takes at most 2 arguments (3 given)"));
+            }
+
+            given = value;
+        }
+
+        if (arguments.Length == 0)
+        {
+            // A base with nothing to apply it to is reported before the base itself is
+            // looked at, so `int(base='q')` complains about the missing string.
+            return given is null
+                ? new PyInt(0)
+                : throw new PyRaise(PyErrors.TypeError("int() missing string argument"));
+        }
+
+        // A bool is an int, but not a base: `int('1', True)` asks for base 1. And a base
+        // wider than an ssize_t clamps rather than overflows, landing out of range anyway.
+        var requested = given is null ? 10 : BuiltinNamespace.RequireInt(given, "int");
+        var radix = (int)BigInteger.Clamp(requested, int.MinValue, int.MaxValue);
+
+        if (radix != 0 && radix is < 2 or > 36)
+        {
+            throw new PyRaise(PyErrors.ValueError("int() base must be >= 2 and <= 36, or 0"));
+        }
+
+        // Only a string source takes a base at all.
+        if (given is not null && arguments[0] is not (PyStr or PyBytes))
+        {
+            throw new PyRaise(PyErrors.TypeError("int() can't convert non-string with explicit base"));
+        }
 
         switch (arguments[0])
         {
@@ -831,19 +998,23 @@ public static class Conversions
     /// <param name="original">The argument, which the error message repeats verbatim.</param>
     private static PyObject ParseInt(string source, bool asciiOnly, int radix, PyObject original)
     {
-        var padded = asciiOnly ? source.Trim(' ', '\t', '\n', '\r', '\v', '\f') : source.Trim();
-        var trimmed = padded.Replace("_", string.Empty, StringComparison.Ordinal);
+        var trimmed = asciiOnly ? source.Trim(' ', '\t', '\n', '\r', '\v', '\f') : source.Trim();
+        var digitsOnly = trimmed.Replace("_", string.Empty, StringComparison.Ordinal);
 
-        // A well-formed decimal literal that is merely too long gets the digit-limit error,
-        // and gets it before any number is built; a malformed one gets the ordinary
-        // complaint, however long it is.
-        if (radix is 10 or 0
-            && trimmed.TrimStart('-', '+') is { Length: > PyInt.MaxStringDigits } digits
-            && digits.All(char.IsAsciiDigit))
+        // The digit limit exists because conversion from a non-power-of-two base is
+        // quadratic; base 2, 4, 8, 16 and 32 convert digit by digit and are exempt.
+        var effective = radix == 0 ? 10 : radix;
+        var quadratic = (effective & (effective - 1)) != 0;
+
+        // A malformed literal gets the ordinary complaint however long it is, so the limit
+        // applies only once every character is known to be a digit in this base.
+        if (quadratic
+            && digitsOnly.TrimStart('-', '+') is { Length: > PyInt.MaxStringDigits } digits
+            && digits.All(c => DigitValue(c) is var d && d >= 0 && d < effective))
         {
             throw new PyRaise(PyErrors.ValueError(
                 $"Exceeds the limit ({PyInt.MaxStringDigits} digits) for integer string conversion: "
-                + $"value has {digits.Length} digits"));
+                + $"value has {digits.Length} digits; use sys.set_int_max_str_digits() to increase the limit"));
         }
 
         return TryParseRadix(trimmed, radix, out var parsed)
@@ -851,6 +1022,12 @@ public static class Conversions
             : throw new PyRaise(PyErrors.ValueError(
                 $"invalid literal for int() with base {radix}: {original.Repr()}"));
     }
+
+    /// <summary>The value of a digit character, or -1 when it is not one.</summary>
+    private static int DigitValue(char c) =>
+        char.IsAsciiDigit(c) ? c - '0'
+        : char.IsAsciiLetter(c) ? char.ToLowerInvariant(c) - 'a' + 10
+        : -1;
 
     private static bool TryParseRadix(string text, int radix, out BigInteger value)
     {
@@ -877,6 +1054,8 @@ public static class Conversions
         }
 
         // A literal may carry a radix prefix, which must agree with the requested base.
+        var hadPrefix = false;
+
         if (text.Length > 2 && text[0] == '0')
         {
             var prefix = char.ToLowerInvariant(text[1]);
@@ -888,8 +1067,24 @@ public static class Conversions
             {
                 radix = prefixRadix;
                 text = text[2..];
+                hadPrefix = true;
             }
         }
+
+        // An underscore is a digit separator, so it may only stand between digits — with one
+        // exception, the one that may follow a radix prefix (`0x_ff`).
+        if (hadPrefix && text.StartsWith('_'))
+        {
+            text = text[1..];
+        }
+
+        if (text.Length == 0 || text[0] == '_' || text[^1] == '_'
+            || text.Contains("__", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        text = text.Replace("_", string.Empty, StringComparison.Ordinal);
 
         if (text.Length == 0)
         {
@@ -905,9 +1100,7 @@ public static class Conversions
 
         foreach (var c in text)
         {
-            var digit = char.IsAsciiDigit(c) ? c - '0'
-                : char.IsAsciiLetter(c) ? char.ToLowerInvariant(c) - 'a' + 10
-                : -1;
+            var digit = DigitValue(c);
 
             if (digit < 0 || digit >= radix)
             {

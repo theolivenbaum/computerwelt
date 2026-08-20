@@ -56,6 +56,13 @@ public sealed class PyType : PyCallable
             return new PyStr(Name);
         }
 
+        // A type built by a module may carry its own type-level members, such as an
+        // alternative constructor.
+        if (Members.TryGetValue(name, out var member))
+        {
+            return member;
+        }
+
         // CPython disables the inherited classmethod on Counter, and it is reachable from
         // the type as well as from an instance.
         if (Name == "Counter" && name == "fromkeys")
@@ -92,6 +99,9 @@ public sealed class PyType : PyCallable
 
         return null;
     }
+
+    /// <summary>Type-level attributes beyond the built-in ones, by name.</summary>
+    public Dictionary<string, PyObject> Members { get; } = new(StringComparer.Ordinal);
 
     /// <summary>Constructs an instance.</summary>
     public PyObject Construct(PyObject[] arguments, PyDict? keywords) => _construct(arguments, keywords);
@@ -284,6 +294,9 @@ public static class TypeRegistry
         PyBytes => Bytes,
         PyList => List,
         PyCounter => PyCounter.Type,
+        // A defaultdict reports the type object its own module made, so `type(d) is
+        // defaultdict` holds within an interpreter without sharing one across them.
+        Modules.PyDefaultDict defaults => defaults.Type,
         PyDeque => PyDeque.Type,
         // A named tuple reports its own class, which is what makes `type(p) is Point` hold.
         PyNamedTuple named => named.Type,
@@ -409,7 +422,11 @@ public static class TypeRegistry
 
         if (arguments.Length > 0)
         {
-            if (arguments[0] is PyDict source)
+            // A mapping is copied entry by entry; anything else is read as a sequence of
+            // pairs.
+            var source = arguments[0] as PyDict;
+
+            if (source is not null)
             {
                 foreach (var (key, value) in source.Entries)
                 {
@@ -418,6 +435,8 @@ public static class TypeRegistry
             }
             else
             {
+                var index = 0;
+
                 foreach (var pair in VirtualMachine.RequireIterable(arguments[0]))
                 {
                     var items = VirtualMachine.RequireIterable(pair).ToList();
@@ -427,10 +446,11 @@ public static class TypeRegistry
                     if (items.Count != 2)
                     {
                         throw new PyRaise(PyErrors.ValueError(
-                            $"dictionary update sequence element #0 has length {items.Count}; 2 is required"));
+                            $"dictionary update sequence element #{index} has length {items.Count}; 2 is required"));
                     }
 
                     dict.Set(items[0], items[1]);
+                    index++;
                 }
             }
         }

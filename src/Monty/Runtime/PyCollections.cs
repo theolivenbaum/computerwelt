@@ -556,7 +556,7 @@ public class PyDict : PyObject
     /// <summary>A shallow copy.</summary>
     public PyDict Copy()
     {
-        var copy = new PyDict();
+        var copy = Blank();
 
         foreach (var (key, value) in _entries)
         {
@@ -565,6 +565,24 @@ public class PyDict : PyObject
 
         return copy;
     }
+
+    /// <summary>
+    /// A new, empty dict of this kind.
+    /// </summary>
+    /// <remarks>
+    /// A subclass copies to its own type — `defaultdict(int, ...).copy()` is a defaultdict
+    /// with the same factory, not a plain dict.
+    /// </remarks>
+    protected virtual PyDict Blank() => new();
+
+    /// <summary>
+    /// A new dict of this kind as its no-argument constructor would build it.
+    /// </summary>
+    /// <remarks>
+    /// This is what the `fromkeys` classmethod builds. It differs from <see cref="Blank"/>
+    /// for a defaultdict: a copy keeps the factory, `cls()` has none.
+    /// </remarks>
+    public virtual PyDict Fresh() => new();
 }
 
 /// <summary>Wraps a key so a .NET dictionary uses Python's hash and equality.</summary>

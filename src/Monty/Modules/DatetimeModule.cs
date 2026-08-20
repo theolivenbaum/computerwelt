@@ -237,7 +237,7 @@ public static class DatetimeModule
     }
 
     /// <summary>A <c>timedelta</c>.</summary>
-    internal sealed class PyTimeDelta(TimeSpan value) : PyObject
+    public sealed class PyTimeDelta(TimeSpan value) : PyObject
     {
         /// <summary>The wrapped span.</summary>
         public TimeSpan Value => value;

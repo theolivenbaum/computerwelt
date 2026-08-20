@@ -28,8 +28,7 @@ public static class SupportModules
             return dict;
         }));
 
-        module.Add("defaultdict", new PyBuiltinFunction("defaultdict", arguments =>
-            new PyDefaultDict(machine, arguments.Length > 0 && arguments[0] is not PyNone ? arguments[0] : null)));
+        module.Add("defaultdict", PyDefaultDict.MakeType(machine));
 
         module.Add("deque", PyDeque.Type);
 
@@ -639,63 +638,161 @@ internal sealed class TypeAlias(string name) : PyObject
     public override PyObject? GetAttribute(string attribute) => null;
 }
 
-/// <summary><c>collections.defaultdict</c>.</summary>
-public sealed class PyDefaultDict(VirtualMachine machine, PyObject? factory) : PyObject
+/// <summary>
+/// <c>collections.defaultdict</c>.
+/// </summary>
+/// <remarks>
+/// A real dict subclass, because scripts check: `isinstance(d, dict)` holds, and every dict
+/// method works on it unchanged. All it adds is what happens on a missing key.
+/// </remarks>
+public sealed class PyDefaultDict : PyDict
 {
-    private readonly PyDict _entries = new();
+    private readonly VirtualMachine _machine;
 
-    /// <inheritdoc />
-    public override string TypeName => "defaultdict";
-
-    /// <inheritdoc />
-    public override string Repr() => $"defaultdict({factory?.Repr() ?? "None"}, {_entries.Repr()})";
-
-    /// <inheritdoc />
-    public override bool IsTruthy() => _entries.Count > 0;
-
-    /// <inheritdoc />
-    public override int? Length() => _entries.Count;
-
-    /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => _entries.Iterate();
-
-    /// <inheritdoc />
-    public override bool Contains(PyObject item) => _entries.Contains(item);
-
-    /// <inheritdoc />
-    public override bool PyEquals(PyObject other) =>
-        other is PyDefaultDict defaults ? _entries.PyEquals(defaults._entries) : _entries.PyEquals(other);
-
-    /// <inheritdoc />
-    public override PyObject GetItem(PyObject index)
+    /// <summary>Creates a defaultdict.</summary>
+    /// <param name="machine">The interpreter that calls the factory.</param>
+    /// <param name="type">The type object this instance reports.</param>
+    /// <param name="factory">What builds a missing value, or null for none.</param>
+    public PyDefaultDict(VirtualMachine machine, PyType type, PyObject? factory)
     {
-        if (_entries.TryGetValue(index, out var value))
+        _machine = machine;
+        Type = type;
+        Factory = factory;
+    }
+
+    /// <summary>
+    /// Builds the type object for one interpreter.
+    /// </summary>
+    /// <remarks>
+    /// One per interpreter rather than one shared statically, because constructing a
+    /// defaultdict needs the interpreter that will later call its factory — and two
+    /// sandboxes must share no mutable state.
+    /// </remarks>
+    /// <param name="machine">The interpreter this type belongs to.</param>
+    /// <returns>The type object, which is also what <c>type(d)</c> answers.</returns>
+    public static PyType MakeType(VirtualMachine machine)
+    {
+        PyType? self = null;
+
+        self = new PyType(
+            "collections.defaultdict",
+            static value => value is PyDefaultDict,
+            (arguments, keywords) => Create(machine, self!, arguments, keywords));
+
+        // Unlike Counter, defaultdict keeps the inherited classmethod — and it builds a
+        // defaultdict, with no factory, rather than a plain dict.
+        self.Members["fromkeys"] = new PyBuiltinFunction("fromkeys", arguments =>
         {
-            return value;
+            // Inherited from dict, so the arity complaints name the bare method.
+            if (arguments.Length == 0)
+            {
+                throw new PyRaise(PyErrors.TypeError("fromkeys expected at least 1 argument, got 0"));
+            }
+
+            if (arguments.Length > 2)
+            {
+                throw new PyRaise(PyErrors.TypeError(
+                    $"fromkeys expected at most 2 arguments, got {arguments.Length}"));
+            }
+
+            var created = new PyDefaultDict(machine, self, null);
+            var value = arguments.Length > 1 ? arguments[1] : PyNone.Instance;
+
+            foreach (var key in VirtualMachine.RequireIterable(arguments[0]))
+            {
+                created.Set(key, value);
+            }
+
+            return created;
+        });
+
+        return self;
+    }
+
+    /// <summary>The type object this instance reports, which is the module's own.</summary>
+    public PyType Type { get; }
+
+    /// <summary>What builds a missing value, or null when there is none.</summary>
+    /// <remarks>
+    /// Writable, and CPython does not check what it is written: a non-callable is stored as
+    /// it stands and only fails when a missing key actually asks it for a value.
+    /// </remarks>
+    public PyObject? Factory { get; set; }
+
+    /// <inheritdoc />
+    public override string TypeName => "collections.defaultdict";
+
+    /// <summary>Builds one from the constructor's arguments.</summary>
+    /// <param name="machine">The interpreter that calls the factory.</param>
+    /// <param name="type">The type object the new instance reports.</param>
+    /// <param name="arguments">The factory, then any initial data.</param>
+    /// <param name="keywords">Initial entries given by name.</param>
+    /// <returns>The new defaultdict.</returns>
+    public static PyObject Create(VirtualMachine machine, PyType type, PyObject[] arguments, PyDict? keywords)
+    {
+        var factory = arguments.Length > 0 && arguments[0] is not PyNone ? arguments[0] : null;
+
+        // The constructor is stricter than the setter: it rejects a non-callable outright.
+        if (factory is not (null or PyCallable or PyType or PyClass or PyNamedTupleType or PyExceptionType))
+        {
+            throw new PyRaise(PyErrors.TypeError("first argument must be callable or None"));
         }
 
-        // A missing key is created from the factory, which is the whole point of the type.
-        if (factory is null)
+        var created = new PyDefaultDict(machine, type, factory);
+        var initial = TypeRegistry.Dict.Construct([.. arguments.Skip(1)], keywords);
+
+        foreach (var (key, value) in ((PyDict)initial).Entries)
         {
-            throw new PyRaise(PyErrors.KeyError(index));
+            created.Set(key, value);
         }
 
-        var created = machine.Call(factory, []);
-        _entries.Set(index, created);
         return created;
     }
 
     /// <inheritdoc />
-    public override void SetItem(PyObject index, PyObject value) => _entries.Set(index, value);
+    public override string Repr() => $"defaultdict({Factory?.Repr() ?? "None"}, {base.Repr()})";
 
     /// <inheritdoc />
-    public override void DeleteItem(PyObject index) => _entries.DeleteItem(index);
+    public override PyObject GetItem(PyObject index) =>
+        TryGetValue(index, out var value) ? value : Missing(index);
 
     /// <inheritdoc />
-    public override PyObject? GetAttribute(string name) =>
-        // Delegating to the wrapped dict gives every dict method for free.
-        name == "default_factory" ? factory ?? PyNone.Instance : _entries.GetAttribute(name);
+    public override PyObject? GetAttribute(string name) => name switch
+    {
+        "default_factory" => Factory ?? PyNone.Instance,
+        "__missing__" => new PyBuiltinFunction("__missing__", arguments => Missing(arguments[0])),
+        _ => base.GetAttribute(name),
+    };
 
-    /// <summary>The wrapped dictionary, for method dispatch.</summary>
-    public PyDict Entries => _entries;
+    /// <inheritdoc />
+    public override bool SetAttribute(string name, PyObject value)
+    {
+        if (name != "default_factory")
+        {
+            return base.SetAttribute(name, value);
+        }
+
+        Factory = value is PyNone ? null : value;
+        return true;
+    }
+
+    /// <inheritdoc />
+    protected override PyDict Blank() => new PyDefaultDict(_machine, Type, Factory);
+
+    /// <inheritdoc />
+    public override PyDict Fresh() => new PyDefaultDict(_machine, Type, null);
+
+    /// <summary>Builds the value a missing key gets, and stores it.</summary>
+    private PyObject Missing(PyObject key)
+    {
+        // A missing key is created from the factory, which is the whole point of the type.
+        if (Factory is null)
+        {
+            throw new PyRaise(PyErrors.KeyError(key));
+        }
+
+        var created = _machine.Call(Factory, []);
+        Set(key, created);
+        return created;
+    }
 }

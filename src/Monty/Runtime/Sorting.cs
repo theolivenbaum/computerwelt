@@ -28,6 +28,14 @@ public static class Sorting
             }
         }
 
+        // A descending sort is an ascending sort of the reversed list, reversed again —
+        // which is how CPython does it, and why elements with equal keys keep their
+        // original order rather than having it flipped along with everything else.
+        if (reverse)
+        {
+            source.Reverse();
+        }
+
         var decorated = new List<Entry>(source.Count);
 
         foreach (var item in source)
