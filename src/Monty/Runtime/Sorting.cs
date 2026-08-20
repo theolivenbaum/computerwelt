@@ -17,6 +17,15 @@ public static class Sorting
 
         if (keywords is not null)
         {
+            foreach (var (name, _) in keywords.Entries)
+            {
+                if (name.Display() is not ("key" or "reverse"))
+                {
+                    throw new PyRaise(PyErrors.TypeError(
+                        $"sort() got an unexpected keyword argument '{name.Display()}'"));
+                }
+            }
+
             if (keywords.TryGetValue(new PyStr("key"), out var keyFunction) && keyFunction is not PyNone)
             {
                 key = keyFunction;

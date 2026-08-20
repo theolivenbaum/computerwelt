@@ -1,4 +1,5 @@
 using System.Globalization;
+using GlobalizationCategory = System.Globalization.UnicodeCategory;
 using System.Numerics;
 using System.Text;
 
@@ -74,6 +75,24 @@ public static class BuiltinMethods
 
             return implementation(self, arguments, keywords);
         });
+
+    /// <summary>
+    /// Rejects more arguments than a method takes, counting positional and keyword together.
+    /// </summary>
+    /// <remarks>
+    /// A parameter that may be spelled either way is one parameter however it is spelled, so
+    /// giving it twice is a count error rather than a duplicate one.
+    /// </remarks>
+    private static void Total(string method, PyObject[] arguments, PyDict? keywords, int maximum)
+    {
+        var total = arguments.Length + (keywords?.Count ?? 0);
+
+        if (total > maximum)
+        {
+            throw new PyRaise(PyErrors.TypeError(
+                $"{method}() takes at most {maximum} argument{(maximum == 1 ? string.Empty : "s")} ({total} given)"));
+        }
+    }
 
     /// <summary>
     /// Reads one named keyword, rejecting any other. A method that takes keywords must
@@ -161,6 +180,8 @@ public static class BuiltinMethods
             case "splitlines":
                 return Method(name, receiver, 0, 1, (self, arguments, keywords) =>
                 {
+                    Total(name, arguments, keywords, 1);
+
                     var keepEnds = arguments.Length > 0
                         ? arguments[0].IsTruthy()
                         : Keyword(keywords, name, "keepends")?.IsTruthy() ?? false;
@@ -344,8 +365,10 @@ public static class BuiltinMethods
                 return Method(name, receiver, static (self, arguments, keywords) =>
                     new PyStr(BraceFormatter.Format(((PyStr)self).Value, arguments, keywords)));
 
+            // The three numeric predicates widen in turn: a decimal digit is a digit, and a
+            // digit is numeric, but a vulgar fraction is only the last of the three.
             case "isdigit":
-                return Predicate(receiver, name, static text => text.Length > 0 && text.All(char.IsDigit));
+                return Predicate(receiver, name, static text => text.Length > 0 && text.All(IsDigitLike));
 
             case "isalpha":
                 return Predicate(receiver, name, static text => text.Length > 0 && text.All(char.IsLetter));
@@ -362,8 +385,15 @@ public static class BuiltinMethods
             case "islower":
                 return Predicate(receiver, name, static text => text.Any(char.IsLetter) && !text.Any(char.IsUpper));
 
-            case "isnumeric" or "isdecimal":
-                return Predicate(receiver, name, static text => text.Length > 0 && text.All(char.IsDigit));
+            case "isdecimal":
+                return Predicate(receiver, name, static text => text.Length > 0
+                    && text.All(static c => char.GetUnicodeCategory(c) == GlobalizationCategory.DecimalDigitNumber));
+
+            case "isnumeric":
+                return Predicate(receiver, name, static text => text.Length > 0 && text.All(static c =>
+                    char.GetUnicodeCategory(c) is GlobalizationCategory.DecimalDigitNumber
+                        or GlobalizationCategory.LetterNumber
+                        or GlobalizationCategory.OtherNumber));
 
             case "isascii":
                 return Predicate(receiver, name, static text => text.All(char.IsAscii));
@@ -372,7 +402,7 @@ public static class BuiltinMethods
                 return Predicate(receiver, name, Identifiers.IsIdentifier);
 
             case "istitle":
-                return Predicate(receiver, name, static text => text.Length > 0 && text == TitleCase(text));
+                return Predicate(receiver, name, static text => IsTitle(text));
 
             case "zfill":
                 return Method(name, receiver, 1, (self, arguments, _) =>
@@ -479,9 +509,13 @@ public static class BuiltinMethods
                 return null;
 
             case "expandtabs":
-                return Method(name, receiver, (self, arguments, _) =>
+                return Method(name, receiver, (self, arguments, keywords) =>
                 {
-                    var size = arguments.Length > 0 ? Int(arguments[0], "tabsize") : 8;
+                    Total(name, arguments, keywords, 1);
+
+                    var size = arguments.Length > 0
+                        ? Int(arguments[0], "tabsize")
+                        : Keyword(keywords, name, "tabsize") is { } named ? Int(named, "tabsize") : 8;
                     var builder = new StringBuilder();
                     var column = 0;
 
@@ -489,14 +523,18 @@ public static class BuiltinMethods
                     {
                         if (c == '\t')
                         {
-                            var advance = size - (column % size);
-                            builder.Append(new string(' ', advance));
+                            // A tab size of zero or less deletes the tab rather than
+                            // advancing to a tab stop there is no room for.
+                            var advance = size > 0 ? size - (column % size) : 0;
+                            builder.Append(' ', advance);
                             column += advance;
                             continue;
                         }
 
                         builder.Append(c);
-                        column = c == '\n' ? 0 : column + 1;
+
+                        // Both line terminators start a new line, so both reset the column.
+                        column = c is '\n' or '\r' ? 0 : column + 1;
                     }
 
                     return new PyStr(builder.ToString());
@@ -1120,6 +1158,70 @@ public static class BuiltinMethods
     }
 
     // ---- tuple, bytes, int, float ----
+
+    /// <summary>
+    /// Whether a character is a digit: a decimal one, or one of the superscript, subscript
+    /// and enclosed forms that stand for a single digit.
+    /// </summary>
+    private static bool IsDigitLike(char c)
+    {
+        var category = char.GetUnicodeCategory(c);
+
+        if (category == GlobalizationCategory.DecimalDigitNumber)
+        {
+            return true;
+        }
+
+        // A fraction is numeric but not a digit, which is what the whole-number test rules
+        // out — as does a value that stands for more than one digit.
+        var value = CharUnicodeInfo.GetNumericValue(c);
+
+        return category == GlobalizationCategory.OtherNumber
+            && value is >= 0 and <= 9
+            && value == Math.Floor(value);
+    }
+
+    /// <summary>
+    /// Whether a string is title-cased: every cased run starts upper and continues lower.
+    /// </summary>
+    /// <remarks>
+    /// Not the same as comparing against `title()`: an apostrophe is uncased, so `They'Re`
+    /// is title-cased even though it does not read like it.
+    /// </remarks>
+    private static bool IsTitle(string text)
+    {
+        var cased = false;
+        var previousCased = false;
+
+        foreach (var c in text)
+        {
+            if (char.IsUpper(c) || char.GetUnicodeCategory(c) == GlobalizationCategory.TitlecaseLetter)
+            {
+                if (previousCased)
+                {
+                    return false;
+                }
+
+                previousCased = true;
+                cased = true;
+            }
+            else if (char.IsLower(c))
+            {
+                if (!previousCased)
+                {
+                    return false;
+                }
+
+                cased = true;
+            }
+            else
+            {
+                previousCased = false;
+            }
+        }
+
+        return cased;
+    }
 
     private static PyObject? BindTuple(PyObject receiver, string name) => name switch
     {

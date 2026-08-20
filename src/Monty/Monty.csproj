@@ -8,6 +8,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The Unicode character database, which the host runtime does not expose. -->
+    <EmbeddedResource Include="Runtime/UnicodeData.bin" LogicalName="Monty.Runtime.UnicodeData.bin" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="Monty.SpecTests" />
     <InternalsVisibleTo Include="Monty.Tests" />
   </ItemGroup>

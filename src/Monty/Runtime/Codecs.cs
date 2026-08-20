@@ -239,6 +239,26 @@ public static class Codecs
                 return Encoding.ASCII.GetBytes(builder.ToString());
             }
 
+            case "namereplace":
+            {
+                var builder = new StringBuilder();
+
+                for (var i = start; i < end; i++)
+                {
+                    var code = char.IsHighSurrogate(text[i]) && i + 1 < end
+                        ? char.ConvertToUtf32(text[i], text[++i])
+                        : text[i];
+
+                    // A character with no name — a C1 control, say — falls back to the
+                    // backslash escape, since there is no `\N{...}` to write.
+                    builder.Append(UnicodeData.Name(code) is { } name
+                        ? $"\\N{{{name}}}"
+                        : Escape(char.ConvertFromUtf32(code)));
+                }
+
+                return Encoding.ASCII.GetBytes(builder.ToString());
+            }
+
             // These only rescue lone surrogates, which cannot appear here, so they behave
             // exactly as `strict` does.
             case "strict" or "surrogateescape" or "surrogatepass":

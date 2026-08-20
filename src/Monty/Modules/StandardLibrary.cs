@@ -48,6 +48,7 @@ public static class StandardLibrary
         ["collections"] = SupportModules.CreateCollections(machine),
         ["itertools"] = SupportModules.CreateItertools(machine),
         ["gc"] = SupportModules.CreateGc(),
+        ["unicodedata"] = UnicodedataModule.Create(),
         ["typing"] = SupportModules.CreateTyping(),
         ["__future__"] = new PyModuleObject("__future__").Add("annotations", PyNone.Instance),
     };
