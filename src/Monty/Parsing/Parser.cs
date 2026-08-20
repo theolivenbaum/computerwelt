@@ -698,8 +698,10 @@ public sealed class Parser
                     depth--;
                     if (depth == 0)
                     {
-                        // `with (...) :` is a tuple context manager, not an item list.
-                        return i + 1 < _tokens.Count && !_tokens[i + 1].Is(":") && !_tokens[i + 1].Is("as");
+                        // Only a `:` straight after the closing paren makes it an item
+                        // list; anything else — `.open()`, `as`, an operator — means the
+                        // parentheses were part of an expression.
+                        return i + 1 < _tokens.Count && _tokens[i + 1].Is(":");
                     }
 
                     break;
@@ -754,6 +756,21 @@ public sealed class Parser
     }
 
     /// <summary>
+    /// Consumes the annotation on a <c>*args</c> or <c>**kwargs</c> parameter.
+    /// </summary>
+    /// <remarks>
+    /// It is parsed and dropped, like every other annotation: the runtime erases them, and
+    /// only their presence has to be accepted.
+    /// </remarks>
+    private void SkipAnnotation(bool allowed)
+    {
+        if (allowed && Match(":"))
+        {
+            ParseExpression();
+        }
+    }
+
+    /// <summary>
     /// Parses a formal parameter list up to <paramref name="terminator"/>.
     /// </summary>
     /// <remarks>
@@ -793,6 +810,7 @@ public sealed class Parser
                 if (!Current.Is(",") && !Current.Is(terminator))
                 {
                     varArgs = Advance().Text;
+                    SkipAnnotation(allowAnnotations);
                 }
 
                 if (!Match(","))
@@ -806,6 +824,7 @@ public sealed class Parser
             if (Match("**"))
             {
                 keywordArgs = Advance().Text;
+                SkipAnnotation(allowAnnotations);
                 Match(",");
                 break;
             }
@@ -1178,16 +1197,21 @@ public sealed class Parser
                 _index++;
                 return At(new Literal(double.Parse(token.Text, CultureInfo.InvariantCulture)), token);
 
-            case TokenKind.String:
-                return At(new Literal(ConcatenateStrings()), token);
+            case TokenKind.String or TokenKind.FString:
+                return At(ConcatenateStrings(), token);
 
             case TokenKind.Bytes:
-                _index++;
-                return At(new Literal(System.Text.Encoding.Latin1.GetBytes(token.Text)), token);
+            {
+                // Adjacent bytes literals concatenate, exactly as strings do.
+                var bytes = new System.Text.StringBuilder();
 
-            case TokenKind.FString:
-                _index++;
-                return At(FStringParser.Parse(token.Text), token);
+                while (Current.Kind == TokenKind.Bytes)
+                {
+                    bytes.Append(Advance().Text);
+                }
+
+                return At(new Literal(System.Text.Encoding.Latin1.GetBytes(bytes.ToString())), token);
+            }
 
             case TokenKind.Name:
                 _index++;
@@ -1242,16 +1266,34 @@ public sealed class Parser
     /// Concatenates adjacent string literals, which Python treats as one literal:
     /// <c>'a' 'b'</c> is <c>'ab'</c>.
     /// </summary>
-    private string ConcatenateStrings()
+    /// <remarks>
+    /// An f-string may join the run — <c>f'x' 'y'</c> is one f-string — so the result is a
+    /// formatted string whenever any piece was one, and a plain literal otherwise.
+    /// </remarks>
+    private Expression ConcatenateStrings()
     {
-        var builder = new System.Text.StringBuilder(Advance().Text);
+        var parts = new List<FormatPart>();
+        var text = new System.Text.StringBuilder();
+        var formatted = false;
 
-        while (Current.Kind == TokenKind.String)
+        while (Current.Kind is TokenKind.String or TokenKind.FString)
         {
-            builder.Append(Advance().Text);
+            var piece = Advance();
+
+            if (piece.Kind == TokenKind.String)
+            {
+                text.Append(piece.Text);
+
+                // The tokenizer has already decoded a plain string, so it goes in as-is.
+                parts.Add(new FormatPart(piece.Text, null, '\0', null));
+                continue;
+            }
+
+            formatted = true;
+            parts.AddRange(FStringParser.Parse(piece.Text).Parts);
         }
 
-        return builder.ToString();
+        return formatted ? new FormattedString(parts) : new Literal(text.ToString());
     }
 
     private Expression ParseParenthesized()
