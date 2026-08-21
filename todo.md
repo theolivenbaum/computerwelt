@@ -26,9 +26,12 @@ builtins, the stdlib subset, dunder dispatch and the external-function boundary 
 place. **557 / 558 fixtures passing (99.8 %)**, with 40 unit tests covering what the
 corpus does not reach. No host exception escapes to a script.
 
-**Current state — joined:** 12 integration tests over one filesystem, and 195 green in
-`tests/Computerwelt.AgentTests/` — 138 covering the shell and Python operations a caller
+**Current state — joined:** 12 integration tests over one filesystem, and 207 green in
+`tests/Computerwelt.AgentTests/` — 150 covering the shell and Python operations a caller
 actually performs, plus upstream's 57 `python` command cases.
+
+**Extensions:** 10 fixtures in `tests/monty-extensions/` cover behaviour upstream does not
+have. They are kept apart from upstream's corpus deliberately — see below.
 
 The one remaining fixture is a documented divergence, not a gap — see below.
 
@@ -60,14 +63,37 @@ Replaying found five defects the corpora between them did not:
 | `python -c "2 + 3"` | Printed nothing | Echoes the value, as upstream's corpus pins. Only for `-c`: a heredoc patch script ending in `open(p, 'w').write(s)` must not emit a stray byte count |
 | `python` in the middle of a pipeline | `input` and `sys.stdin` did not exist | Both read the shell's standard input, when the program did not come from it |
 
-`io` was added at the same time — `io.open` is the spelling a patch script uses to state an
-encoding, and `io.StringIO` / `io.BytesIO` are the in-memory streams that go with it.
+## Extensions beyond Monty  (`tests/monty-extensions/`)
+
+Some of what the agent suite wanted was not a defect but an absence: upstream Monty has no
+way to match a pattern against a filename, and no way to walk a tree. Those are now
+implemented, and because they are additions rather than ports they are tested apart from
+upstream's corpus — a fixture in `tests/monty-extensions/` fails on upstream Monty by
+construction, usually at the import. `COMPUTERWELT_SKIP_EXTENSIONS=1` switches the folder
+off, which is the check that the port still stands on upstream's corpus alone.
+
+| Added | Surface | Fixture |
+|---|---|---|
+| `glob` | `glob`, `iglob`, `escape`, `has_magic`; `**` with `recursive=`, `root_dir=`, `include_hidden=` | `glob__patterns.py` |
+| `fnmatch` | `fnmatch`, `fnmatchcase`, `filter`, `translate` — no filesystem needed, so importable without one | `fnmatch__patterns.py` |
+| `os.walk` | top-down and bottom-up, `onerror`, and pruning via the directory list | `os__walk.py` |
+| `os.scandir` | `DirEntry` with `name`, `path`, `is_dir`, `is_file`, `stat`, `__fspath__`; a context manager | `os__scandir.py` |
+| `os.path` | `relpath`, `commonpath`, `commonprefix`, `realpath`, `normcase`, `lexists`, `getmtime`, `expanduser`; `normpath` now collapses `..` | `os__path_extended.py` |
+| `import os.path` | `os.path` and `posixpath` are importable names for the object `os.path` already was; `import a.b` binds `a`, as CPython does | `os__path_extended.py` |
+| `Path.glob` / `rglob` / `match` / `full_match` / `walk` | upstream's `Path` had `iterdir` and nothing more | `pathlib__glob.py` |
+| `io` | `io.open`, `StringIO`, `BytesIO`, `UnsupportedOperation` | `io__module.py` |
+| `sys.argv`, `sys.exit`, `input`, `sys.stdin` | the host-facing four from the previous round | `sys__*.py` |
+
+One engine sits behind `fnmatch`, `glob` and `Path.glob`, because CPython's three agree on
+what a pattern means and differ only in what they match it against. `os.walk` is iterative
+and lazy: iterative because recursion would spend the *host's* stack on the depth of a tree
+the program chose, and lazy because pruning only works if the descent happens after the
+caller's turn.
 
 Recorded, not fixed, because upstream defines the surface and this port follows it:
 
 | Absent | Note |
 |---|---|
-| `os.walk`, `glob`, `fnmatch` | Upstream's `os` exposes eleven operations and tree-walking is not one. A five-line recursion over `os.listdir` replaces it, which is what `StandardLibrarySurfaceTests` demonstrates |
 | `open(..., newline='')` | Refused, though nothing here translates line endings and it would describe what already happens. `tests/monty-spec/open__fs.py` pins the refusal; binary mode is the way to ask for exact bytes |
 | `shutil`, `argparse`, `textwrap`, `difflib`, `tempfile`, `csv`, `hashlib`, `base64`, `string`, `functools`, … | Not ported. `StandardLibrarySurfaceTests` lists the set in both directions, so adding one is a deliberate edit rather than a silent widening |
 

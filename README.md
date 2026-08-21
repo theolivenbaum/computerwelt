@@ -82,6 +82,7 @@ behaves identically on Linux, macOS and Windows.
 | `tests/Computerwelt.Emulation.Bash.SpecTests/` | shell conformance runner |
 | `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
 | `tests/monty-spec/` | 568 Python fixtures carried over from monty |
+| `tests/monty-extensions/` | fixtures for behaviour monty does **not** have, kept apart on purpose |
 | `.reference/` | the vendored Rust sources, read-only, used as the specification |
 
 ## Building and testing
@@ -103,13 +104,24 @@ COMPUTERWELT_UPDATE_PYTHON_BASELINE=1 dotnet test tests/Computerwelt.Emulation.P
 
 Never lower a baseline to make a build green.
 
+`tests/monty-extensions/` is the opposite arrangement: absolute rather than ratcheted, and
+deliberately separate, because every fixture in it exercises something upstream Monty does
+not have — `glob`, `fnmatch`, `os.walk`, `os.scandir`, `io`, `sys.argv`. Run one against
+upstream and it fails at the import. To check that the port still stands on upstream's
+corpus alone:
+
+```bash
+COMPUTERWELT_SKIP_EXTENSIONS=1 dotnet test
+```
+
 ## Status
 
 | | conformance | notes |
 |---|---|---|
 | shell | **2,521 / 2,521** | 73 commands implemented; 27 cases skipped by upstream directive |
 | python | **557 / 558** | parser, bytecode compiler, VM, types, builtins, the stdlib subset, dunders |
-| joined | **195 / 195** | 138 agent-operation tests plus upstream's 57 `python` command cases |
+| joined | **207 / 207** | 150 agent-operation tests plus upstream's 57 `python` command cases |
+| extensions | **10 / 10** | fixtures for what this port adds beyond monty |
 
 The one Python fixture that does not pass asserts that a temporary's `id()` is handed to
 the next object of the same shape — an artifact of upstream's slot-recycling heap. Object

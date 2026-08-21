@@ -620,8 +620,23 @@ public sealed class Compiler
 
                 foreach (var alias in import.Names)
                 {
+                    // `import a.b` binds `a`, not `a.b` — but both still have to resolve,
+                    // so the submodule is imported and dropped and the package is bound.
+                    // `import a.b as name` binds the submodule itself, which is why the
+                    // aliased form takes the straight path.
+                    if (alias.Alias is null && alias.Name.Contains('.', StringComparison.Ordinal))
+                    {
+                        var package = alias.Name.Split('.')[0];
+
+                        Emit(OpCode.ImportName, _code.AddName(alias.Name), import.Line);
+                        Emit(OpCode.Pop, 0, import.Line);
+                        Emit(OpCode.ImportName, _code.AddName(package), import.Line);
+                        EmitStore(package, import.Line);
+                        continue;
+                    }
+
                     Emit(OpCode.ImportName, _code.AddName(alias.Name), import.Line);
-                    EmitStore(alias.Alias ?? alias.Name.Split('.')[0], import.Line);
+                    EmitStore(alias.Alias ?? alias.Name, import.Line);
                 }
 
                 _bindingImport = false;

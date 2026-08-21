@@ -35,9 +35,25 @@ public static class StandardLibrary
         modules["pathlib"] = PathlibModule.Create(fileSystem);
         modules["io"] = IoModule.Create(fileSystem);
 
+        // Pattern matching over plain strings needs nothing from the host, so it is here
+        // even for a sandbox with no storage — a program filtering names a host handed in
+        // is a perfectly ordinary use of it.
+        modules["fnmatch"] = FnmatchModule.Create();
+
         if (fileSystem is not null)
         {
-            modules["os"] = OsModule.Create(fileSystem);
+            var os = OsModule.Create(fileSystem, machine);
+            modules["os"] = os;
+            modules["glob"] = GlobModule.Create(fileSystem);
+
+            // `import os.path` and `import posixpath` are two more names for the object
+            // `os.path` already is — one module, three ways to reach it, as CPython has it
+            // on a POSIX host.
+            if (os.GetAttribute("path") is { } path)
+            {
+                modules["os.path"] = path;
+                modules["posixpath"] = path;
+            }
         }
 
         return modules;

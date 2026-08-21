@@ -18,6 +18,11 @@ namespace Computerwelt.AgentTests;
 /// rest are simply not ported yet, and a script that needs one has to be written a
 /// different way.
 /// </para>
+/// <para>
+/// Several entries in <see cref="Available"/> are extensions rather than ports —
+/// <c>glob</c>, <c>fnmatch</c> and <c>io</c> do not exist upstream at all. What each one
+/// promises is pinned by a fixture in <c>tests/monty-extensions/</c>.
+/// </para>
 /// </remarks>
 public sealed class StandardLibrarySurfaceTests
 {
@@ -29,13 +34,17 @@ public sealed class StandardLibrarySurfaceTests
         "collections",
         "dataclasses",
         "datetime",
+        "fnmatch",
         "gc",
+        "glob",
         "io",
         "itertools",
         "json",
         "math",
         "os",
+        "os.path",
         "pathlib",
+        "posixpath",
         "re",
         "sys",
         "typing",
@@ -59,13 +68,10 @@ public sealed class StandardLibrarySurfaceTests
         "copy",
         "csv",
         "difflib",
-        "fnmatch",
         "functools",
-        "glob",
         "hashlib",
         "heapq",
         "operator",
-        "posixpath",
         "random",
         "shlex",
         "shutil",
@@ -116,18 +122,16 @@ public sealed class StandardLibrarySurfaceTests
         var output = await session.OutAsync("""
             python3 - <<'PY'
             import os
-            names = ['getenv', 'listdir', 'stat', 'mkdir', 'makedirs', 'remove',
-                     'unlink', 'rmdir', 'rename', 'replace', 'getcwd', 'path']
+            names = ['getenv', 'listdir', 'scandir', 'walk', 'stat', 'mkdir', 'makedirs',
+                     'remove', 'unlink', 'rmdir', 'rename', 'replace', 'getcwd', 'path']
             print(' '.join(n for n in names if hasattr(os, n)))
-            print('walk' , hasattr(os, 'walk'))
             print('system', hasattr(os, 'system'))
             PY
             """);
 
         Assert.Equal(
             """
-            getenv listdir stat mkdir makedirs remove unlink rmdir rename replace getcwd path
-            walk False
+            getenv listdir scandir walk stat mkdir makedirs remove unlink rmdir rename replace getcwd path
             system False
 
             """,
@@ -135,7 +139,7 @@ public sealed class StandardLibrarySurfaceTests
     }
 
     [Fact]
-    public async Task Walking_a_tree_is_done_with_listdir_since_os_walk_is_absent()
+    public async Task A_tree_can_still_be_walked_by_hand()
     {
         var session = await AgentSession.NewAsync();
 
@@ -155,8 +159,24 @@ public sealed class StandardLibrarySurfaceTests
             PY
             """);
 
-        // The workaround is short enough to inline, which is why the absence is recorded
-        // rather than worked around in the port.
+        // The recursion `os.walk` replaces. It still works, and is still bounded by the
+        // interpreter's recursion limit — which is exactly why `os.walk` itself is
+        // iterative.
+        Assert.Equal("7\n", output);
+    }
+
+    [Fact]
+    public async Task Walking_a_tree_now_takes_one_call()
+    {
+        var session = await AgentSession.NewAsync();
+
+        var output = await session.OutAsync("""
+            python3 - <<'PY'
+            import os
+            print(sum(len(files) for _, _, files in os.walk('/work')))
+            PY
+            """);
+
         Assert.Equal("7\n", output);
     }
 }

@@ -405,6 +405,79 @@ public sealed class PyPath : PyObject
                     return new PyPath(target, _fileSystem);
                 });
 
+            case "glob" or "rglob":
+                return new PyBuiltinFunction(name, (arguments, keywords) =>
+                {
+                    if (arguments.Length == 0)
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            $"Path.{name}() missing 1 required positional argument: 'pattern'"));
+                    }
+
+                    var pattern = Text(arguments[0]);
+
+                    // `rglob(p)` is `glob('**/' + p)`, which is also why it needs no
+                    // `recursive` flag of its own: the recursion is in the pattern.
+                    var expression = name == "rglob" ? "**/" + pattern : pattern;
+
+                    var hidden = keywords?.TryGetValue(new PyStr("include_hidden"), out var flag) == true
+                        && flag.IsTruthy();
+
+                    return new PyList([
+                        .. Globbing.Expand(Storage(), Value, expression, recursive: true, includeHidden: hidden)
+                            .Select(match => (PyObject)new PyPath(Join(Value, match), _fileSystem))]);
+                });
+
+            case "match" or "full_match":
+                return Builtin(name, arguments =>
+                {
+                    var pattern = Text(arguments[0]);
+
+                    // `match` anchors at the right — `Path('a/b/c.py').match('*.py')` is
+                    // true — while `full_match` has to account for the whole path.
+                    if (name == "full_match")
+                    {
+                        return PyBool.Of(FullMatch(Value, pattern));
+                    }
+
+                    if (pattern.StartsWith('/'))
+                    {
+                        return PyBool.Of(FullMatch(Value, pattern));
+                    }
+
+                    var parts = pattern.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                    var mine = Value.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length > mine.Length)
+                    {
+                        return PyBool.False;
+                    }
+
+                    var offset = mine.Length - parts.Length;
+
+                    return PyBool.Of(parts
+                        .Select((part, index) => Globbing.Matches(mine[offset + index], part, segment: true))
+                        .All(static matched => matched));
+                });
+
+            case "walk":
+                return new PyBuiltinFunction(name, (arguments, keywords) =>
+                {
+                    var topDown = arguments.Length > 0 ? arguments[0].IsTruthy()
+                        : keywords?.TryGetValue(new PyStr("top_down"), out var flag) != true || flag!.IsTruthy();
+
+                    // The same traversal `os.walk` performs, differing only in that the
+                    // directory comes back as a Path. Sharing it is what keeps the two
+                    // orderings — and the pruning — from drifting apart.
+                    return new PyIterator(
+                        OsModule.Walk(Storage(), Value, topDown, onError: null, machine: null)
+                            .Select(triple => (PyObject)new PyTuple([
+                                new PyPath(((PyTuple)triple).Items[0].Display(), _fileSystem),
+                                ((PyTuple)triple).Items[1],
+                                ((PyTuple)triple).Items[2]])),
+                        "generator");
+                });
+
             case "resolve" or "absolute":
                 return Builtin(name, _ => new PyPath(
                     Value.StartsWith('/') ? Value : Join(Storage().WorkingDirectory, Value),
@@ -412,6 +485,55 @@ public sealed class PyPath : PyObject
 
             default:
                 return null;
+        }
+    }
+
+    /// <summary>Whether a whole path matches a pattern, segment by segment.</summary>
+    private static bool FullMatch(string value, string pattern)
+    {
+        var parts = pattern.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var mine = value.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        // An absolute pattern only matches an absolute path.
+        if (pattern.StartsWith('/') != value.StartsWith('/'))
+        {
+            return false;
+        }
+
+        return Segments(mine, 0, parts, 0);
+    }
+
+    /// <summary>Matches path segments against pattern segments, letting <c>**</c> span any number.</summary>
+    private static bool Segments(string[] path, int pathIndex, string[] pattern, int patternIndex)
+    {
+        while (true)
+        {
+            if (patternIndex == pattern.Length)
+            {
+                return pathIndex == path.Length;
+            }
+
+            if (pattern[patternIndex] == "**")
+            {
+                // Try every split point: `**` may stand for no segments at all.
+                for (var skip = pathIndex; skip <= path.Length; skip++)
+                {
+                    if (Segments(path, skip, pattern, patternIndex + 1))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            if (pathIndex == path.Length || !Globbing.Matches(path[pathIndex], pattern[patternIndex], segment: true))
+            {
+                return false;
+            }
+
+            pathIndex++;
+            patternIndex++;
         }
     }
 

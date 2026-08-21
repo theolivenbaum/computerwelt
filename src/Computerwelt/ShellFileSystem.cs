@@ -122,7 +122,10 @@ public sealed class ShellFileSystem : IPyFileSystem
         }
         catch (ShellException)
         {
-            throw NotFound(path);
+            // Listing something that is there but is not a directory is a different error
+            // from listing something that is not there, and scripts branch on which —
+            // `tests/monty-spec/mount_fs__ops.py` pins both messages.
+            throw Stat(path) is null ? NotFound(path) : NotADirectory(path);
         }
     }
 
@@ -181,6 +184,11 @@ public sealed class ShellFileSystem : IPyFileSystem
         new(new PyException(
             PyExceptionType.FileNotFoundError,
             $"[Errno 2] No such file or directory: '{path}'"));
+
+    private static PyRaise NotADirectory(string path) =>
+        new(new PyException(
+            PyExceptionType.NotADirectoryError,
+            $"[Errno 20] Not a directory: '{path}'"));
 
     /// <summary>
     /// Waits for a filesystem call.

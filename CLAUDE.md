@@ -131,6 +131,7 @@ tests/
   Computerwelt.AgentTests/                  the operations a caller performs, end to end
   spec/                                     shell acceptance corpus (from bashkit)
   monty-spec/                               python acceptance corpus (from monty)
+  monty-extensions/                         fixtures for what this port adds beyond monty
 .reference/bashkit/          vendored bashkit source (read-only)
 .reference/monty/            vendored monty source (read-only)
 ```
@@ -179,6 +180,17 @@ makes them error-message conformance tests. `# xfail=monty` marks a case upstrea
 does not pass.
 
 `Computerwelt.Emulation.Python.SpecTests` will run these under the same ratchet discipline.
+
+### Python extensions — `tests/monty-extensions/`
+
+Same fixture format, opposite purpose: every file here exercises something upstream Monty
+does **not** have, so running one against upstream fails — usually at the import. Keeping
+them in their own folder is what lets a reader tell a port decision from a specification,
+and `COMPUTERWELT_SKIP_EXTENSIONS=1` switches the folder off so you can check the port
+still stands on upstream's corpus alone. The suite is absolute, not ratcheted.
+
+Nothing here may contradict `tests/monty-spec/`. Where the two would disagree, upstream
+wins and the behaviour is recorded as a limitation in `todo.md` instead.
 
 ```bash
 dotnet test                                   # everything
