@@ -110,7 +110,7 @@ public sealed class BashBuiltin : IBuiltin
         {
             bytes = await context.FileSystem.ReadFileAsync(context.ResolvePath(file), cancellationToken);
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             return ExecResult.Error($"{Name}: {file}: No such file or directory\n", ExitCodes.NotFound);
         }
@@ -326,6 +326,8 @@ public sealed class BashBuiltin : IBuiltin
 
     private string Version() =>
         Name == "sh"
+            // The corpus pins this banner — `bash --version` is greppable behaviour, not
+            // branding — so it keeps naming the upstream the port is compatible with.
             ? "Bashkit virtual sh, version 5.2.0(1)-release\n"
             : "GNU bash, version 5.2.0(1)-release (Bashkit virtual shell)\n";
 }

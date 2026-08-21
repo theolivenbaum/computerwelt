@@ -9,4 +9,4 @@ namespace Computerwelt.Emulation.Bash.Interpreter;
 /// used the pattern reports an error.
 /// </remarks>
 public sealed class GlobFailureException(string message)
-    : BashkitException(BashkitErrorKind.Internal, message);
+    : ShellException(ShellErrorKind.Internal, message);

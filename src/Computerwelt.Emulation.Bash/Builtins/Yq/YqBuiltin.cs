@@ -211,7 +211,7 @@ public sealed class YqBuiltin : IBuiltin
             return Encoding.UTF8.GetString(
                 await context.FileSystem.ReadFileAsync(context.ResolvePath(path), cancellationToken));
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             return null;
         }

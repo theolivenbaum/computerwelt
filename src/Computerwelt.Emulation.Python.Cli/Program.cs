@@ -15,7 +15,7 @@ var source = args[0] == "-c" && args.Length > 1
 
 var name = args[0] == "-c" ? "<stdin>" : Path.GetFileName(args[0]);
 
-var result = new MontyRunner().Run(source, name);
+var result = new PythonRunner().Run(source, name);
 
 Console.Out.Write(result.Stdout);
 Console.Error.Write(result.Stderr);

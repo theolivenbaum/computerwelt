@@ -9,42 +9,42 @@ namespace Computerwelt.Emulation.Bash;
 /// after them. An exception means the sandbox itself refused to continue: a limit was
 /// exhausted, the script could not be parsed, or a capability was denied.
 /// </remarks>
-public class BashkitException : Exception
+public class ShellException : Exception
 {
     /// <summary>Creates an exception of the given <paramref name="kind"/>.</summary>
-    public BashkitException(BashkitErrorKind kind, string message, Exception? innerException = null)
+    public ShellException(ShellErrorKind kind, string message, Exception? innerException = null)
         : base(message, innerException) => Kind = kind;
 
     /// <summary>What class of failure occurred.</summary>
-    public BashkitErrorKind Kind { get; }
+    public ShellErrorKind Kind { get; }
 
     /// <summary>The exit status a host should report for this failure.</summary>
     public virtual int ExitCode => Kind switch
     {
-        BashkitErrorKind.Parse => ExitCodes.Usage,
-        BashkitErrorKind.Timeout => ExitCodes.Terminated,
-        BashkitErrorKind.Cancelled => ExitCodes.Interrupted,
+        ShellErrorKind.Parse => ExitCodes.Usage,
+        ShellErrorKind.Timeout => ExitCodes.Terminated,
+        ShellErrorKind.Cancelled => ExitCodes.Interrupted,
         _ => ExitCodes.Failure,
     };
 }
 
 /// <summary>A script could not be parsed.</summary>
-public sealed class ParseException : BashkitException
+public sealed class ParseException : ShellException
 {
     /// <summary>Creates a parse error at <paramref name="position"/>.</summary>
     public ParseException(string message, int position = -1)
-        : base(BashkitErrorKind.Parse, message) => Position = position;
+        : base(ShellErrorKind.Parse, message) => Position = position;
 
     /// <summary>Byte offset into the script where parsing failed, or -1 when unknown.</summary>
     public int Position { get; }
 }
 
 /// <summary>A resource limit was exhausted.</summary>
-public sealed class LimitExceededException : BashkitException
+public sealed class LimitExceededException : ShellException
 {
     /// <summary>Creates a limit error naming the limit and its configured value.</summary>
     public LimitExceededException(string limitName, long limit)
-        : base(BashkitErrorKind.LimitExceeded, $"resource limit exceeded: {limitName} (limit: {limit})")
+        : base(ShellErrorKind.LimitExceeded, $"resource limit exceeded: {limitName} (limit: {limit})")
     {
         LimitName = limitName;
         Limit = limit;
@@ -58,18 +58,18 @@ public sealed class LimitExceededException : BashkitException
 }
 
 /// <summary>A filesystem operation failed. Carries the message a shell would print.</summary>
-public sealed class FileSystemException : BashkitException
+public sealed class FileSystemException : ShellException
 {
     /// <summary>Creates a filesystem error.</summary>
     public FileSystemException(FileSystemErrorKind kind, string message)
-        : base(BashkitErrorKind.FileSystem, message) => FsKind = kind;
+        : base(ShellErrorKind.FileSystem, message) => FsKind = kind;
 
     /// <summary>The specific filesystem failure.</summary>
     public FileSystemErrorKind FsKind { get; }
 }
 
 /// <summary>Broad classes of fatal failure.</summary>
-public enum BashkitErrorKind
+public enum ShellErrorKind
 {
     /// <summary>The script is syntactically invalid.</summary>
     Parse,

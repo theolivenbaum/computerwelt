@@ -70,7 +70,7 @@ public sealed class FileBuiltin : IBuiltin
                     : metadata.Size == 0 ? "empty"
                     : Classify(await context.FileSystem.ReadFileAsync(path, cancellationToken));
             }
-            catch (BashkitException)
+            catch (ShellException)
             {
                 description = "cannot open (No such file or directory)";
             }
@@ -545,7 +545,7 @@ public sealed class PagerBuiltin : IBuiltin
                 context.Budget.ChargeWork(bytes.Length);
                 output.Append(Encoding.UTF8.GetString(bytes));
             }
-            catch (BashkitException)
+            catch (ShellException)
             {
                 return new ExecResult
                 {

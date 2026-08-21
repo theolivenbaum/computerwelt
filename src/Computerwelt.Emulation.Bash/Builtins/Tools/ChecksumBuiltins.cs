@@ -101,7 +101,7 @@ public sealed class ChecksumBuiltin : IBuiltin
             {
                 bytes = await context.FileSystem.ReadFileAsync(context.ResolvePath(operand), cancellationToken);
             }
-            catch (BashkitException)
+            catch (ShellException)
             {
                 errors.Append($"{Name}: {operand}: No such file or directory\n");
                 failed = true;

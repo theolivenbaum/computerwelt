@@ -70,8 +70,8 @@ public sealed class Redirection
             {
                 await redirection.AddAsync(interpreter, redirect, cancellationToken);
             }
-            catch (BashkitException exception)
-                when (exception.Kind is BashkitErrorKind.FileSystem or BashkitErrorKind.PermissionDenied)
+            catch (ShellException exception)
+                when (exception.Kind is ShellErrorKind.FileSystem or ShellErrorKind.PermissionDenied)
             {
                 redirection.Failure = ExecResult.Error($"bash: {exception.Message}\n", ExitCodes.Failure);
                 return redirection;
@@ -314,7 +314,7 @@ public sealed class Redirection
         if (!append && interpreter.State.Options.NoClobber && redirect.Kind == RedirectKind.Output
             && await FileSystem.ExistsAsync(resolved, cancellationToken))
         {
-            throw new BashkitException(BashkitErrorKind.PermissionDenied, $"{path}: cannot overwrite existing file");
+            throw new ShellException(ShellErrorKind.PermissionDenied, $"{path}: cannot overwrite existing file");
         }
 
         // Truncate now, so that `> f` with no output still empties the file.
@@ -376,7 +376,7 @@ public sealed class Redirection
                     await FileSystem.WriteFileAsync(target.Path, payload.Memory, cancellationToken);
                 }
             }
-            catch (BashkitException e) when (e.Kind is BashkitErrorKind.FileSystem or BashkitErrorKind.PermissionDenied)
+            catch (ShellException e) when (e.Kind is ShellErrorKind.FileSystem or ShellErrorKind.PermissionDenied)
             {
                 // Writing to a directory or a read-only file fails the command; it is not
                 // an error in the shell itself.

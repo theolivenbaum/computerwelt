@@ -287,7 +287,7 @@ public static class ReModule
     private static string Text(PyObject value, string what) => value switch
     {
         PyStr text => text.Value,
-        // Monty documents callable replacements as unsupported, and a non-string repl is
+        // Upstream documents callable replacements as unsupported, and a non-string repl is
         // reported that way rather than as a decoding failure.
         _ when what == "repl" => throw new PyRaise(PyErrors.TypeError(
             "callable replacement is not yet supported in re.sub()")),

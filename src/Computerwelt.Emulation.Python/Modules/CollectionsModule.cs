@@ -646,7 +646,7 @@ internal sealed class TypeAlias(string name) : PyObject
 {
     /// <inheritdoc />
     /// <remarks>
-    /// CPython gives each construct its own internal type; Monty uses one, so
+    /// CPython gives each construct its own internal type; this port uses one, so
     /// <c>type(x)</c> reports <c>typing._SpecialForm</c> for all of them.
     /// </remarks>
     public override string TypeName => "typing._SpecialForm";

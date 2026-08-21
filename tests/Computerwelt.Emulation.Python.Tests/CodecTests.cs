@@ -15,7 +15,7 @@ public sealed class CodecTests
 {
     private static string Run(string source)
     {
-        var result = new MontyRunner().Run(source);
+        var result = new PythonRunner().Run(source);
 
         Assert.True(result.Succeeded, result.Exception?.Message ?? result.SyntaxError?.Message);
         return result.Stdout;

@@ -76,6 +76,14 @@ the speed and the snapshot-at-a-call-boundary feature both depend on it.
 | `crates/monty-fs/` | `Computerwelt/PythonFileSystem` | `os`, `os.path` and `open` over this repo's `IFileSystem`, so both sandboxes share one VFS |
 | `crates/monty-type-checking/` | — | out of scope: wraps `ty`, an external type checker |
 
+### Naming
+
+Identifiers carry this product's names, not the upstreams': `ShellException`, `PythonRunner`,
+`Computerwelt.Emulation.Bash`. Three strings are the exception, because they are behaviour
+the acceptance corpora pin rather than branding — `bash --version`'s banner, `sys.platform`
+(`monty`) and `sys.version` (`3.14.0 (Monty)`). Prose may still name an upstream when it is
+citing it as the specification.
+
 ### Rust → C# idiom map
 
 | Rust | C# |
@@ -83,7 +91,7 @@ the speed and the snapshot-at-a-call-boundary feature both depend on it.
 | `async fn` + tokio | `ValueTask<T>` / `Task<T>`, `CancellationToken` threaded explicitly |
 | `Arc<dyn Trait>` | `interface` + DI by constructor; instances must be thread-safe |
 | `enum` with payloads | `abstract record` + `sealed record` cases, matched with `switch` patterns |
-| `Result<T, E>` | Exceptions for *fatal* errors (`BashkitException`); `ExecResult` carries ordinary non-zero exits |
+| `Result<T, E>` | Exceptions for *fatal* errors (`ShellException`); `ExecResult` carries ordinary non-zero exits |
 | `Option<T>` | Nullable reference types (`#nullable enable` is on and warnings are errors) |
 | `&[u8]` / `Vec<u8>` | `ReadOnlySpan<byte>` / `byte[]`, wrapped by `StreamData` |
 | `PathBuf` | `VPath` (POSIX-only readonly struct) |

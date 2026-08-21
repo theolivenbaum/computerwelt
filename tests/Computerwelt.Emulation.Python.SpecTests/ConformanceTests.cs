@@ -6,22 +6,26 @@ using Xunit.Abstractions;
 namespace Computerwelt.Emulation.Python.SpecTests;
 
 /// <summary>
-/// Runs the Monty fixture corpus under a ratchet.
+/// Runs the Python fixture corpus under a ratchet.
 /// </summary>
 /// <remarks>
 /// The corpus needs no harness format: a fixture is ordinary Python whose body is
 /// <c>assert</c> statements, so it passes when it runs to completion without raising.
 /// Fixtures that pin a <c># Raise=</c> or a traceback invert that condition.
+/// <para>
+/// Set <c>COMPUTERWELT_UPDATE_PYTHON_BASELINE=1</c> to rewrite the baseline after making
+/// fixtures pass, and <c>COMPUTERWELT_SHOW_FAILURES=1</c> to list the failing ones by name.
+/// </para>
 /// </remarks>
 public sealed class ConformanceTests(ITestOutputHelper output)
 {
     [Fact]
     public void Corpus_does_not_regress()
     {
-        var fixtures = MontySuite.LoadAll();
+        var fixtures = SpecSuite.LoadAll();
         Assert.NotEmpty(fixtures);
 
-        var baseline = MontySuite.LoadBaseline();
+        var baseline = SpecSuite.LoadBaseline();
         var passing = new HashSet<string>(StringComparer.Ordinal);
         var failureReasons = new Dictionary<string, string>(StringComparer.Ordinal);
 
@@ -45,13 +49,13 @@ public sealed class ConformanceTests(ITestOutputHelper output)
         }
 
         var runnable = fixtures.Count(static f => !f.ExpectedToFail);
-        output.WriteLine($"monty: {passing.Count}/{runnable} fixtures passing");
+        output.WriteLine($"python: {passing.Count}/{runnable} fixtures passing");
         WriteFailureSummary(failureReasons);
 
-        if (Environment.GetEnvironmentVariable("MONTY_UPDATE_BASELINE") == "1")
+        if (Environment.GetEnvironmentVariable("COMPUTERWELT_UPDATE_PYTHON_BASELINE") == "1")
         {
-            MontySuite.SaveBaseline(passing);
-            output.WriteLine($"baseline written to {MontySuite.BaselinePath}");
+            SpecSuite.SaveBaseline(passing);
+            output.WriteLine($"baseline written to {SpecSuite.BaselinePath}");
             return;
         }
 
@@ -65,13 +69,13 @@ public sealed class ConformanceTests(ITestOutputHelper output)
     }
 
     /// <summary>Runs one fixture and decides whether it passed.</summary>
-    private static (bool Passed, string Reason) Run(MontyFixture fixture)
+    private static (bool Passed, string Reason) Run(SpecFixture fixture)
     {
         RunResult result;
 
         try
         {
-            var runner = new MontyRunner { FileSystem = new FixtureFileSystem() };
+            var runner = new PythonRunner { FileSystem = new FixtureFileSystem() };
 
             // A `# mount-fs` fixture expects `root` bound to the mounted tree.
             if (fixture.Source.Contains("# mount-fs", StringComparison.Ordinal))
@@ -150,7 +154,7 @@ public sealed class ConformanceTests(ITestOutputHelper output)
 
         output.WriteLine(builder.ToString());
 
-        if (Environment.GetEnvironmentVariable("MONTY_SHOW_FAILURES") == "1")
+        if (Environment.GetEnvironmentVariable("COMPUTERWELT_SHOW_FAILURES") == "1")
         {
             foreach (var (name, reason) in failures.OrderBy(static f => f.Key, StringComparer.Ordinal))
             {

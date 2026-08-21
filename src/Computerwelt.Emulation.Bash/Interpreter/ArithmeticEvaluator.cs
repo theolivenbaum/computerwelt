@@ -680,10 +680,10 @@ public sealed class ArithmeticEvaluator
 }
 
 /// <summary>An error in an arithmetic expression, reported the way bash reports it.</summary>
-public sealed class ShellArithmeticException : BashkitException
+public sealed class ShellArithmeticException : ShellException
 {
     /// <summary>Creates an arithmetic error.</summary>
-    public ShellArithmeticException(string message) : base(BashkitErrorKind.Internal, message)
+    public ShellArithmeticException(string message) : base(ShellErrorKind.Internal, message)
     {
     }
 

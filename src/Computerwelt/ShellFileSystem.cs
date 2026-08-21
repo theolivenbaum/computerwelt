@@ -60,7 +60,7 @@ public sealed class ShellFileSystem : IPyFileSystem
         {
             return Run(() => _fileSystem.ReadFileAsync(Resolve(path)));
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             throw NotFound(path);
         }
@@ -81,7 +81,7 @@ public sealed class ShellFileSystem : IPyFileSystem
         {
             Run(() => _fileSystem.RemoveAsync(Resolve(path), recursive: false));
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             throw NotFound(path);
         }
@@ -107,7 +107,7 @@ public sealed class ShellFileSystem : IPyFileSystem
         {
             Run(() => _fileSystem.RemoveAsync(Resolve(path), recursive: false));
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             throw NotFound(path);
         }
@@ -120,7 +120,7 @@ public sealed class ShellFileSystem : IPyFileSystem
         {
             return [.. Run(() => _fileSystem.ReadDirectoryAsync(Resolve(path))).Select(static e => e.Name)];
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             throw NotFound(path);
         }
@@ -136,7 +136,7 @@ public sealed class ShellFileSystem : IPyFileSystem
         {
             Run(() => _fileSystem.RenameAsync(Resolve(from), Resolve(to)));
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             throw NotFound(from);
         }
@@ -169,7 +169,7 @@ public sealed class ShellFileSystem : IPyFileSystem
         {
             return Run(() => _fileSystem.StatAsync(Resolve(path)));
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             return null;
         }

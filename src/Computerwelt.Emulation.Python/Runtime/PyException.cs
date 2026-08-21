@@ -106,7 +106,7 @@ public readonly record struct TracebackFrame(string FunctionName, int Line, stri
 /// An exception class.
 /// </summary>
 /// <remarks>
-/// Exception classes form the one inheritance hierarchy Monty supports, because
+/// Exception classes form the one inheritance hierarchy this interpreter has, because
 /// <c>except ValueError</c> has to catch <c>ValueError</c> subclasses to be useful at all.
 /// User classes remain flat, as upstream documents.
 /// </remarks>

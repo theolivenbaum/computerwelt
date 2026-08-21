@@ -952,7 +952,7 @@ public sealed class Interpreter
             // A `failglob` miss fails only the command that used the pattern.
             return ExecResult.Error($"bash: {e.Message}\n", ExitCodes.Failure);
         }
-        catch (BashkitException e) when (e.Kind is BashkitErrorKind.Internal or BashkitErrorKind.PermissionDenied)
+        catch (ShellException e) when (e.Kind is ShellErrorKind.Internal or ShellErrorKind.PermissionDenied)
         {
             // An expansion error — `${x:?}` or `set -u` on an unset name — ends a
             // non-interactive shell rather than the command. A subshell catches the exit
@@ -1083,7 +1083,7 @@ public sealed class Interpreter
         {
             result = await DispatchAsync(name, arguments, command.Assignments, redirection.Stdin, cancellationToken);
         }
-        catch (BashkitException e) when (e.Kind is BashkitErrorKind.Internal or BashkitErrorKind.PermissionDenied)
+        catch (ShellException e) when (e.Kind is ShellErrorKind.Internal or ShellErrorKind.PermissionDenied)
         {
             result = ExecResult.Error($"bash: {e.Message}\n", ExitCodes.Failure);
         }
@@ -1272,7 +1272,7 @@ public sealed class Interpreter
 
         if (variable.IsReadOnly)
         {
-            throw new BashkitException(BashkitErrorKind.PermissionDenied, $"{assignment.Name}: readonly variable");
+            throw new ShellException(ShellErrorKind.PermissionDenied, $"{assignment.Name}: readonly variable");
         }
 
         switch (assignment.Value)
@@ -1461,7 +1461,7 @@ public sealed class Interpreter
             {
                 metadata = await FileSystem.StatAsync(path.Value, cancellationToken);
             }
-            catch (BashkitException)
+            catch (ShellException)
             {
                 return ExecResult.Error($"bash: {name}: command not found\n", ExitCodes.NotFound);
             }
@@ -1556,7 +1556,7 @@ public sealed class Interpreter
         {
             parsed = Parser.Parse(request.Script, Budget);
         }
-        catch (BashkitException exception) when (exception.Kind == BashkitErrorKind.Parse)
+        catch (ShellException exception) when (exception.Kind == ShellErrorKind.Parse)
         {
             return ExecResult.Error($"{request.ScriptName}: {exception.Message}\n", ExitCodes.Usage);
         }

@@ -178,7 +178,7 @@ internal sealed class AwkLexer
             return new AwkToken(AwkTokenKind.Operator, op);
         }
 
-        throw new BashkitException(BashkitErrorKind.Parse, $"awk: syntax error at '{c}'");
+        throw new ShellException(ShellErrorKind.Parse, $"awk: syntax error at '{c}'");
     }
 
     private bool Matches(string op) =>
@@ -421,7 +421,7 @@ internal sealed class AwkLexer
             _position++;
         }
 
-        throw new BashkitException(BashkitErrorKind.Parse, "awk: unterminated regex");
+        throw new ShellException(ShellErrorKind.Parse, "awk: unterminated regex");
     }
 
     /// <summary>Character predicates, spelled out so the grammar's intent is explicit.</summary>

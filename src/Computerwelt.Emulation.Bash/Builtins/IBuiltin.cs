@@ -5,7 +5,7 @@ namespace Computerwelt.Emulation.Bash.Builtins;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Every command in Bashkit is a builtin — there is no <c>PATH</c> lookup and no process
+/// Every command here is a builtin — there is no <c>PATH</c> lookup and no process
 /// spawn. That is the whole security model: a script can only invoke what the host has
 /// registered.
 /// </para>

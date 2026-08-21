@@ -7,7 +7,7 @@ namespace Computerwelt.Emulation.Python.Builtins;
 
 /// <summary>Builds the builtin namespace.</summary>
 /// <remarks>
-/// Only what Monty documents is present. A name that is absent here is absent from the
+/// Only the documented subset is present. A name that is absent here is absent from the
 /// sandbox — there is no fallback to a host implementation, which is what makes the
 /// vocabulary auditable.
 /// </remarks>

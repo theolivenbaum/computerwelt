@@ -202,7 +202,7 @@ public sealed class PyCell
     public PyObject? Value { get; set; }
 }
 
-/// <summary>A class defined in Python. Monty supports plain classes only.</summary>
+/// <summary>A class defined in Python. Plain classes only, with no inheritance.</summary>
 public sealed class PyClass : PyCallable
 {
     /// <summary>Creates a class from its namespace.</summary>

@@ -74,7 +74,7 @@ public sealed class AwkBuiltin : IBuiltin
         {
             program = AwkParser.Parse(options.Program);
         }
-        catch (BashkitException exception)
+        catch (ShellException exception)
         {
             return ExecResult.Error($"{exception.Message}\n", 2);
         }
@@ -258,7 +258,7 @@ public sealed class AwkBuiltin : IBuiltin
             var bytes = read.IsCompletedSuccessfully ? read.Result : read.AsTask().GetAwaiter().GetResult();
             return Encoding.UTF8.GetString(bytes);
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             return null;
         }
@@ -291,7 +291,7 @@ public sealed class AwkBuiltin : IBuiltin
             {
                 bytes = await context.FileSystem.ReadFileAsync(context.ResolvePath(file), cancellationToken);
             }
-            catch (BashkitException exception)
+            catch (ShellException exception)
             {
                 return (sources, ExecResult.Error($"{Name}: {file}: {exception.Message}\n", 2));
             }

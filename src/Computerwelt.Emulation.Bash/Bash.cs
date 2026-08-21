@@ -129,7 +129,7 @@ public sealed class Bash
             {
                 return ExecResult.Error($"bash: {e.Message}\n", ExitCodes.Failure);
             }
-            catch (BashkitException e) when (e.Kind is BashkitErrorKind.Timeout or BashkitErrorKind.Cancelled)
+            catch (ShellException e) when (e.Kind is ShellErrorKind.Timeout or ShellErrorKind.Cancelled)
             {
                 return ExecResult.Error($"bash: {e.Message}\n", e.ExitCode);
             }

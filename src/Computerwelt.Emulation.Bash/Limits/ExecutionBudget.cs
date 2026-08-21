@@ -127,13 +127,13 @@ public sealed class ExecutionBudget
     {
         if (CancellationToken.IsCancellationRequested)
         {
-            throw new BashkitException(BashkitErrorKind.Cancelled, "execution cancelled");
+            throw new ShellException(ShellErrorKind.Cancelled, "execution cancelled");
         }
 
         if (TimeProvider.System.GetTimestamp() > _deadlineTicks)
         {
-            throw new BashkitException(
-                BashkitErrorKind.Timeout,
+            throw new ShellException(
+                ShellErrorKind.Timeout,
                 $"execution timed out after {Limits.Timeout.TotalSeconds:0.###}s");
         }
     }

@@ -16,7 +16,7 @@ namespace Computerwelt.Emulation.Bash.SpecTests;
 /// strictly stronger as the port advances.
 /// </para>
 /// <para>
-/// Set <c>BASHKIT_UPDATE_BASELINE=1</c> to rewrite the baseline after making cases pass.
+/// Set <c>COMPUTERWELT_UPDATE_BASH_BASELINE=1</c> to rewrite the baseline after making cases pass.
 /// Never lower a number by hand.
 /// </para>
 /// </remarks>
@@ -101,7 +101,7 @@ public sealed class ConformanceTests(ITestOutputHelper output)
         output.WriteLine($"spec: {totalPassed}/{totalRun} passing ({totalSkipped} skipped)");
         WriteBreakdown(output, current, files);
 
-        if (Environment.GetEnvironmentVariable("BASHKIT_UPDATE_BASELINE") == "1")
+        if (Environment.GetEnvironmentVariable("COMPUTERWELT_UPDATE_BASH_BASELINE") == "1")
         {
             SpecSuite.SaveBaseline(current);
             output.WriteLine($"baseline written to {SpecSuite.BaselinePath}");

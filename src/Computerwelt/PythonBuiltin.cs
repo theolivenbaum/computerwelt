@@ -54,7 +54,7 @@ public sealed class PythonBuiltin : IBuiltin
             return error;
         }
 
-        var runner = new MontyRunner(new PythonLimits
+        var runner = new PythonRunner(new PythonLimits
         {
             MaxInstructions = _options.MaxInstructions,
             MaxRecursionDepth = _options.MaxRecursionDepth,

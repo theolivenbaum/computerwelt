@@ -14,10 +14,10 @@ namespace Computerwelt.Emulation.Python;
 /// external function — which is the same posture the shell half of this repository takes,
 /// and the reason the two can share one virtual filesystem later.
 /// </remarks>
-public sealed class MontyRunner
+public sealed class PythonRunner
 {
     /// <summary>Creates a runner with the given limits.</summary>
-    public MontyRunner(ExecutionLimits? limits = null) => Limits = limits ?? ExecutionLimits.Default;
+    public PythonRunner(ExecutionLimits? limits = null) => Limits = limits ?? ExecutionLimits.Default;
 
     /// <summary>The per-run resource caps.</summary>
     public ExecutionLimits Limits { get; }

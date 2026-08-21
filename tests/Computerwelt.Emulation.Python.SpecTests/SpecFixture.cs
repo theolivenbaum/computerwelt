@@ -1,7 +1,7 @@
 namespace Computerwelt.Emulation.Python.SpecTests;
 
-/// <summary>One fixture from the Monty corpus.</summary>
-public sealed record MontyFixture
+/// <summary>One fixture from the Python corpus.</summary>
+public sealed record SpecFixture
 {
     /// <summary>The file name, relative to the corpus root.</summary>
     public required string Name { get; init; }

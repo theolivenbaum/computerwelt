@@ -96,7 +96,7 @@ public sealed record FunctionDef(
 
 /// <summary>A class definition.</summary>
 /// <param name="Name">The class's name.</param>
-/// <param name="Bases">Base-class expressions. Monty rejects non-empty bases at runtime.</param>
+/// <param name="Bases">Base-class expressions. Non-empty bases are rejected at runtime.</param>
 /// <param name="Body">The class body.</param>
 /// <param name="Decorators">Decorator expressions, outermost first.</param>
 public sealed record ClassDef(

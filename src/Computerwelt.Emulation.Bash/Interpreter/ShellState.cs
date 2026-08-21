@@ -239,7 +239,7 @@ public sealed class ShellState
         {
             if (existing.IsReadOnly)
             {
-                throw new BashkitException(BashkitErrorKind.PermissionDenied, $"{name}: readonly variable");
+                throw new ShellException(ShellErrorKind.PermissionDenied, $"{name}: readonly variable");
             }
 
             existing.SetScalar(value);
@@ -309,7 +309,7 @@ public sealed class ShellState
 
             if (variable.IsReadOnly)
             {
-                throw new BashkitException(BashkitErrorKind.PermissionDenied, $"{name}: cannot unset: readonly variable");
+                throw new ShellException(ShellErrorKind.PermissionDenied, $"{name}: cannot unset: readonly variable");
             }
 
             _scopes[i].Remove(name);

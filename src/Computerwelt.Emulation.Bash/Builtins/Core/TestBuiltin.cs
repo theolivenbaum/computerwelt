@@ -42,7 +42,7 @@ public sealed class TestBuiltin : IBuiltin
             var result = await EvaluateAsync(context, arguments, cancellationToken);
             return ExecResult.FromExitCode(result ? 0 : 1);
         }
-        catch (BashkitException e)
+        catch (ShellException e)
         {
             return ExecResult.Usage(Name, e.Message);
         }
@@ -182,7 +182,7 @@ public sealed class TestBuiltin : IBuiltin
         {
             if (!TryParseInteger(left, out var a) || !TryParseInteger(right, out var b))
             {
-                throw new BashkitException(BashkitErrorKind.Internal, $"{(TryParseInteger(left, out _) ? right : left)}: integer expression expected");
+                throw new ShellException(ShellErrorKind.Internal, $"{(TryParseInteger(left, out _) ? right : left)}: integer expression expected");
             }
 
             return op switch

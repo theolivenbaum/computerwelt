@@ -62,7 +62,7 @@ Upstream: `stream.rs`, `error.rs`, `interpreter/state.rs`, `fs/posix.rs`
 - [x] `StreamData` — byte-oriented stdio payload with lossy UTF-8 view
 - [x] `ExecResult` — stdout/stderr/exit code/control flow/truncation flags
 - [x] `ControlFlow` — none / break(n) / continue(n) / return(code) / exit(code)
-- [x] `BashkitException` + error taxonomy (`Error` variants from `error.rs`)
+- [x] `ShellException` + error taxonomy (`Error` variants from `error.rs`)
 - [x] `ExitCodes` constants (127 not-found, 126 not-executable, 2 usage, 128+n signals)
 
 ## Phase 2 — Limits  (`src/Computerwelt.Emulation.Bash/Limits/`)
@@ -373,7 +373,7 @@ Upstream: `modules/` — the permitted set and nothing more.
 
 Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.rs`
 
-- [x] `ExecutionLimits` and the `MontyRunner` facade
+- [x] `ExecutionLimits` and the `PythonRunner` facade
 - [x] `Computerwelt.Emulation.Python.Cli` — run a script or `-c` source
 - [x] `Computerwelt.Cli` — the product driver, shell plus `python`
 - [x] External functions — the only route to anything outside the sandbox, mirroring how

@@ -566,7 +566,7 @@ public sealed class Expander
         if (!isSet && parameter.Operation == ParameterOp.None && _state.Options.NoUnset
             && !IsSpecialName(parameter.Name))
         {
-            throw new BashkitException(BashkitErrorKind.Internal, $"{parameter.Name}: unbound variable");
+            throw new ShellException(ShellErrorKind.Internal, $"{parameter.Name}: unbound variable");
         }
 
         return [result];
@@ -718,7 +718,7 @@ public sealed class Expander
         switch (op)
         {
             case ParameterOp.BadSubstitution:
-                throw new BashkitException(BashkitErrorKind.Internal, $"${{{parameter.Name}}}: bad substitution");
+                throw new ShellException(ShellErrorKind.Internal, $"${{{parameter.Name}}}: bad substitution");
 
             case ParameterOp.UseDefault:
                 return isNullOrUnset && argument is not null
@@ -775,7 +775,7 @@ public sealed class Expander
                     ? "parameter null or not set"
                     : await ExpandToStringAsync(argument, cancellationToken);
 
-                throw new BashkitException(BashkitErrorKind.Internal, $"{parameter.Name}: {message}");
+                throw new ShellException(ShellErrorKind.Internal, $"{parameter.Name}: {message}");
             }
 
             case ParameterOp.UseAlternate:

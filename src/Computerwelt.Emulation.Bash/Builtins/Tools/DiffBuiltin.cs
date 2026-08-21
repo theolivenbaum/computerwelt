@@ -109,7 +109,7 @@ public sealed class DiffBuiltin : IBuiltin
         {
             files = await context.ReadOperandsAsync(operands, cancellationToken);
         }
-        catch (BashkitException exception)
+        catch (ShellException exception)
         {
             return ExecResult.Error($"diff: {exception.Message}\n", ExitCodes.Usage);
         }

@@ -207,7 +207,7 @@ public sealed class DuBuiltin : IBuiltin
         {
             metadata = await context.FileSystem.StatAsync(path, cancellationToken);
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             return 0;
         }

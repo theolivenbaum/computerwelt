@@ -59,8 +59,8 @@ internal sealed class AwkParser
         }
     }
 
-    private BashkitException Error(string message) =>
-        new(BashkitErrorKind.Parse, $"awk: syntax error: {message}, got '{Current.Text}'");
+    private ShellException Error(string message) =>
+        new(ShellErrorKind.Parse, $"awk: syntax error: {message}, got '{Current.Text}'");
 
     private void SkipNewlines()
     {

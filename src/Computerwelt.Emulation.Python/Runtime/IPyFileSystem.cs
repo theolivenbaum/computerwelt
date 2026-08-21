@@ -5,7 +5,7 @@ namespace Computerwelt.Emulation.Python.Runtime;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Nothing is reachable by default: a <see cref="MontyRunner"/> with no filesystem raises
+/// Nothing is reachable by default: a <see cref="PythonRunner"/> with no filesystem raises
 /// <c>ModuleNotFoundError</c> for <c>os</c> and <c>pathlib</c> and <c>NameError</c> for
 /// <c>open</c>, which is the honest report — the program is not being denied access to a
 /// real filesystem, there is no filesystem at all.

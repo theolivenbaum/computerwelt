@@ -201,7 +201,7 @@ public sealed class TarBuiltin : IBuiltin
         {
             metadata = await context.FileSystem.StatAsync(path, cancellationToken);
         }
-        catch (BashkitException)
+        catch (ShellException)
         {
             return false;
         }
@@ -334,7 +334,7 @@ public sealed class TarBuiltin : IBuiltin
             {
                 bytes = await context.FileSystem.ReadFileAsync(context.ResolvePath(archive), cancellationToken);
             }
-            catch (BashkitException)
+            catch (ShellException)
             {
                 return null;
             }

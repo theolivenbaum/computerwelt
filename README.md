@@ -24,7 +24,7 @@ Console.WriteLine(result.Stdout);   // HELLO
 ```
 
 ```csharp
-var python = new MontyRunner().Run("print(sum(x * x for x in range(5)))");
+var python = new PythonRunner().Run("print(sum(x * x for x in range(5)))");
 Console.WriteLine(python.Stdout);   // 30
 ```
 
@@ -96,8 +96,8 @@ Python fixtures pass, and each suite fails on a regression. After making cases p
 the baseline:
 
 ```bash
-BASHKIT_UPDATE_BASELINE=1 dotnet test tests/Computerwelt.Emulation.Bash.SpecTests
-MONTY_UPDATE_BASELINE=1 dotnet test tests/Computerwelt.Emulation.Python.SpecTests
+COMPUTERWELT_UPDATE_BASH_BASELINE=1 dotnet test tests/Computerwelt.Emulation.Bash.SpecTests
+COMPUTERWELT_UPDATE_PYTHON_BASELINE=1 dotnet test tests/Computerwelt.Emulation.Python.SpecTests
 ```
 
 Never lower a baseline to make a build green.

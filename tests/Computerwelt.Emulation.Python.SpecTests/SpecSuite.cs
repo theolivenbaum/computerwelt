@@ -3,8 +3,8 @@ using System.Text.RegularExpressions;
 
 namespace Computerwelt.Emulation.Python.SpecTests;
 
-/// <summary>Loads the Monty fixture corpus.</summary>
-public static partial class MontySuite
+/// <summary>Loads the Python fixture corpus, carried over from monty.</summary>
+public static partial class SpecSuite
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -15,9 +15,9 @@ public static partial class MontySuite
     public static string BaselinePath => Path.Combine(Root, "baseline.json");
 
     /// <summary>Loads every fixture.</summary>
-    public static List<MontyFixture> LoadAll()
+    public static List<SpecFixture> LoadAll()
     {
-        var fixtures = new List<MontyFixture>();
+        var fixtures = new List<SpecFixture>();
 
         foreach (var path in Directory.EnumerateFiles(Root, "*.py").Order(StringComparer.Ordinal))
         {
@@ -28,7 +28,7 @@ public static partial class MontySuite
     }
 
     /// <summary>Parses a fixture's directives out of its source.</summary>
-    public static MontyFixture Parse(string name, string source)
+    public static SpecFixture Parse(string name, string source)
     {
         var expectedToFail = XfailPattern().IsMatch(source);
         var raise = RaisePattern().Match(source);
@@ -36,7 +36,7 @@ public static partial class MontySuite
         // A trailing docstring introduced by TRACEBACK: pins the expected traceback.
         var traceback = TracebackPattern().Match(source);
 
-        return new MontyFixture
+        return new SpecFixture
         {
             Name = name,
             Source = source,
