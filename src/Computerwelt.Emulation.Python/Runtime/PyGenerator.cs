@@ -186,6 +186,13 @@ internal static class GeneratorRunner
             {
                 frame.InstructionPointer++;
                 yield return frame.Pop();
+
+                // `yield` is an expression, so it leaves a value behind — None, since
+                // nothing can be sent in. Without it the `Pop` the compiler emits for
+                // `yield x` as a statement takes the stack below empty, and a generator
+                // with a second `yield` in it brings the host down rather than the
+                // program.
+                frame.Push(PyNone.Instance);
                 continue;
             }
 

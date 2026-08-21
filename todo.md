@@ -13,7 +13,9 @@ Status legend: `[ ]` not started · `[~]` in progress / partial · `[x]` done
 
 Upstream reference: `.reference/bashkit/crates/bashkit/src/`
 Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-scope
-`python` and `typescript` suites). Ratchet file: `tests/spec/baseline.json`.
+`typescript` suite). Ratchet file: `tests/spec/baseline.json`. Upstream's `python` suite
+needs a command that exists only once both halves are joined, so it lives with the
+agent-operation tests instead — see below.
 
 **Current state — shell:** solution builds clean, 156 unit tests green,
 **2,521 / 2,521 conformance cases passing (100 %)**, 27 cases skipped by upstream
@@ -21,8 +23,15 @@ directive.
 
 **Current state — python:** tokenizer, parser, bytecode compiler, VM, core types,
 builtins, the stdlib subset, dunder dispatch and the external-function boundary are all in
-place. **557 / 558 fixtures passing (99.8 %)**, with 18 unit tests covering what the
+place. **557 / 558 fixtures passing (99.8 %)**, with 40 unit tests covering what the
 corpus does not reach. No host exception escapes to a script.
+
+**Current state — joined:** 12 integration tests over one filesystem, and 210 green in
+`tests/Computerwelt.AgentTests/` — 153 covering the shell and Python operations a caller
+actually performs, plus upstream's 57 `python` command cases.
+
+**Extensions:** 11 fixtures in `tests/monty-extensions/` cover behaviour upstream does not
+have. They are kept apart from upstream's corpus deliberately — see below.
 
 The one remaining fixture is a documented divergence, not a gap — see below.
 
@@ -34,6 +43,81 @@ The one remaining fixture is a documented divergence, not a gap — see below.
 | `jq` | 124 / 124 |
 | `awk` | 126 / 126 |
 | `yq` | 26 / 26 |
+
+## Agent-operation coverage  (`tests/Computerwelt.AgentTests/`)
+
+The two conformance corpora prove each builtin is individually right. They say much less
+about the handful of shapes a caller actually types: read a file, search a tree, patch a
+source file with a short Python program, check the result. That suite was written by
+replaying a real working session against this repository and turning each operation into a
+test — 153 of them, plus upstream's 57-case `python` command corpus, which had never been
+ported because the command it exercises only exists once both halves are joined.
+
+Replaying found five defects the corpora between them did not:
+
+| Found | Was | Now |
+|---|---|---|
+| A generator with a second `yield` in it | `ArgumentOutOfRangeException` out of the host — `yield` left no value where the compiler's `Pop` expected one | The yield expression evaluates to `None`, as it does in CPython. Covered by `GeneratorTests` |
+| `sys.argv` | The constant `['<script>']`, so no script could read its own options | The invocation as written: `-c`, `-`, or the script's path, then the arguments |
+| `sys.exit(n)` / `raise SystemExit(n)` | Exit status 1 and a traceback, so `python check.py \|\| handle` never fired | Status `n`, no traceback; a non-integer argument prints and exits 1 |
+| `python -c "2 + 3"` | Printed nothing | Echoes the value, as upstream's corpus pins. Only for `-c`: a heredoc patch script ending in `open(p, 'w').write(s)` must not emit a stray byte count |
+| `python` in the middle of a pipeline | `input` and `sys.stdin` did not exist | Both read the shell's standard input, when the program did not come from it |
+
+## Extensions beyond Monty  (`tests/monty-extensions/`)
+
+Some of what the agent suite wanted was not a defect but an absence: upstream Monty has no
+way to match a pattern against a filename, and no way to walk a tree. Those are now
+implemented, and because they are additions rather than ports they are tested apart from
+upstream's corpus — a fixture in `tests/monty-extensions/` fails on upstream Monty by
+construction, usually at the import. `COMPUTERWELT_SKIP_EXTENSIONS=1` switches the folder
+off, which is the check that the port still stands on upstream's corpus alone.
+
+| Added | Surface | Fixture |
+|---|---|---|
+| `glob` | `glob`, `iglob`, `escape`, `has_magic`; `**` with `recursive=`, `root_dir=`, `include_hidden=` | `glob__patterns.py` |
+| `fnmatch` | `fnmatch`, `fnmatchcase`, `filter`, `translate` — no filesystem needed, so importable without one | `fnmatch__patterns.py` |
+| `os.walk` | top-down and bottom-up, `onerror`, and pruning via the directory list | `os__walk.py` |
+| `os.scandir` | `DirEntry` with `name`, `path`, `is_dir`, `is_file`, `stat`, `__fspath__`; a context manager | `os__scandir.py` |
+| `os.path` | `relpath`, `commonpath`, `commonprefix`, `realpath`, `normcase`, `lexists`, `getmtime`, `expanduser`; `normpath` now collapses `..` | `os__path_extended.py` |
+| `import os.path` | `os.path` and `posixpath` are importable names for the object `os.path` already was; `import a.b` binds `a`, as CPython does | `os__path_extended.py` |
+| `Path.glob` / `rglob` / `match` / `full_match` / `walk` | upstream's `Path` had `iterdir` and nothing more | `pathlib__glob.py` |
+| `os.walk(..., max_depth=N)` | not CPython's either — a bound the caller asks for, which ends the walk cleanly | `os__walk_depth.py` |
+| `io` | `io.open`, `StringIO`, `BytesIO`, `UnsupportedOperation` | `io__module.py` |
+| `sys.argv`, `sys.exit`, `input`, `sys.stdin` | the host-facing four from the previous round | `sys__*.py` |
+
+One engine sits behind `fnmatch`, `glob` and `Path.glob`, because CPython's three agree on
+what a pattern means and differ only in what they match it against. `os.walk` is iterative
+and lazy: iterative because recursion would spend the *host's* stack on the depth of a tree
+the program chose, and lazy because pruning only works if the descent happens after the
+caller's turn.
+
+### Depth is bounded twice, for two different reasons
+
+| | What it is | What happens at it |
+|---|---|---|
+| `FsLimits.MaxDepth` (64) | the shell filesystem's cap on the path it will **create** | `mkdir` refuses — the tree simply cannot get deeper |
+| `ExecutionLimits.MaxDirectoryDepth` (64) | how deep a **traversal** will descend | raises `OSError`, because a walk that quietly stopped part-way would report a subset of the tree as though it were all of it |
+| `os.walk(..., max_depth=N)` | the **caller's** own bound, relative to `top` | ends the walk cleanly — this is someone asking for less, not a limit being hit |
+
+The first is the real containment: nothing can walk depth that cannot exist. It now covers
+the whole path rather than just directories — a file sits one level below the directory
+holding it, so capping directories alone left the deepest thing in the tree one past the
+limit. The second matters only for a host that supplies its own `IPyFileSystem` over
+storage this sandbox did not build, where a tree can be arbitrarily deep or, through a link
+to its own ancestor, bottomless. `DepthLimitTests` walks exactly that filesystem.
+
+Making the traversal cap useful turned up a related hole: `ShellFileSystem` translated only
+some failures into Python exceptions, so `os.makedirs` past the depth limit threw a
+`FileSystemException` straight out of `ExecAsync` — a host exception leaving the sandbox
+rather than an error the program could catch. Every call now goes through one guarded
+chokepoint that maps `FileSystemErrorKind` onto the matching Python exception.
+
+Recorded, not fixed, because upstream defines the surface and this port follows it:
+
+| Absent | Note |
+|---|---|
+| `open(..., newline='')` | Refused, though nothing here translates line endings and it would describe what already happens. `tests/monty-spec/open__fs.py` pins the refusal; binary mode is the way to ask for exact bytes |
+| `shutil`, `argparse`, `textwrap`, `difflib`, `tempfile`, `csv`, `hashlib`, `base64`, `string`, `functools`, … | Not ported. `StandardLibrarySurfaceTests` lists the set in both directions, so adding one is a deliberate edit rather than a silent widening |
 
 ## Known divergences
 

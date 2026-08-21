@@ -272,6 +272,7 @@ public sealed class InMemoryFileSystem : IFileSystem
             }
 
             EnsureNameLength(name);
+            EnsureDepth(link);
             parent.Children[name] = new SymlinkNode(target, _time.GetUtcNow());
             parent.Touch(_time.GetUtcNow());
         }
@@ -393,6 +394,7 @@ public sealed class InMemoryFileSystem : IFileSystem
     {
         var (parent, name) = ResolveParent(path);
         EnsureNameLength(name);
+        EnsureDepth(path);
 
         byte[] final;
         long delta;
@@ -464,6 +466,24 @@ public sealed class InMemoryFileSystem : IFileSystem
         if (name.Length > Limits.MaxNameLength)
         {
             throw FsErrors.NameTooLong(name);
+        }
+    }
+
+    /// <summary>
+    /// Refuses a path with more components than the filesystem allows.
+    /// </summary>
+    /// <remarks>
+    /// The cap is on the whole path, not just on how deep a <c>mkdir</c> reaches: a file
+    /// sits one level below the directory holding it, so bounding directories alone would
+    /// leave the deepest thing in the tree one past the limit. Making it a property of the
+    /// path means anything that walks this filesystem — <c>find</c>, a glob, Python's
+    /// <c>os.walk</c> — has a depth it can count on rather than one it has to guess.
+    /// </remarks>
+    private void EnsureDepth(VPath path)
+    {
+        if (path.Segments.Length > Limits.MaxDepth)
+        {
+            throw FsErrors.InvalidArgument(path, "Directory nesting too deep");
         }
     }
 

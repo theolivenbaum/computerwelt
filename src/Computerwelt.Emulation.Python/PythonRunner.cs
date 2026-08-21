@@ -52,6 +52,26 @@ public sealed class PythonRunner
     /// <summary>Values the host defines in the program's global namespace before it runs.</summary>
     public Dictionary<string, PyObject> Variables { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// What <c>sys.argv</c> reports, program name first.
+    /// </summary>
+    /// <remarks>
+    /// Left empty, <c>sys.argv</c> is <c>["&lt;script&gt;"]</c>. A host running Python as a
+    /// command fills this in from the real invocation, which is why
+    /// <c>python script.py --flag value</c> behaves the way a script expects.
+    /// </remarks>
+    public List<string> Arguments { get; } = [];
+
+    /// <summary>
+    /// What the program reads from standard input, or <see langword="null"/> for none.
+    /// </summary>
+    /// <remarks>
+    /// With none, <c>input()</c> and <c>sys.stdin</c> are absent rather than present and
+    /// empty — the same rule the filesystem follows. A host that puts Python in the middle
+    /// of a pipeline sets this to whatever the previous stage produced.
+    /// </remarks>
+    public string? StandardInput { get; set; }
+
     /// <summary>Runs <paramref name="source"/> and reports what happened.</summary>
     public RunResult Run(string source, string fileName = "<stdin>")
     {
@@ -68,9 +88,23 @@ public sealed class PythonRunner
             builtins.Set(key, value);
         }
 
-        foreach (var (name, module) in Computerwelt.Emulation.Python.Modules.StandardLibrary.Create(machine, TimeProvider, FileSystem))
+        // One stream object serves both `sys.stdin` and `input()`, so a program that mixes
+        // them reads each line once rather than seeing the input twice.
+        var standardInput = StandardInput is { } text
+            ? new Computerwelt.Emulation.Python.Modules.PyMemoryStream(binary: false, text)
+            : null;
+
+        foreach (var (name, module) in Computerwelt.Emulation.Python.Modules.StandardLibrary.Create(
+                     machine, TimeProvider, FileSystem, Arguments, standardInput))
         {
             machine.Modules[name] = module;
+        }
+
+        if (standardInput is not null)
+        {
+            builtins.Set(
+                new PyStr("input"),
+                Computerwelt.Emulation.Python.Modules.SysModule.CreateInput(machine, standardInput));
         }
 
         // `open` exists only when there is somewhere to open a file.
@@ -103,13 +137,14 @@ public sealed class PythonRunner
         {
             var module = Parser.Parse(source);
             var code = Compiler.CompileModule(module, fileName);
-            machine.RunModule(code);
+            var value = machine.RunModule(code);
 
             return new RunResult
             {
                 Succeeded = true,
                 Stdout = machine.Stdout,
                 Stderr = machine.Stderr,
+                Value = value,
                 Globals = globals,
             };
         }
@@ -120,8 +155,26 @@ public sealed class PythonRunner
                 Succeeded = false,
                 Stdout = machine.Stdout,
                 Stderr = machine.Stderr,
+                ExitCode = 1,
                 SyntaxError = error,
                 Traceback = $"  File \"{fileName}\", line {error.Line}\nSyntaxError: {error.Message}",
+                Globals = globals,
+            };
+        }
+        catch (PyRaise raise) when (raise.Exception.IsInstanceOf(PyExceptionType.SystemExit))
+        {
+            // `sys.exit()` and a bare `raise SystemExit` are how a script *asks* to stop, so
+            // they are an ordinary ending rather than a crash: no traceback, and the status
+            // the script named becomes the command's exit status.
+            var (code, message) = SystemExitStatus(raise.Exception);
+
+            return new RunResult
+            {
+                Succeeded = true,
+                Stdout = machine.Stdout,
+                Stderr = message is null ? machine.Stderr : machine.Stderr + message + "\n",
+                ExitCode = code,
+                Exception = raise.Exception,
                 Globals = globals,
             };
         }
@@ -132,11 +185,31 @@ public sealed class PythonRunner
                 Succeeded = false,
                 Stdout = machine.Stdout,
                 Stderr = machine.Stderr,
+                ExitCode = 1,
                 Exception = raise.Exception,
                 Traceback = raise.Exception.FormatTraceback(fileName),
                 Globals = globals,
             };
         }
+    }
+
+    /// <summary>
+    /// Turns an uncaught <c>SystemExit</c> into a status and, when the argument was not an
+    /// integer, the line CPython prints to standard error before exiting with 1.
+    /// </summary>
+    private static (int Code, string? Message) SystemExitStatus(PyException exception)
+    {
+        var argument = exception.Arguments.Count > 0 ? exception.Arguments[0] : PyNone.Instance;
+
+        return argument switch
+        {
+            PyNone => (0, null),
+
+            // Statuses are a byte on the way out of a process, and scripts do rely on
+            // `sys.exit(256)` not reading as success, so the wrap is kept.
+            PyInt status => ((int)(((status.Value % 256) + 256) % 256), null),
+            _ => (1, argument.Display()),
+        };
     }
 }
 
@@ -152,6 +225,15 @@ public sealed record RunResult
     /// <summary>Everything the program wrote to standard error.</summary>
     public required string Stderr { get; init; }
 
+    /// <summary>
+    /// The status the program asked to exit with: 0 unless it raised.
+    /// </summary>
+    /// <remarks>
+    /// An uncaught exception is 1; <c>sys.exit(n)</c> is <c>n</c>. A host running Python as
+    /// a command reports this as the command's exit status.
+    /// </remarks>
+    public int ExitCode { get; init; }
+
     /// <summary>The uncaught exception, when one ended the run.</summary>
     public PyException? Exception { get; init; }
 
@@ -160,6 +242,15 @@ public sealed record RunResult
 
     /// <summary>The formatted traceback, when the run failed.</summary>
     public string? Traceback { get; init; }
+
+    /// <summary>
+    /// The value of the program's last statement, when that was a bare expression.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="PyNone"/> for anything else, so a caller can tell <c>2 + 3</c> from
+    /// <c>x = 2 + 3</c> and echo only the first — which is how <c>python -c</c> behaves.
+    /// </remarks>
+    public PyObject Value { get; init; } = PyNone.Instance;
 
     /// <summary>The module namespace after the run.</summary>
     public required PyDict Globals { get; init; }

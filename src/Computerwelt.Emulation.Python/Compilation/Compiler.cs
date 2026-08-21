@@ -67,6 +67,18 @@ public sealed class Compiler
     public static CodeObject CompileModule(PyModule module, string fileName)
     {
         var compiler = new Compiler("<module>", fileName, null, isFunctionScope: false);
+
+        // A module ending in a bare expression returns its value rather than discarding
+        // it, which is what lets a host echo the result of `python -c "2 + 3"` the way an
+        // interactive session would. Anything else returns None.
+        if (module.Body is [.., ExpressionStatement last])
+        {
+            compiler.CompileStatements([.. module.Body.Take(module.Body.Count - 1)]);
+            compiler.CompileExpression(last.Value);
+            compiler.Emit(OpCode.Return, 0, last.Line);
+            return compiler._code;
+        }
+
         compiler.CompileStatements(module.Body);
         compiler.Emit(OpCode.LoadConst, compiler._code.AddConstant(PyNone.Instance), 0);
         compiler.Emit(OpCode.Return, 0, 0);
@@ -608,8 +620,23 @@ public sealed class Compiler
 
                 foreach (var alias in import.Names)
                 {
+                    // `import a.b` binds `a`, not `a.b` — but both still have to resolve,
+                    // so the submodule is imported and dropped and the package is bound.
+                    // `import a.b as name` binds the submodule itself, which is why the
+                    // aliased form takes the straight path.
+                    if (alias.Alias is null && alias.Name.Contains('.', StringComparison.Ordinal))
+                    {
+                        var package = alias.Name.Split('.')[0];
+
+                        Emit(OpCode.ImportName, _code.AddName(alias.Name), import.Line);
+                        Emit(OpCode.Pop, 0, import.Line);
+                        Emit(OpCode.ImportName, _code.AddName(package), import.Line);
+                        EmitStore(package, import.Line);
+                        continue;
+                    }
+
                     Emit(OpCode.ImportName, _code.AddName(alias.Name), import.Line);
-                    EmitStore(alias.Alias ?? alias.Name.Split('.')[0], import.Line);
+                    EmitStore(alias.Alias ?? alias.Name, import.Line);
                 }
 
                 _bindingImport = false;

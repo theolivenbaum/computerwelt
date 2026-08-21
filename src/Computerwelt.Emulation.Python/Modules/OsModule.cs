@@ -22,7 +22,13 @@ namespace Computerwelt.Emulation.Python.Modules;
 public static class OsModule
 {
     /// <summary>Builds the <c>os</c> module over <paramref name="fileSystem"/>.</summary>
-    public static PyModuleObject Create(IPyFileSystem fileSystem)
+    /// <param name="fileSystem">The storage the module works over.</param>
+    /// <param name="machine">
+    /// The machine a callback is invoked through — <c>os.walk</c>'s <c>onerror</c> is the
+    /// only one. Without it an unreadable directory is skipped silently, which is what
+    /// <c>os.walk</c> does when no handler was given anyway.
+    /// </param>
+    public static PyModuleObject Create(IPyFileSystem fileSystem, VirtualMachine? machine = null)
     {
         var module = new PyModuleObject("os");
 
@@ -61,6 +67,7 @@ public static class OsModule
             {
                 PyStr or PyBytes => given[0]!,
                 PyPath path => new PyStr(path.Value),
+                PyDirEntry entry => new PyStr(entry.Path),
                 _ => throw new PyRaise(PyErrors.TypeError(
                     $"expected str, bytes or os.PathLike object, not {given[0]!.TypeName}")),
             };
@@ -218,8 +225,226 @@ public static class OsModule
             }));
         }
 
+        module.Add("walk", new PyBuiltinFunction("walk", (arguments, keywords) =>
+        {
+            var given = Clinic(
+                "walk",
+                ["top", "topdown", "onerror", "followlinks", "max_depth"],
+                arguments,
+                keywords,
+                maxPositional: 4,
+                required: 1,
+                exactPositional: false);
+
+            var top = Located(given[0]!, "walk", "top", "string, bytes or os.PathLike");
+            var topDown = given[1] is null || given[1]!.IsTruthy();
+            var onError = given[2] is null or PyNone ? null : given[2];
+
+            // `followlinks` is accepted and has nothing to do: this filesystem has no
+            // symbolic links, so a walk cannot loop through one.
+            _ = given[3];
+
+            return new PyIterator(
+                Walk(fileSystem, top, topDown, onError, machine, Depth(given[4]), DepthCap(machine)),
+                "generator");
+        }));
+
+        module.Add("scandir", new PyBuiltinFunction("scandir", (arguments, keywords) =>
+        {
+            var given = Clinic("scandir", ["path"], arguments, keywords, maxPositional: 1, required: 0);
+
+            var target = given[0] is null or PyNone
+                ? fileSystem.WorkingDirectory
+                : Located(given[0]!, "scandir", "path", "string, bytes, os.PathLike, integer or None");
+
+            return new PyScandir(target, [
+                .. fileSystem.List(target)
+                    .OrderBy(static name => name, StringComparer.Ordinal)
+                    .Select(name => new PyDirEntry(name, PyPath.Join(target, name), fileSystem))]);
+        }));
+
         module.Add("path", CreatePath(fileSystem));
         return module;
+    }
+
+    /// <summary>
+    /// Produces <c>os.walk</c>'s <c>(dirpath, dirnames, filenames)</c> triples, lazily.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Iterative and lazy, both deliberately. Iterative because recursion would spend the
+    /// host's stack on the depth of a tree the program chose, and a sandbox must not let a
+    /// program decide how much host stack to use. Lazy because a top-down walk is supposed
+    /// to honour edits to the directory list it just handed out —
+    /// <c>dirnames[:] = [d for d in dirnames if d != 'obj']</c> is how a walk prunes a
+    /// subtree, and it only works if the descent happens after the caller's turn.
+    /// </para>
+    /// <para>
+    /// A bottom-up walk cannot be pruned that way in CPython either: the children are
+    /// already visited by the time the parent is reported.
+    /// </para>
+    /// </remarks>
+    /// <param name="fileSystem">Where to walk.</param>
+    /// <param name="top">The directory to start from.</param>
+    /// <param name="topDown">True to report a directory before its children.</param>
+    /// <param name="onError">A callable handed the <c>OSError</c> from an unreadable directory.</param>
+    /// <param name="machine">The machine <paramref name="onError"/> is called through.</param>
+    /// <param name="maxDepth">
+    /// How many levels below <paramref name="top"/> to descend, or null for no bound of the
+    /// caller's own. Unlike <paramref name="depthCap"/> this <i>stops</i> rather than
+    /// raising: it is the caller asking for less, not a limit being hit.
+    /// </param>
+    /// <param name="depthCap">
+    /// The sandbox's own cap on absolute path depth. Reaching it raises, because a walk
+    /// that quietly stopped part-way would report a subset of the tree as though it were
+    /// all of it.
+    /// </param>
+    internal static IEnumerable<PyObject> Walk(
+        IPyFileSystem fileSystem,
+        string top,
+        bool topDown,
+        PyObject? onError,
+        VirtualMachine? machine,
+        int? maxDepth = null,
+        int depthCap = Globbing.DefaultMaxDepth)
+    {
+        // Depth is counted from `top`, so `max_depth=1` means "this directory and the ones
+        // directly under it" whatever the absolute depth of the starting point.
+        var origin = Globbing.Depth(top);
+
+        if (topDown)
+        {
+            var pending = new List<string> { top };
+
+            while (pending.Count > 0)
+            {
+                var directory = pending[0];
+                pending.RemoveAt(0);
+
+                var (directories, files) = Split(fileSystem, directory, onError, machine);
+
+                if (directories is null)
+                {
+                    continue;
+                }
+
+                yield return new PyTuple([new PyStr(directory), directories, files!]);
+
+                if (maxDepth is { } limit && Globbing.Depth(directory) - origin >= limit)
+                {
+                    continue;
+                }
+
+                Globbing.EnsureDepth(directory, depthCap);
+
+                // Read back from the very list object the caller was given, after its turn
+                // — anything it removed is never descended into.
+                pending.InsertRange(0, directories.Items.Select(name => PyPath.Join(directory, name.Display())));
+            }
+
+            yield break;
+        }
+
+        foreach (var triple in BottomUp(fileSystem, top, onError, machine, maxDepth, depthCap, origin))
+        {
+            yield return triple;
+        }
+    }
+
+    /// <summary>Reads the <c>max_depth</c> argument, which must be a non-negative integer.</summary>
+    private static int? Depth(PyObject? value) => value switch
+    {
+        null or PyNone => null,
+        PyInt { Value: var depth } when depth >= 0 => (int)depth,
+        PyInt => throw new PyRaise(PyErrors.ValueError("max_depth must not be negative")),
+        _ => throw new PyRaise(PyErrors.TypeError(
+            $"'{value.TypeName}' object cannot be interpreted as an integer")),
+    };
+
+    /// <summary>The sandbox's depth cap, from the machine's limits when there is one.</summary>
+    private static int DepthCap(VirtualMachine? machine) =>
+        machine?.Limits.MaxDirectoryDepth ?? Globbing.DefaultMaxDepth;
+
+    /// <summary>Walks a subtree children-first.</summary>
+    /// <remarks>
+    /// The recursion here is over the host's stack, so it is bounded by the same instruction
+    /// budget the rest of a run is: a tree deep enough to overflow it costs more listings
+    /// than a program is allowed to make first.
+    /// </remarks>
+    private static IEnumerable<PyObject> BottomUp(
+        IPyFileSystem fileSystem,
+        string directory,
+        PyObject? onError,
+        VirtualMachine? machine,
+        int? maxDepth,
+        int depthCap,
+        int origin)
+    {
+        var (directories, files) = Split(fileSystem, directory, onError, machine);
+
+        if (directories is null)
+        {
+            yield break;
+        }
+
+        // Bottom-up cannot be pruned by editing the list — the children are already
+        // visited by the time the parent is reported — so both bounds are checked before
+        // the recursion rather than after the yield.
+        if (maxDepth is not { } limit || Globbing.Depth(directory) - origin < limit)
+        {
+            Globbing.EnsureDepth(directory, depthCap);
+
+            foreach (var name in directories.Items.ToList())
+            {
+                var child = PyPath.Join(directory, name.Display());
+
+                foreach (var triple in BottomUp(fileSystem, child, onError, machine, maxDepth, depthCap, origin))
+                {
+                    yield return triple;
+                }
+            }
+        }
+
+        yield return new PyTuple([new PyStr(directory), directories, files!]);
+    }
+
+    /// <summary>
+    /// Lists a directory into its subdirectories and its files, or reports it unreadable.
+    /// </summary>
+    /// <returns>Two lists, or two nulls when the directory could not be read.</returns>
+    private static (PyList? Directories, PyList? Files) Split(
+        IPyFileSystem fileSystem,
+        string directory,
+        PyObject? onError,
+        VirtualMachine? machine)
+    {
+        IReadOnlyList<string> names;
+
+        try
+        {
+            names = fileSystem.List(directory);
+        }
+        catch (PyRaise raise)
+        {
+            // An unreadable directory is skipped silently unless the caller asked to hear
+            // about it, which is what `onerror` is for.
+            if (onError is not null && machine is not null)
+            {
+                machine.Call(onError, [raise.Exception]);
+            }
+
+            return (null, null);
+        }
+
+        var directories = new List<PyObject>();
+        var files = new List<PyObject>();
+
+        foreach (var name in names.OrderBy(static name => name, StringComparer.Ordinal))
+        {
+            (fileSystem.IsDirectory(PyPath.Join(directory, name)) ? directories : files).Add(new PyStr(name));
+        }
+
+        return (new PyList(directories), new PyList(files));
     }
 
     /// <summary>Builds <c>os.path</c>, whose operations are lexical except for the queries.</summary>
@@ -270,19 +495,98 @@ public static class OsModule
             return new PyTuple([new PyStr(parent == "." ? string.Empty : parent), new PyStr(name.Name)]);
         });
 
-        Add(path, "abspath", 1, 1, (arguments, _) =>
-        {
-            var value = Text(arguments[0]);
-            return new PyStr(value.StartsWith('/') ? PyPath.Normalize(value) : PyPath.Join(fileSystem.WorkingDirectory, value));
-        });
-
-        Add(path, "normpath", 1, 1, (arguments, _) => new PyStr(PyPath.Normalize(Text(arguments[0]))));
+        Add(path, "abspath", 1, 1, (arguments, _) => new PyStr(Absolute(Text(arguments[0]), fileSystem)));
+        Add(path, "normpath", 1, 1, (arguments, _) => new PyStr(Normalize(Text(arguments[0]))));
         Add(path, "isabs", 1, 1, (arguments, _) => PyBool.Of(Text(arguments[0]).StartsWith('/')));
         Add(path, "exists", 1, 1, (arguments, _) => PyBool.Of(fileSystem.Exists(Text(arguments[0]))));
         Add(path, "isfile", 1, 1, (arguments, _) => PyBool.Of(fileSystem.IsFile(Text(arguments[0]))));
         Add(path, "isdir", 1, 1, (arguments, _) => PyBool.Of(fileSystem.IsDirectory(Text(arguments[0]))));
         Add(path, "islink", 1, 1, (_, _) => PyBool.False);
+        Add(path, "lexists", 1, 1, (arguments, _) => PyBool.Of(fileSystem.Exists(Text(arguments[0]))));
         Add(path, "getsize", 1, 1, (arguments, _) => new PyInt(fileSystem.Size(Text(arguments[0]))));
+        Add(path, "getmtime", 1, 1, (arguments, _) => new PyFloat(fileSystem.ModifiedAt(Text(arguments[0]))));
+
+        // No filesystem here has symbolic links, so resolving is normalising.
+        Add(path, "realpath", 1, 1, (arguments, _) => new PyStr(Absolute(Text(arguments[0]), fileSystem)));
+
+        // Paths are POSIX whatever the host is, so case folding would be wrong even on
+        // Windows: `normcase` is the identity.
+        Add(path, "normcase", 1, 1, (arguments, _) => new PyStr(Text(arguments[0])));
+
+        Add(path, "relpath", 1, 2, (arguments, keywords) =>
+        {
+            var start = arguments.Length > 1 ? Text(arguments[1])
+                : keywords?.TryGetValue(new PyStr("start"), out var named) == true ? Text(named)
+                : ".";
+
+            return new PyStr(Relative(Absolute(Text(arguments[0]), fileSystem), Absolute(start, fileSystem)));
+        });
+
+        Add(path, "commonprefix", 1, 1, (arguments, _) =>
+        {
+            var values = (arguments[0].Iterate() ?? throw new PyRaise(PyErrors.TypeError(
+                $"'{arguments[0].TypeName}' object is not iterable")))
+                .Select(Text).ToList();
+
+            if (values.Count == 0)
+            {
+                return new PyStr(string.Empty);
+            }
+
+            // Character-wise, not component-wise — the documented wart, and scripts that
+            // want the sane one call commonpath.
+            var shortest = values.Min(static value => value.Length);
+            var length = 0;
+
+            while (length < shortest && values.All(value => value[length] == values[0][length]))
+            {
+                length++;
+            }
+
+            return new PyStr(values[0][..length]);
+        });
+
+        Add(path, "commonpath", 1, 1, (arguments, _) =>
+        {
+            var values = (arguments[0].Iterate() ?? throw new PyRaise(PyErrors.TypeError(
+                $"'{arguments[0].TypeName}' object is not iterable")))
+                .Select(Text).ToList();
+
+            if (values.Count == 0)
+            {
+                throw new PyRaise(PyErrors.ValueError("commonpath() arg is an empty sequence"));
+            }
+
+            var absolute = values[0].StartsWith('/');
+
+            if (values.Any(value => value.StartsWith('/') != absolute))
+            {
+                throw new PyRaise(PyErrors.ValueError("Can't mix absolute and relative paths"));
+            }
+
+            var parts = values
+                .Select(static value => value.Split('/', StringSplitOptions.RemoveEmptyEntries))
+                .ToList();
+
+            var shared = new List<string>();
+
+            for (var i = 0; i < parts.Min(static p => p.Length); i++)
+            {
+                if (parts.Any(p => !string.Equals(p[i], parts[0][i], StringComparison.Ordinal)))
+                {
+                    break;
+                }
+
+                shared.Add(parts[0][i]);
+            }
+
+            var joined = string.Join('/', shared);
+            return new PyStr(absolute ? "/" + joined : joined);
+        });
+
+        // There are no home directories in this sandbox, so `~` stays as written rather
+        // than expanding to somewhere that does not exist.
+        Add(path, "expanduser", 1, 1, (arguments, _) => new PyStr(Text(arguments[0])));
 
         return path;
     }
@@ -369,6 +673,10 @@ public static class OsModule
         Default(given[3], "encoding", static value =>
             value is PyNone or PyStr { Value: "utf-8" or "utf8" or "UTF-8" });
         Default(given[4], "errors", static value => value is PyNone);
+        // `newline=''` is refused along with the rest, even though nothing here translates
+        // line endings and it would therefore describe what already happens: upstream's
+        // corpus pins the rejection, and a caller passing it is asking for a guarantee
+        // about newline handling that this wrapper does not make.
         Default(given[5], "newline", static value => value is PyNone);
         Default(given[6], "closefd", static value => value.IsTruthy());
         Default(given[7], "opener", static value => value is PyNone);
@@ -406,10 +714,86 @@ public static class OsModule
     {
         PyStr text => text.Value,
         PyPath path => path.Value,
+
+        // A DirEntry is os.PathLike, which is what lets `open(entry)` work directly on
+        // what a scan produced.
+        PyDirEntry entry => entry.Path,
         PyBytes bytes => Encoding.UTF8.GetString(bytes.Value),
         _ => throw new PyRaise(PyErrors.TypeError(
             $"expected str, bytes or os.PathLike object, not {value.TypeName}")),
     };
+
+    /// <summary>Resolves a path against the working directory, without touching storage.</summary>
+    private static string Absolute(string value, IPyFileSystem fileSystem) =>
+        Normalize(value.StartsWith('/') ? value : PyPath.Join(fileSystem.WorkingDirectory, value));
+
+    /// <summary>
+    /// Collapses <c>.</c> and <c>..</c> the way <c>os.path.normpath</c> does.
+    /// </summary>
+    /// <remarks>
+    /// Not <see cref="PyPath.Normalize"/>, which leaves <c>..</c> in place — and correctly
+    /// so, because <c>PurePath</c> is lexical about a component that could name a symbolic
+    /// link. <c>os.path</c> made the opposite choice, and <c>relpath</c>, <c>commonpath</c>
+    /// and <c>realpath</c> all depend on it having done so.
+    /// </remarks>
+    private static string Normalize(string value)
+    {
+        if (value.Length == 0)
+        {
+            return ".";
+        }
+
+        var absolute = value.StartsWith('/');
+        var parts = new List<string>();
+
+        foreach (var part in value.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            switch (part)
+            {
+                case ".":
+                    break;
+
+                // `..` above the root is the root; above a relative path's start it has to
+                // stay, because there is no way to know what it would climb to.
+                case ".." when parts.Count > 0 && parts[^1] != "..":
+                    parts.RemoveAt(parts.Count - 1);
+                    break;
+
+                case ".." when absolute:
+                    break;
+
+                default:
+                    parts.Add(part);
+                    break;
+            }
+        }
+
+        var joined = string.Join('/', parts);
+        return absolute ? "/" + joined : joined.Length == 0 ? "." : joined;
+    }
+
+    /// <summary>Expresses <paramref name="path"/> as a route from <paramref name="start"/>.</summary>
+    /// <remarks>
+    /// Purely lexical, as CPython's is: it climbs with <c>..</c> as far as it needs to and
+    /// never asks the filesystem whether any of it exists.
+    /// </remarks>
+    private static string Relative(string path, string start)
+    {
+        var target = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var from = start.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var shared = 0;
+
+        while (shared < target.Length && shared < from.Length
+               && string.Equals(target[shared], from[shared], StringComparison.Ordinal))
+        {
+            shared++;
+        }
+
+        var steps = Enumerable.Repeat("..", from.Length - shared).Concat(target[shared..]).ToList();
+
+        // A path that is the start itself is ".", not the empty string.
+        return steps.Count == 0 ? "." : string.Join('/', steps);
+    }
 
     /// <summary>
     /// Binds an <c>os</c> function's arguments the way CPython's argument clinic does.
@@ -509,6 +893,7 @@ public static class OsModule
         {
             PyStr text => text.Value,
             PyPath path => path.Value,
+            PyDirEntry entry => entry.Path,
             PyBytes bytes => Encoding.UTF8.GetString(bytes.Value),
             _ => throw new PyRaise(PyErrors.TypeError(
                 $"{function}: {parameter} should be {kinds}, not {value.TypeName}")),

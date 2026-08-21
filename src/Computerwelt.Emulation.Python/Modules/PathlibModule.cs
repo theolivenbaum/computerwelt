@@ -25,11 +25,23 @@ public sealed class PyPath : PyObject
     /// <summary>Creates a path.</summary>
     /// <param name="value">The path text, already normalised.</param>
     /// <param name="fileSystem">The filesystem its I/O methods use, if any.</param>
-    public PyPath(string value, IPyFileSystem? fileSystem = null)
+    /// <param name="maxDepth">
+    /// How deep <c>glob</c> and <c>walk</c> may descend before refusing to go further. It
+    /// travels with the path so that a <c>Path</c> produced by a walk carries the same cap
+    /// as the one the walk started from.
+    /// </param>
+    public PyPath(string value, IPyFileSystem? fileSystem = null, int maxDepth = DefaultMaxDepth)
     {
         Value = value;
         _fileSystem = fileSystem;
+        MaxDepth = maxDepth;
     }
+
+    /// <summary>The depth cap used when no host set one — the shell filesystem's own.</summary>
+    internal const int DefaultMaxDepth = 64;
+
+    /// <summary>How deep this path's traversals may descend.</summary>
+    public int MaxDepth { get; }
 
     /// <summary>The path text.</summary>
     public string Value { get; }
@@ -170,12 +182,12 @@ public sealed class PyPath : PyObject
     public override PyObject? GetAttribute(string name) => name switch
     {
         "name" => new PyStr(Name),
-        "parent" => new PyPath(Parent, _fileSystem),
+        "parent" => new PyPath(Parent, _fileSystem, MaxDepth),
         "stem" => new PyStr(Stem),
         "suffix" => new PyStr(Suffix),
         "suffixes" => new PyList([.. Suffixes().Select(static s => (PyObject)new PyStr(s))]),
         "parts" => new PyTuple([.. Parts().Select(static p => (PyObject)new PyStr(p))]),
-        "parents" => new PyList([.. Ancestors().Select(p => (PyObject)new PyPath(p, _fileSystem))]),
+        "parents" => new PyList([.. Ancestors().Select(p => (PyObject)new PyPath(p, _fileSystem, MaxDepth))]),
         _ => Method(name),
     };
 
@@ -231,14 +243,14 @@ public sealed class PyPath : PyObject
         {
             case "joinpath":
                 return Builtin(name, arguments =>
-                    new PyPath(arguments.Aggregate(Value, (path, part) => Join(path, Text(part))), _fileSystem));
+                    new PyPath(arguments.Aggregate(Value, (path, part) => Join(path, Text(part))), _fileSystem, MaxDepth));
 
             case "with_name":
-                return Builtin(name, arguments => new PyPath(Join(Parent, Text(arguments[0])), _fileSystem));
+                return Builtin(name, arguments => new PyPath(Join(Parent, Text(arguments[0])), _fileSystem, MaxDepth));
 
             case "with_suffix":
                 return Builtin(name, arguments =>
-                    new PyPath(Join(Parent, Stem + Text(arguments[0])), _fileSystem));
+                    new PyPath(Join(Parent, Stem + Text(arguments[0])), _fileSystem, MaxDepth));
 
             case "is_absolute":
                 return Builtin(name, _ => PyBool.Of(Value.StartsWith('/')));
@@ -395,23 +407,153 @@ public sealed class PyPath : PyObject
             case "iterdir":
                 return Builtin(name, _ => new PyList(
                     [.. Storage().List(Value).OrderBy(static e => e, StringComparer.Ordinal)
-                        .Select(entry => (PyObject)new PyPath(Join(Value, entry), _fileSystem))]));
+                        .Select(entry => (PyObject)new PyPath(Join(Value, entry), _fileSystem, MaxDepth))]));
 
             case "rename":
                 return Builtin(name, arguments =>
                 {
                     var target = Text(arguments[0]);
                     Storage().Rename(Value, target);
-                    return new PyPath(target, _fileSystem);
+                    return new PyPath(target, _fileSystem, MaxDepth);
+                });
+
+            case "glob" or "rglob":
+                return new PyBuiltinFunction(name, (arguments, keywords) =>
+                {
+                    if (arguments.Length == 0)
+                    {
+                        throw new PyRaise(PyErrors.TypeError(
+                            $"Path.{name}() missing 1 required positional argument: 'pattern'"));
+                    }
+
+                    var pattern = Text(arguments[0]);
+
+                    // `rglob(p)` is `glob('**/' + p)`, which is also why it needs no
+                    // `recursive` flag of its own: the recursion is in the pattern.
+                    var expression = name == "rglob" ? "**/" + pattern : pattern;
+
+                    var hidden = keywords?.TryGetValue(new PyStr("include_hidden"), out var flag) == true
+                        && flag.IsTruthy();
+
+                    return new PyList([
+                        .. Globbing.Expand(Storage(), Value, expression, recursive: true, includeHidden: hidden, MaxDepth)
+                            .Select(match => (PyObject)new PyPath(Join(Value, match), _fileSystem, MaxDepth))]);
+                });
+
+            case "match" or "full_match":
+                return Builtin(name, arguments =>
+                {
+                    var pattern = Text(arguments[0]);
+
+                    // `match` anchors at the right — `Path('a/b/c.py').match('*.py')` is
+                    // true — while `full_match` has to account for the whole path.
+                    if (name == "full_match")
+                    {
+                        return PyBool.Of(FullMatch(Value, pattern));
+                    }
+
+                    if (pattern.StartsWith('/'))
+                    {
+                        return PyBool.Of(FullMatch(Value, pattern));
+                    }
+
+                    var parts = pattern.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                    var mine = Value.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length > mine.Length)
+                    {
+                        return PyBool.False;
+                    }
+
+                    var offset = mine.Length - parts.Length;
+
+                    return PyBool.Of(parts
+                        .Select((part, index) => Globbing.Matches(mine[offset + index], part, segment: true))
+                        .All(static matched => matched));
+                });
+
+            case "walk":
+                return new PyBuiltinFunction(name, (arguments, keywords) =>
+                {
+                    var topDown = arguments.Length > 0 ? arguments[0].IsTruthy()
+                        : keywords?.TryGetValue(new PyStr("top_down"), out var flag) != true || flag!.IsTruthy();
+
+                    var depth = keywords?.TryGetValue(new PyStr("max_depth"), out var bound) == true
+                        && bound is not PyNone
+                            ? bound is PyInt { Value: var levels } && levels >= 0
+                                ? (int)levels
+                                : throw new PyRaise(PyErrors.ValueError("max_depth must not be negative"))
+                            : (int?)null;
+
+                    // The same traversal `os.walk` performs, differing only in that the
+                    // directory comes back as a Path. Sharing it is what keeps the two
+                    // orderings — and the pruning — from drifting apart.
+                    return new PyIterator(
+                        OsModule.Walk(Storage(), Value, topDown, onError: null, machine: null, depth, MaxDepth)
+                            .Select(triple => (PyObject)new PyTuple([
+                                new PyPath(((PyTuple)triple).Items[0].Display(), _fileSystem, MaxDepth),
+                                ((PyTuple)triple).Items[1],
+                                ((PyTuple)triple).Items[2]])),
+                        "generator");
                 });
 
             case "resolve" or "absolute":
                 return Builtin(name, _ => new PyPath(
                     Value.StartsWith('/') ? Value : Join(Storage().WorkingDirectory, Value),
-                    _fileSystem));
+                    _fileSystem,
+                    MaxDepth));
 
             default:
                 return null;
+        }
+    }
+
+    /// <summary>Whether a whole path matches a pattern, segment by segment.</summary>
+    private static bool FullMatch(string value, string pattern)
+    {
+        var parts = pattern.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var mine = value.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        // An absolute pattern only matches an absolute path.
+        if (pattern.StartsWith('/') != value.StartsWith('/'))
+        {
+            return false;
+        }
+
+        return Segments(mine, 0, parts, 0);
+    }
+
+    /// <summary>Matches path segments against pattern segments, letting <c>**</c> span any number.</summary>
+    private static bool Segments(string[] path, int pathIndex, string[] pattern, int patternIndex)
+    {
+        while (true)
+        {
+            if (patternIndex == pattern.Length)
+            {
+                return pathIndex == path.Length;
+            }
+
+            if (pattern[patternIndex] == "**")
+            {
+                // Try every split point: `**` may stand for no segments at all.
+                for (var skip = pathIndex; skip <= path.Length; skip++)
+                {
+                    if (Segments(path, skip, pattern, patternIndex + 1))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            if (pathIndex == path.Length || !Globbing.Matches(path[pathIndex], pattern[patternIndex], segment: true))
+            {
+                return false;
+            }
+
+            pathIndex++;
+            patternIndex++;
         }
     }
 
@@ -443,7 +585,9 @@ public sealed class PyPath : PyObject
 public static class PathlibModule
 {
     /// <summary>Builds the module over <paramref name="fileSystem"/>, which may be absent.</summary>
-    public static PyModuleObject Create(IPyFileSystem? fileSystem)
+    /// <param name="fileSystem">The storage a path's I/O methods use.</param>
+    /// <param name="maxDepth">How deep <c>glob</c> and <c>walk</c> may descend.</param>
+    public static PyModuleObject Create(IPyFileSystem? fileSystem, int maxDepth = PyPath.DefaultMaxDepth)
     {
         var module = new PyModuleObject("pathlib");
 
@@ -452,7 +596,7 @@ public static class PathlibModule
         var path = new PyType(
             "pathlib.PosixPath",
             static value => value is PyPath,
-            (arguments, _) => Construct(arguments, fileSystem));
+            (arguments, _) => Construct(arguments, fileSystem, maxDepth));
 
         // Registering it makes `type(p)` resolve to the same object the module exposes.
         TypeRegistry.All["PosixPath"] = path;
@@ -465,7 +609,13 @@ public static class PathlibModule
     }
 
     /// <summary>Builds a path from the constructor's segments.</summary>
-    public static PyObject Construct(PyObject[] arguments, IPyFileSystem? fileSystem)
+    /// <param name="arguments">The segments, joined left to right.</param>
+    /// <param name="fileSystem">The storage the result's I/O methods use.</param>
+    /// <param name="maxDepth">How deep the result's traversals may descend.</param>
+    public static PyObject Construct(
+        PyObject[] arguments,
+        IPyFileSystem? fileSystem,
+        int maxDepth = PyPath.DefaultMaxDepth)
     {
         var value = ".";
 
@@ -483,7 +633,7 @@ public static class PathlibModule
             value = value == "." ? PyPath.Normalize(text) : PyPath.Join(value, text);
         }
 
-        return new PyPath(value, fileSystem);
+        return new PyPath(value, fileSystem, maxDepth);
     }
 }
 

@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Computerwelt.AgentTests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Computerwelt/Computerwelt.csproj" />
+  </ItemGroup>
+
+  <!--
+    The corpus under spec/ is data the runner locates on disk rather than an embedded
+    resource, so a failing case stays editable without a rebuild — the same arrangement the
+    two conformance suites use.
+  -->
+  <ItemGroup>
+    <Compile Include="../Computerwelt.Emulation.Bash.SpecTests/SpecCase.cs" Link="Spec/SpecCase.cs" />
+    <Compile Include="../Computerwelt.Emulation.Bash.SpecTests/SpecFileParser.cs" Link="Spec/SpecFileParser.cs" />
+  </ItemGroup>
+
+</Project>

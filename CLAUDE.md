@@ -27,11 +27,17 @@ Bashkit's value is its security posture. The port must preserve all of it:
 1. **No process spawning.** Never `Process.Start`, never `fork`/`exec`. Every command is a
    managed implementation. A "builtin" that shells out is a bug, not a shortcut.
 2. **No ambient filesystem access.** All file I/O goes through `IFileSystem`. Never call
-   `System.IO.File` / `Directory` outside the `RealFileSystem` backend.
+   `System.IO.File` / `Directory` outside the `RealFileSystem` backend. A failure crossing
+   into Python is translated at the boundary: a `ShellException` reaching a sandboxed
+   program is a host exception leaving the sandbox, not an error the program can catch.
 3. **No ambient network access.** HTTP is denied unless an allowlist is configured.
 4. **Deterministic resource limits.** Command count, loop iterations, function depth,
-   output size, filesystem size, parser fuel, wall-clock timeout. Limits are enforced, not
-   advisory.
+   output size, filesystem size, directory depth, parser fuel, wall-clock timeout. Limits
+   are enforced, not advisory — and never silently: a cap that is reached raises, because
+   a traversal that quietly stopped part-way reports a subset as though it were the whole.
+   Depth is capped where paths are *created* (`FsLimits.MaxDepth`) as well as where they
+   are *walked* (`ExecutionLimits.MaxDirectoryDepth`); the first is the containment, the
+   second is the backstop for a host-supplied filesystem this sandbox did not build.
 5. **Multi-tenant isolation.** Two `Bash` instances share no mutable state.
 6. **POSIX path semantics everywhere.** Virtual paths are POSIX even when the host is
    Windows. This is why `VPath` exists and why `System.IO.Path` must not be used for
@@ -128,8 +134,10 @@ tests/
   Computerwelt.Emulation.Python.Tests/      python unit tests
   Computerwelt.Emulation.Python.SpecTests/  python conformance over `tests/monty-spec/*.py`
   Computerwelt.Tests/                       integration: both interpreters over one filesystem
+  Computerwelt.AgentTests/                  the operations a caller performs, end to end
   spec/                                     shell acceptance corpus (from bashkit)
   monty-spec/                               python acceptance corpus (from monty)
+  monty-extensions/                         fixtures for what this port adds beyond monty
 .reference/bashkit/          vendored bashkit source (read-only)
 .reference/monty/            vendored monty source (read-only)
 ```
@@ -179,11 +187,38 @@ does not pass.
 
 `Computerwelt.Emulation.Python.SpecTests` will run these under the same ratchet discipline.
 
+### Python extensions — `tests/monty-extensions/`
+
+Same fixture format, opposite purpose: every file here exercises something upstream Monty
+does **not** have, so running one against upstream fails — usually at the import. Keeping
+them in their own folder is what lets a reader tell a port decision from a specification,
+and `COMPUTERWELT_SKIP_EXTENSIONS=1` switches the folder off so you can check the port
+still stands on upstream's corpus alone. The suite is absolute, not ratcheted.
+
+Nothing here may contradict `tests/monty-spec/`. Where the two would disagree, upstream
+wins and the behaviour is recorded as a limitation in `todo.md` instead.
+
 ```bash
 dotnet test                                   # everything
 dotnet test tests/Computerwelt.Emulation.Bash.SpecTests           # shell conformance only
 dotnet test tests/Computerwelt.Emulation.Python.SpecTests             # python conformance only
 ```
+
+### Joined — `tests/Computerwelt.AgentTests/`
+
+A third suite, and the one that catches what the other two structurally cannot. Both
+corpora test features; this tests *operations* — the shapes a caller actually types, taken
+from real sessions rather than invented: read a file, search a tree, patch a source file
+with a heredoc Python program, check the result, keep going. Composing correct builtins is
+where the interesting failures live, and every defect it has found so far was in code both
+corpora already covered.
+
+It also carries upstream's `python` command corpus (`spec/python.test.sh`), which the
+shell suite cannot run — that command exists only once both halves are joined. Unlike the
+two ratcheted suites it is absolute: every case must pass.
+
+When adding to it, keep the discipline: an operation goes in because someone performed it,
+not because it would round out a matrix.
 
 ## Working rules
 
