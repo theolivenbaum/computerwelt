@@ -1,0 +1,96 @@
+# Builds Computerwelt and publishes every package in it to NuGet.
+#
+# This is the only thing that publishes, and it is the only build definition in the
+# repository: a push to main packs and pushes, and nothing else releases anything.
+#
+# The version is CalVer, computed here rather than committed: yy.M.<build id>, the same
+# scheme every other package from this organisation uses. Nothing in the repository carries
+# a release version - a local build gets the SDK's default and the /p:Version below
+# overrides it.
+
+variables:
+  solution: 'Computerwelt.slnx'
+  buildConfiguration: 'Release'
+  targetVersion: yy.M.$(build.buildId)
+
+trigger:
+- main
+
+# Linux: nothing in the port is platform-specific - VPath is POSIX by construction and the
+# sandbox spawns no process - so the cheapest agent is the right one. RealFileSystem is the
+# one backend that touches the host, and its tests run against a temp directory either way.
+pool:
+  vmImage: 'ubuntu-22.04'
+
+steps:
+- task: Bash@3
+  displayName: 'Create CalVer Version'
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -euo pipefail
+      dottedDate=$(date +%y.%-m)
+      modBuildID=$(( BUILD_BUILDID % 65536 ))   # ensure fits in int16
+      newTargetVersion="$dottedDate.$modBuildID"
+      echo "##vso[task.setvariable variable=targetVersion;]$newTargetVersion"
+      echo "Updated targetVersion to '$newTargetVersion'"
+
+# There is no global.json to read from: the repository targets net10.0 in
+# Directory.Build.props and nothing pins an SDK band below that.
+- task: UseDotNet@2
+  displayName: 'Use the .NET 10 SDK'
+  inputs:
+    packageType: sdk
+    version: '10.0.x'
+
+- task: DotNetCoreCLI@2
+  displayName: 'restore nuget'
+  inputs:
+    command: 'restore'
+    projects: '$(solution)'
+
+- task: DotNetCoreCLI@2
+  displayName: 'build'
+  inputs:
+    command: 'build'
+    projects: '$(solution)'
+    arguments: '-c $(buildConfiguration) --no-restore /p:Version=$(targetVersion)'
+
+# Everything, including both ratcheted conformance suites and the agent-operation suite.
+# The ratchets are the release gate they were built to be: tests/spec/baseline.json fails
+# the run if any spec file regresses, and Computerwelt.AgentTests is absolute. A package
+# published without them is one nobody can un-publish.
+- task: DotNetCoreCLI@2
+  displayName: 'test'
+  inputs:
+    command: 'test'
+    projects: '$(solution)'
+    arguments: '-c $(buildConfiguration) --no-build'
+    publishTestResults: true
+
+# Packs the solution: the three library projects pack, the two CLIs and the six test
+# projects opt out with IsPackable.
+- task: DotNetCoreCLI@2
+  displayName: 'pack'
+  inputs:
+    command: 'pack'
+    packagesToPack: '$(solution)'
+    versioningScheme: 'off'
+    configuration: '$(buildConfiguration)'
+    buildProperties: 'Version="$(targetVersion)"'
+    nobuild: true
+    packDirectory: '$(Build.ArtifactStagingDirectory)'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'publish the packages as build artifacts'
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'packages'
+
+- task: NuGetCommand@2
+  displayName: 'push nuget'
+  inputs:
+    command: 'push'
+    packagesToPush: '$(Build.ArtifactStagingDirectory)/*.nupkg'
+    nuGetFeedType: 'external'
+    publishFeedCredentials: 'nuget-curiosity-org'

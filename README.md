@@ -114,6 +114,11 @@ corpus alone:
 COMPUTERWELT_SKIP_EXTENSIONS=1 dotnet test
 ```
 
+Publishing is `.devops/build-nuget.yml`, an Azure DevOps pipeline on a push to `main`, and
+it is the only thing that pushes packages. It runs the whole suite before it packs, and the
+version is CalVer computed in the pipeline (`yy.M.<build id>`), so no release version is
+committed anywhere in the repository.
+
 ## Status
 
 | | conformance | notes |
