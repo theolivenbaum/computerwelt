@@ -60,6 +60,7 @@ public sealed class PythonBuiltin : IBuiltin
         {
             MaxInstructions = _options.MaxInstructions,
             MaxRecursionDepth = _options.MaxRecursionDepth,
+            MaxDirectoryDepth = _options.MaxDirectoryDepth,
         });
 
         // The filesystem modules close over the shell's state, so `os.getcwd()` follows a
@@ -211,6 +212,17 @@ public sealed record PythonOptions
 
     /// <summary>Maximum Python call depth.</summary>
     public int MaxRecursionDepth { get; init; } = 200;
+
+    /// <summary>
+    /// Maximum path depth a tree walk will descend to.
+    /// </summary>
+    /// <remarks>
+    /// The default matches <c>FsLimits.MaxDepth</c>, which is what the shell's filesystem
+    /// will let a script <i>create</i> — so over that filesystem this can never be reached
+    /// and costs nothing. Raise the two together, or a walk will refuse to enter a
+    /// directory the shell was allowed to make.
+    /// </remarks>
+    public int MaxDirectoryDepth { get; init; } = 64;
 
     /// <summary>Extra modules the host makes importable from Python.</summary>
     public Dictionary<string, PyObject> AdditionalModules { get; init; } = new(StringComparer.Ordinal);

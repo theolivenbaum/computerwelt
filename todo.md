@@ -26,11 +26,11 @@ builtins, the stdlib subset, dunder dispatch and the external-function boundary 
 place. **557 / 558 fixtures passing (99.8 %)**, with 40 unit tests covering what the
 corpus does not reach. No host exception escapes to a script.
 
-**Current state — joined:** 12 integration tests over one filesystem, and 207 green in
-`tests/Computerwelt.AgentTests/` — 150 covering the shell and Python operations a caller
+**Current state — joined:** 12 integration tests over one filesystem, and 210 green in
+`tests/Computerwelt.AgentTests/` — 153 covering the shell and Python operations a caller
 actually performs, plus upstream's 57 `python` command cases.
 
-**Extensions:** 10 fixtures in `tests/monty-extensions/` cover behaviour upstream does not
+**Extensions:** 11 fixtures in `tests/monty-extensions/` cover behaviour upstream does not
 have. They are kept apart from upstream's corpus deliberately — see below.
 
 The one remaining fixture is a documented divergence, not a gap — see below.
@@ -50,7 +50,7 @@ The two conformance corpora prove each builtin is individually right. They say m
 about the handful of shapes a caller actually types: read a file, search a tree, patch a
 source file with a short Python program, check the result. That suite was written by
 replaying a real working session against this repository and turning each operation into a
-test — 138 of them, plus upstream's 57-case `python` command corpus, which had never been
+test — 153 of them, plus upstream's 57-case `python` command corpus, which had never been
 ported because the command it exercises only exists once both halves are joined.
 
 Replaying found five defects the corpora between them did not:
@@ -81,6 +81,7 @@ off, which is the check that the port still stands on upstream's corpus alone.
 | `os.path` | `relpath`, `commonpath`, `commonprefix`, `realpath`, `normcase`, `lexists`, `getmtime`, `expanduser`; `normpath` now collapses `..` | `os__path_extended.py` |
 | `import os.path` | `os.path` and `posixpath` are importable names for the object `os.path` already was; `import a.b` binds `a`, as CPython does | `os__path_extended.py` |
 | `Path.glob` / `rglob` / `match` / `full_match` / `walk` | upstream's `Path` had `iterdir` and nothing more | `pathlib__glob.py` |
+| `os.walk(..., max_depth=N)` | not CPython's either — a bound the caller asks for, which ends the walk cleanly | `os__walk_depth.py` |
 | `io` | `io.open`, `StringIO`, `BytesIO`, `UnsupportedOperation` | `io__module.py` |
 | `sys.argv`, `sys.exit`, `input`, `sys.stdin` | the host-facing four from the previous round | `sys__*.py` |
 
@@ -89,6 +90,27 @@ what a pattern means and differ only in what they match it against. `os.walk` is
 and lazy: iterative because recursion would spend the *host's* stack on the depth of a tree
 the program chose, and lazy because pruning only works if the descent happens after the
 caller's turn.
+
+### Depth is bounded twice, for two different reasons
+
+| | What it is | What happens at it |
+|---|---|---|
+| `FsLimits.MaxDepth` (64) | the shell filesystem's cap on the path it will **create** | `mkdir` refuses — the tree simply cannot get deeper |
+| `ExecutionLimits.MaxDirectoryDepth` (64) | how deep a **traversal** will descend | raises `OSError`, because a walk that quietly stopped part-way would report a subset of the tree as though it were all of it |
+| `os.walk(..., max_depth=N)` | the **caller's** own bound, relative to `top` | ends the walk cleanly — this is someone asking for less, not a limit being hit |
+
+The first is the real containment: nothing can walk depth that cannot exist. It now covers
+the whole path rather than just directories — a file sits one level below the directory
+holding it, so capping directories alone left the deepest thing in the tree one past the
+limit. The second matters only for a host that supplies its own `IPyFileSystem` over
+storage this sandbox did not build, where a tree can be arbitrarily deep or, through a link
+to its own ancestor, bottomless. `DepthLimitTests` walks exactly that filesystem.
+
+Making the traversal cap useful turned up a related hole: `ShellFileSystem` translated only
+some failures into Python exceptions, so `os.makedirs` past the depth limit threw a
+`FileSystemException` straight out of `ExecAsync` — a host exception leaving the sandbox
+rather than an error the program could catch. Every call now goes through one guarded
+chokepoint that maps `FileSystemErrorKind` onto the matching Python exception.
 
 Recorded, not fixed, because upstream defines the surface and this port follows it:
 

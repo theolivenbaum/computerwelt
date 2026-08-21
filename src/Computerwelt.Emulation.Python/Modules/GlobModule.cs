@@ -19,12 +19,14 @@ namespace Computerwelt.Emulation.Python.Modules;
 public static class GlobModule
 {
     /// <summary>Builds the module over <paramref name="fileSystem"/>.</summary>
-    public static PyModuleObject Create(IPyFileSystem fileSystem)
+    /// <param name="fileSystem">The storage patterns are matched against.</param>
+    /// <param name="maxDepth">How deep a <c>**</c> may reach before the walk refuses to go on.</param>
+    public static PyModuleObject Create(IPyFileSystem fileSystem, int maxDepth = Globbing.DefaultMaxDepth)
     {
         var module = new PyModuleObject("glob");
 
-        module.Add("glob", Expand("glob", fileSystem));
-        module.Add("iglob", Expand("iglob", fileSystem));
+        module.Add("glob", Expand("glob", fileSystem, maxDepth));
+        module.Add("iglob", Expand("iglob", fileSystem, maxDepth));
 
         module.Add("escape", new PyBuiltinFunction("escape", arguments =>
         {
@@ -41,7 +43,7 @@ public static class GlobModule
         return module;
     }
 
-    private static PyBuiltinFunction Expand(string name, IPyFileSystem fileSystem) =>
+    private static PyBuiltinFunction Expand(string name, IPyFileSystem fileSystem, int maxDepth) =>
         new(name, (arguments, keywords) =>
         {
             if (arguments.Length is 0 or > 2)
@@ -94,7 +96,7 @@ public static class GlobModule
             }
 
             return new PyList([
-                .. Globbing.Expand(fileSystem, root, pattern, recursive, includeHidden)
+                .. Globbing.Expand(fileSystem, root, pattern, recursive, includeHidden, maxDepth)
                     .Select(static path => (PyObject)new PyStr(path))]);
         });
 

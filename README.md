@@ -120,8 +120,8 @@ COMPUTERWELT_SKIP_EXTENSIONS=1 dotnet test
 |---|---|---|
 | shell | **2,521 / 2,521** | 73 commands implemented; 27 cases skipped by upstream directive |
 | python | **557 / 558** | parser, bytecode compiler, VM, types, builtins, the stdlib subset, dunders |
-| joined | **207 / 207** | 150 agent-operation tests plus upstream's 57 `python` command cases |
-| extensions | **10 / 10** | fixtures for what this port adds beyond monty |
+| joined | **210 / 210** | 153 agent-operation tests plus upstream's 57 `python` command cases |
+| extensions | **11 / 11** | fixtures for what this port adds beyond monty |
 
 The one Python fixture that does not pass asserts that a temporary's `id()` is handed to
 the next object of the same shape — an artifact of upstream's slot-recycling heap. Object

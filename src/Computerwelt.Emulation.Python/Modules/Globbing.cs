@@ -32,6 +32,9 @@ public static class Globbing
 
     private const int CacheLimit = 256;
 
+    /// <summary>The depth cap used when no host set one — the shell filesystem's own.</summary>
+    public const int DefaultMaxDepth = 64;
+
     /// <summary>Whether <paramref name="text"/> matches <paramref name="pattern"/>.</summary>
     /// <param name="text">The string to test.</param>
     /// <param name="pattern">The shell-style pattern.</param>
@@ -155,13 +158,19 @@ public static class Globbing
     /// <param name="pattern">The pattern, which may contain <c>/</c> and <c>**</c>.</param>
     /// <param name="recursive">Whether <c>**</c> spans directories rather than acting as <c>*</c>.</param>
     /// <param name="includeHidden">Whether a wildcard may match a name beginning with a dot.</param>
+    /// <param name="maxDepth">
+    /// How many path components deep a <c>**</c> may reach before the walk refuses to go
+    /// further. Reaching it raises rather than truncating, because a glob that quietly
+    /// stopped part-way would report a subset of the tree as though it were all of it.
+    /// </param>
     /// <returns>Matching paths, sorted, directories marked by a trailing separator when the pattern ends in one.</returns>
     public static List<string> Expand(
         IPyFileSystem fileSystem,
         string root,
         string pattern,
         bool recursive,
-        bool includeHidden)
+        bool includeHidden,
+        int maxDepth = DefaultMaxDepth)
     {
         if (pattern.Length == 0)
         {
@@ -184,7 +193,7 @@ public static class Globbing
         var start = absolute ? "/" : root;
         var matches = new List<string>();
 
-        Descend(fileSystem, start, segments, 0, recursive, includeHidden, matches);
+        Descend(fileSystem, start, segments, 0, recursive, includeHidden, maxDepth, matches);
 
         var results = matches
             .Where(path => !directoriesOnly || fileSystem.IsDirectory(path))
@@ -218,6 +227,7 @@ public static class Globbing
         int index,
         bool recursive,
         bool includeHidden,
+        int maxDepth,
         List<string> matches)
     {
         if (index == segments.Length)
@@ -233,9 +243,9 @@ public static class Globbing
         // `**/*.py` finds a file in the search root itself.
         if (recursive && segment == "**")
         {
-            foreach (var candidate in SelfAndDescendants(fileSystem, directory, includeHidden))
+            foreach (var candidate in SelfAndDescendants(fileSystem, directory, includeHidden, maxDepth))
             {
-                Descend(fileSystem, candidate, segments, index + 1, recursive, includeHidden, matches);
+                Descend(fileSystem, candidate, segments, index + 1, recursive, includeHidden, maxDepth, matches);
             }
 
             return;
@@ -249,7 +259,7 @@ public static class Globbing
 
             if (fileSystem.Exists(literal))
             {
-                Descend(fileSystem, literal, segments, index + 1, recursive, includeHidden, matches);
+                Descend(fileSystem, literal, segments, index + 1, recursive, includeHidden, maxDepth, matches);
             }
 
             return;
@@ -274,7 +284,7 @@ public static class Globbing
 
             if (expression.IsMatch(name))
             {
-                Descend(fileSystem, Join(directory, name), segments, index + 1, recursive, includeHidden, matches);
+                Descend(fileSystem, Join(directory, name), segments, index + 1, recursive, includeHidden, maxDepth, matches);
             }
         }
     }
@@ -288,7 +298,8 @@ public static class Globbing
     private static IEnumerable<string> SelfAndDescendants(
         IPyFileSystem fileSystem,
         string directory,
-        bool includeHidden)
+        bool includeHidden,
+        int maxDepth)
     {
         var pending = new Queue<string>([directory]);
 
@@ -301,6 +312,10 @@ public static class Globbing
             {
                 continue;
             }
+
+            // Checked before listing, so the error names the directory that was about to
+            // be descended into rather than one of its children.
+            EnsureDepth(current, maxDepth);
 
             foreach (var name in Listing(fileSystem, current))
             {
@@ -318,6 +333,29 @@ public static class Globbing
             }
         }
     }
+
+    /// <summary>
+    /// Refuses to descend below the depth cap.
+    /// </summary>
+    /// <remarks>
+    /// Over the shell's own filesystem this can never fire — that filesystem will not
+    /// create a path this deep in the first place. It is here for a host that supplies
+    /// storage this sandbox did not build, where a tree can be arbitrarily deep or, with
+    /// links, unbounded, and an unguarded <c>**</c> would never finish.
+    /// </remarks>
+    internal static void EnsureDepth(string path, int maxDepth)
+    {
+        if (Depth(path) >= maxDepth)
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.OSError,
+                $"[Errno 40] Too many levels of directories: '{path}' exceeds the depth limit of {maxDepth}"));
+        }
+    }
+
+    /// <summary>How many components a path has.</summary>
+    internal static int Depth(string path) =>
+        path.Split('/', StringSplitOptions.RemoveEmptyEntries).Length;
 
     /// <summary>Lists a directory in a stable order, treating an unreadable one as empty.</summary>
     /// <remarks>

@@ -32,7 +32,12 @@ public static class StandardLibrary
         PyMemoryStream? standardInput = null)
     {
         var modules = Core(machine, timeProvider, arguments, standardInput);
-        modules["pathlib"] = PathlibModule.Create(fileSystem);
+
+        // One cap, read from the run's limits, shared by everything that walks a tree —
+        // so `glob`, `os.walk` and `Path.walk` cannot disagree about how deep is too deep.
+        var maxDepth = machine.Limits.MaxDirectoryDepth;
+
+        modules["pathlib"] = PathlibModule.Create(fileSystem, maxDepth);
         modules["io"] = IoModule.Create(fileSystem);
 
         // Pattern matching over plain strings needs nothing from the host, so it is here
@@ -44,7 +49,7 @@ public static class StandardLibrary
         {
             var os = OsModule.Create(fileSystem, machine);
             modules["os"] = os;
-            modules["glob"] = GlobModule.Create(fileSystem);
+            modules["glob"] = GlobModule.Create(fileSystem, maxDepth);
 
             // `import os.path` and `import posixpath` are two more names for the object
             // `os.path` already is — one module, three ways to reach it, as CPython has it

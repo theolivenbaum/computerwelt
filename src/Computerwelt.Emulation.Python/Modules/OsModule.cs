@@ -229,7 +229,7 @@ public static class OsModule
         {
             var given = Clinic(
                 "walk",
-                ["top", "topdown", "onerror", "followlinks"],
+                ["top", "topdown", "onerror", "followlinks", "max_depth"],
                 arguments,
                 keywords,
                 maxPositional: 4,
@@ -244,7 +244,9 @@ public static class OsModule
             // symbolic links, so a walk cannot loop through one.
             _ = given[3];
 
-            return new PyIterator(Walk(fileSystem, top, topDown, onError, machine), "generator");
+            return new PyIterator(
+                Walk(fileSystem, top, topDown, onError, machine, Depth(given[4]), DepthCap(machine)),
+                "generator");
         }));
 
         module.Add("scandir", new PyBuiltinFunction("scandir", (arguments, keywords) =>
@@ -287,13 +289,29 @@ public static class OsModule
     /// <param name="topDown">True to report a directory before its children.</param>
     /// <param name="onError">A callable handed the <c>OSError</c> from an unreadable directory.</param>
     /// <param name="machine">The machine <paramref name="onError"/> is called through.</param>
+    /// <param name="maxDepth">
+    /// How many levels below <paramref name="top"/> to descend, or null for no bound of the
+    /// caller's own. Unlike <paramref name="depthCap"/> this <i>stops</i> rather than
+    /// raising: it is the caller asking for less, not a limit being hit.
+    /// </param>
+    /// <param name="depthCap">
+    /// The sandbox's own cap on absolute path depth. Reaching it raises, because a walk
+    /// that quietly stopped part-way would report a subset of the tree as though it were
+    /// all of it.
+    /// </param>
     internal static IEnumerable<PyObject> Walk(
         IPyFileSystem fileSystem,
         string top,
         bool topDown,
         PyObject? onError,
-        VirtualMachine? machine)
+        VirtualMachine? machine,
+        int? maxDepth = null,
+        int depthCap = Globbing.DefaultMaxDepth)
     {
+        // Depth is counted from `top`, so `max_depth=1` means "this directory and the ones
+        // directly under it" whatever the absolute depth of the starting point.
+        var origin = Globbing.Depth(top);
+
         if (topDown)
         {
             var pending = new List<string> { top };
@@ -312,6 +330,13 @@ public static class OsModule
 
                 yield return new PyTuple([new PyStr(directory), directories, files!]);
 
+                if (maxDepth is { } limit && Globbing.Depth(directory) - origin >= limit)
+                {
+                    continue;
+                }
+
+                Globbing.EnsureDepth(directory, depthCap);
+
                 // Read back from the very list object the caller was given, after its turn
                 // — anything it removed is never descended into.
                 pending.InsertRange(0, directories.Items.Select(name => PyPath.Join(directory, name.Display())));
@@ -320,11 +345,25 @@ public static class OsModule
             yield break;
         }
 
-        foreach (var triple in BottomUp(fileSystem, top, onError, machine))
+        foreach (var triple in BottomUp(fileSystem, top, onError, machine, maxDepth, depthCap, origin))
         {
             yield return triple;
         }
     }
+
+    /// <summary>Reads the <c>max_depth</c> argument, which must be a non-negative integer.</summary>
+    private static int? Depth(PyObject? value) => value switch
+    {
+        null or PyNone => null,
+        PyInt { Value: var depth } when depth >= 0 => (int)depth,
+        PyInt => throw new PyRaise(PyErrors.ValueError("max_depth must not be negative")),
+        _ => throw new PyRaise(PyErrors.TypeError(
+            $"'{value.TypeName}' object cannot be interpreted as an integer")),
+    };
+
+    /// <summary>The sandbox's depth cap, from the machine's limits when there is one.</summary>
+    private static int DepthCap(VirtualMachine? machine) =>
+        machine?.Limits.MaxDirectoryDepth ?? Globbing.DefaultMaxDepth;
 
     /// <summary>Walks a subtree children-first.</summary>
     /// <remarks>
@@ -336,7 +375,10 @@ public static class OsModule
         IPyFileSystem fileSystem,
         string directory,
         PyObject? onError,
-        VirtualMachine? machine)
+        VirtualMachine? machine,
+        int? maxDepth,
+        int depthCap,
+        int origin)
     {
         var (directories, files) = Split(fileSystem, directory, onError, machine);
 
@@ -345,11 +387,21 @@ public static class OsModule
             yield break;
         }
 
-        foreach (var name in directories.Items.ToList())
+        // Bottom-up cannot be pruned by editing the list — the children are already
+        // visited by the time the parent is reported — so both bounds are checked before
+        // the recursion rather than after the yield.
+        if (maxDepth is not { } limit || Globbing.Depth(directory) - origin < limit)
         {
-            foreach (var triple in BottomUp(fileSystem, PyPath.Join(directory, name.Display()), onError, machine))
+            Globbing.EnsureDepth(directory, depthCap);
+
+            foreach (var name in directories.Items.ToList())
             {
-                yield return triple;
+                var child = PyPath.Join(directory, name.Display());
+
+                foreach (var triple in BottomUp(fileSystem, child, onError, machine, maxDepth, depthCap, origin))
+                {
+                    yield return triple;
+                }
             }
         }
 

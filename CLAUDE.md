@@ -27,11 +27,17 @@ Bashkit's value is its security posture. The port must preserve all of it:
 1. **No process spawning.** Never `Process.Start`, never `fork`/`exec`. Every command is a
    managed implementation. A "builtin" that shells out is a bug, not a shortcut.
 2. **No ambient filesystem access.** All file I/O goes through `IFileSystem`. Never call
-   `System.IO.File` / `Directory` outside the `RealFileSystem` backend.
+   `System.IO.File` / `Directory` outside the `RealFileSystem` backend. A failure crossing
+   into Python is translated at the boundary: a `ShellException` reaching a sandboxed
+   program is a host exception leaving the sandbox, not an error the program can catch.
 3. **No ambient network access.** HTTP is denied unless an allowlist is configured.
 4. **Deterministic resource limits.** Command count, loop iterations, function depth,
-   output size, filesystem size, parser fuel, wall-clock timeout. Limits are enforced, not
-   advisory.
+   output size, filesystem size, directory depth, parser fuel, wall-clock timeout. Limits
+   are enforced, not advisory — and never silently: a cap that is reached raises, because
+   a traversal that quietly stopped part-way reports a subset as though it were the whole.
+   Depth is capped where paths are *created* (`FsLimits.MaxDepth`) as well as where they
+   are *walked* (`ExecutionLimits.MaxDirectoryDepth`); the first is the containment, the
+   second is the backstop for a host-supplied filesystem this sandbox did not build.
 5. **Multi-tenant isolation.** Two `Bash` instances share no mutable state.
 6. **POSIX path semantics everywhere.** Virtual paths are POSIX even when the host is
    Windows. This is why `VPath` exists and why `System.IO.Path` must not be used for

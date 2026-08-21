@@ -152,6 +152,60 @@ public sealed class SandboxBoundaryTests
     }
 
     [Fact]
+    public async Task A_tree_cannot_be_nested_without_bound()
+    {
+        var session = await AgentSession.NewAsync();
+
+        var output = await session.OutAsync("""
+            mkdir -p /work/$(seq -s/ 1 70) 2>/dev/null || echo refused
+            mkdir -p /work/$(seq -s/ 1 60) && echo allowed
+            """);
+
+        // Depth is capped where things are made, not where they are read. That is what
+        // lets everything walking this filesystem — `find`, a glob, Python's `os.walk` —
+        // count on a bottom rather than hope for one.
+        Assert.Equal("refused\nallowed\n", output);
+    }
+
+    [Fact]
+    public async Task Python_cannot_nest_deeper_than_the_shell_can()
+    {
+        var session = await AgentSession.NewAsync();
+
+        var result = await session.RunAsync(
+            "python3 -c \"import os; os.makedirs('/work/' + '/'.join(str(i) for i in range(70)))\"");
+
+        // The refusal arrives as an ordinary OSError a script can catch. It used to be a
+        // host exception that came straight out of the whole `ExecAsync` call.
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("OSError", result.Stderr.ToString(), StringComparison.Ordinal);
+        Assert.Contains("too deep", result.Stderr.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_filesystem_refusal_reaches_python_as_a_catchable_error()
+    {
+        var session = await AgentSession.NewAsync();
+
+        var output = await session.OutAsync("""
+            python3 - <<'PY'
+            import os
+            for attempt in ('/work/' + '/'.join(str(i) for i in range(70)), '/work/README.md/nested'):
+                try:
+                    os.makedirs(attempt)
+                    print('made', attempt)
+                except OSError as e:
+                    print(type(e).__name__)
+            PY
+            """);
+
+        // Every failure crossing the shell-to-Python boundary is translated. Nothing may
+        // arrive as a .NET exception, which would leave the sandbox rather than be handled
+        // inside it.
+        Assert.Equal("OSError\nNotADirectoryError\n", output);
+    }
+
+    [Fact]
     public async Task A_runaway_python_loop_is_stopped_too()
     {
         var session = await AgentSession.NewAsync();

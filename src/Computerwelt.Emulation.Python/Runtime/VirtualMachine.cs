@@ -1779,4 +1779,22 @@ public sealed record ExecutionLimits
 
     /// <summary>Maximum characters written to stdout and stderr. Default 10 MB.</summary>
     public int MaxOutputCharacters { get; init; } = 10_000_000;
+
+    /// <summary>
+    /// Maximum path depth a tree walk will descend to. Default 64.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately the same default as the shell filesystem's own <c>MaxDepth</c>, which
+    /// refuses to <i>create</i> a path deeper than this — so over that filesystem the cap
+    /// can never be reached and costs nothing. It matters for a host that supplies its own
+    /// <see cref="IPyFileSystem"/> over storage this sandbox did not build, where a tree can
+    /// be arbitrarily deep or, with links, unbounded.
+    /// </para>
+    /// <para>
+    /// Reaching it raises rather than truncating: a walk that quietly stopped part-way
+    /// would report a subset of the tree as though it were all of it.
+    /// </para>
+    /// </remarks>
+    public int MaxDirectoryDepth { get; init; } = 64;
 }

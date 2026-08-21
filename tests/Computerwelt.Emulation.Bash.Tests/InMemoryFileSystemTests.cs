@@ -138,6 +138,55 @@ public sealed class InMemoryFileSystemTests
     }
 
     [Fact]
+    public async Task Enforces_the_nesting_depth_limit_on_directories()
+    {
+        var fs = new InMemoryFileSystem(new FsLimits { MaxDepth = 3 });
+        await fs.CreateDirectoryAsync("/a/b/c", recursive: true);
+
+        var error = await Assert.ThrowsAsync<FileSystemException>(
+            async () => await fs.CreateDirectoryAsync("/a/b/c/d", recursive: true));
+
+        Assert.Equal(FileSystemErrorKind.InvalidArgument, error.FsKind);
+        Assert.Contains("too deep", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task The_depth_limit_counts_the_file_too()
+    {
+        // A file sits one level below the directory holding it, so bounding directories
+        // alone would leave the deepest thing in the tree one past the limit. The cap is
+        // on the path, which is what lets anything walking this filesystem count on it.
+        var fs = new InMemoryFileSystem(new FsLimits { MaxDepth = 3 });
+        await fs.CreateDirectoryAsync("/a/b", recursive: true);
+        await fs.WriteFileAsync("/a/b/file", Hello);
+
+        var error = await Assert.ThrowsAsync<FileSystemException>(
+            async () => await fs.WriteFileAsync("/a/b/c/file", Hello));
+
+        // The parent does not exist either, so this is the shallower complaint — the point
+        // is that it is refused, and that the deep write below is refused on depth alone.
+        Assert.Equal(FileSystemErrorKind.NotFound, error.FsKind);
+
+        await fs.CreateDirectoryAsync("/x/y/z", recursive: true);
+
+        var tooDeep = await Assert.ThrowsAsync<FileSystemException>(
+            async () => await fs.WriteFileAsync("/x/y/z/file", Hello));
+
+        Assert.Equal(FileSystemErrorKind.InvalidArgument, tooDeep.FsKind);
+        Assert.Contains("too deep", tooDeep.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task The_depth_limit_covers_symlinks()
+    {
+        var fs = new InMemoryFileSystem(new FsLimits { MaxDepth = 2 });
+        await fs.CreateDirectoryAsync("/a/b", recursive: true);
+
+        await Assert.ThrowsAsync<FileSystemException>(
+            async () => await fs.CreateSymlinkAsync("/a", "/a/b/link"));
+    }
+
+    [Fact]
     public async Task Two_instances_share_nothing()
     {
         var a = new InMemoryFileSystem();
