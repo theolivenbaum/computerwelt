@@ -14,7 +14,10 @@ They fit together the way they do upstream: Bashkit already exposes Monty as its
 against the same virtual filesystem, under the same resource limits — with no CPython, no
 container and no process.
 
-Both vendored trees are read-only and have CI/CD workflows and generated blobs stripped.
+Both vendored trees are read-only and have their CI/CD workflows, their build and
+release automation and their generated blobs stripped — a `justfile`, a `Makefile` or a
+cargo-deny config specifies how to build a Rust crate this repository does not build, and
+the only pipeline here is the one under `.devops/`.
 They are the *specification*: when behaviour is ambiguous, the Rust source is the answer.
 
 Both upstreams are MIT licensed, as is this repository. `LICENSE` / `NOTICE` files are
@@ -122,6 +125,7 @@ citing it as the specification.
 Computerwelt.slnx
 Directory.Build.props        shared TFM / analyzers / warnings-as-errors
 Directory.Packages.props     central package versions
+.devops/build-nuget.yml      the pipeline that builds, tests, packs and publishes
 src/
   Computerwelt.Emulation.Bash/          the shell library
   Computerwelt.Emulation.Python/        the Python library
@@ -219,6 +223,36 @@ two ratcheted suites it is absolute: every case must pass.
 
 When adding to it, keep the discipline: an operation goes in because someone performed it,
 not because it would round out a matrix.
+
+## Building and publishing
+
+```bash
+dotnet build
+dotnet test
+```
+
+Both work with no arguments from the repository root, and keeping it that way is the point:
+`Computerwelt.slnx` is the only solution, every project in it builds from a clean clone, and
+the suites are xunit on the standard test SDK, so nothing needs a runner selection or a
+`global.json`. The whole suite is a couple of minutes, most of it in the two conformance
+corpora.
+
+`.devops/build-nuget.yml` is an Azure DevOps pipeline on a push to `main`, and it is the
+only thing that publishes — there is no other build definition, so nothing releases by
+accident. It restores, builds, runs the whole suite, packs and pushes the three library
+packages (`Computerwelt`, `Computerwelt.Emulation.Bash`, `Computerwelt.Emulation.Python`);
+the two CLIs and the six test projects opt out with `IsPackable`.
+
+The version is CalVer computed in the pipeline — `yy.M.<build id mod 65536>`, the scheme the
+other packages from this organisation use — so no release version is committed anywhere and
+a local build simply gets the SDK's default; the pipeline's `/p:Version` overrides it. The
+push goes through the `nuget-curiosity-org` service connection, so no API key lives in this
+repository.
+
+The tests are the release gate, and both ratchets carry their weight there:
+`tests/spec/baseline.json` fails the run if any spec file regresses, and
+`Computerwelt.AgentTests` is absolute. A red suite is a package that never gets built, which
+is the only ordering that helps — a package pushed to NuGet cannot be un-published.
 
 ## Working rules
 
