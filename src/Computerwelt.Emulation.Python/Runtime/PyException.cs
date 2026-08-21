@@ -218,6 +218,9 @@ public sealed class PyExceptionType : PyObject
     /// <summary><c>StopIteration</c>.</summary>
     public static PyExceptionType StopIteration { get; } = Define("StopIteration", Exception);
 
+    /// <summary><c>EOFError</c>, raised by <c>input()</c> past the end of standard input.</summary>
+    public static PyExceptionType EOFError { get; } = Define("EOFError", Exception);
+
     /// <summary><c>AssertionError</c>.</summary>
     public static PyExceptionType AssertionError { get; } = Define("AssertionError", Exception);
 

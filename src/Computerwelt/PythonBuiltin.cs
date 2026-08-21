@@ -22,7 +22,9 @@ namespace Computerwelt;
 /// </para>
 /// <para>
 /// Python's exit status follows the shell convention: 0 on success, 1 on an uncaught
-/// exception, and the traceback goes to stderr exactly as CPython prints it.
+/// exception, and the traceback goes to stderr exactly as CPython prints it. A script that
+/// calls <c>sys.exit(n)</c> exits with <c>n</c> and no traceback, so
+/// <c>python check.py || echo failed</c> works.
 /// </para>
 /// </remarks>
 public sealed class PythonBuiltin : IBuiltin
@@ -47,7 +49,7 @@ public sealed class PythonBuiltin : IBuiltin
     /// <inheritdoc />
     public async ValueTask<ExecResult> ExecuteAsync(BuiltinContext context, CancellationToken cancellationToken = default)
     {
-        var (source, scriptName, arguments, error) = await ResolveSourceAsync(context, cancellationToken);
+        var (source, scriptName, argv, error) = await ResolveSourceAsync(context, cancellationToken);
 
         if (error is not null)
         {
@@ -78,15 +80,29 @@ public sealed class PythonBuiltin : IBuiltin
             runner.ExternalFunctions[name] = function;
         }
 
+        // `sys.argv` is the invocation as written, so `python script.py --flag value` reads
+        // its own options the way a script assumes it can.
+        runner.Arguments.AddRange(argv);
+
+        // Standard input is the program itself when it was piped in, so there is nothing
+        // left for the program to read; otherwise it is the pipeline's, which is what makes
+        // `cat data | python -c '…sys.stdin.read()…'` a usable stage.
+        if (scriptName != "<stdin>" && context.Stdin is { IsEmpty: false })
+        {
+            runner.StandardInput = context.StdinText;
+        }
+
         var result = runner.Run(source!, scriptName);
-        _ = arguments;
 
         if (result.Succeeded)
         {
             return new ExecResult
             {
-                Stdout = StreamData.FromText(result.Stdout),
+                Stdout = StreamData.FromText(Echoed(result, scriptName)),
                 Stderr = StreamData.FromText(result.Stderr),
+
+                // Zero unless the script called `sys.exit(n)`.
+                ExitCode = result.ExitCode,
             };
         }
 
@@ -98,7 +114,34 @@ public sealed class PythonBuiltin : IBuiltin
         };
     }
 
-    private static async ValueTask<(string? Source, string ScriptName, List<string> Arguments, ExecResult? Error)>
+    /// <summary>
+    /// Standard output, with the value of a bare trailing expression appended when the
+    /// program printed nothing itself.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is what makes <c>python -c "2 + 3"</c> answer <c>5</c> rather than nothing, the
+    /// way typing it at a prompt would. It applies only to a silent program: one that
+    /// printed its own output is not second-guessed.
+    /// </para>
+    /// <para>
+    /// And only to <c>-c</c>. A script file or a heredoc is a program, not an expression
+    /// typed at a prompt, and one ending in <c>open(p, 'w').write(text)</c> — which is what
+    /// a patch script looks like — would otherwise emit a stray byte count into whatever
+    /// reads its output.
+    /// </para>
+    /// </remarks>
+    private static string Echoed(RunResult result, string scriptName) =>
+        scriptName == "<string>" && result.Stdout.Length == 0 && result.Value is not PyNone
+            ? result.Value.Repr() + "\n"
+            : result.Stdout;
+
+    /// <summary>
+    /// Works out what to run, what to call it in a traceback, and what <c>sys.argv</c>
+    /// should be — which, as in CPython, starts with how the program was named
+    /// (<c>-c</c>, <c>-</c> for standard input, or the script's path).
+    /// </summary>
+    private static async ValueTask<(string? Source, string ScriptName, List<string> Argv, ExecResult? Error)>
         ResolveSourceAsync(BuiltinContext context, CancellationToken cancellationToken)
     {
         var index = 0;
@@ -115,7 +158,7 @@ public sealed class PythonBuiltin : IBuiltin
                 }
 
                 return (context.Arguments[index + 1], "<string>",
-                    [.. context.Arguments.Skip(index + 2)], null);
+                    ["-c", .. context.Arguments.Skip(index + 2)], null);
             }
 
             // Flags that change nothing here are accepted and ignored, so that a script
@@ -139,7 +182,7 @@ public sealed class PythonBuiltin : IBuiltin
         if (index >= context.Arguments.Count || context.Arguments[index] == "-")
         {
             return (context.StdinText, "<stdin>",
-                [.. context.Arguments.Skip(Math.Min(index + 1, context.Arguments.Count))], null);
+                ["-", .. context.Arguments.Skip(Math.Min(index + 1, context.Arguments.Count))], null);
         }
 
         var path = context.ResolvePath(context.Arguments[index]);
@@ -149,7 +192,7 @@ public sealed class PythonBuiltin : IBuiltin
             var bytes = await context.FileSystem.ReadFileAsync(path, cancellationToken);
 
             return (Encoding.UTF8.GetString(bytes), context.Arguments[index],
-                [.. context.Arguments.Skip(index + 1)], null);
+                [.. context.Arguments.Skip(index)], null);
         }
         catch (FileSystemException)
         {

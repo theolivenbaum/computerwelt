@@ -11,13 +11,27 @@ namespace Computerwelt.Emulation.Python.Modules;
 public static class SysModule
 {
     /// <summary>Builds the module.</summary>
-    public static PyModuleObject Create(VirtualMachine machine)
+    /// <param name="machine">The machine whose output buffers the streams write to.</param>
+    /// <param name="arguments">
+    /// What <c>sys.argv</c> reports, program name first. A host that runs Python as a
+    /// command — the shell's <c>python</c> builtin does — passes the real invocation here,
+    /// so an ordinary <c>script.py --flag value</c> works.
+    /// </param>
+    /// <param name="standardInput">
+    /// The stream <c>sys.stdin</c> reads, or null when there is no standard input.
+    /// </param>
+    public static PyModuleObject Create(
+        VirtualMachine machine,
+        IReadOnlyList<string>? arguments = null,
+        PyMemoryStream? standardInput = null)
     {
         var module = new PyModuleObject("sys");
 
+        IReadOnlyList<string> argv = arguments is { Count: > 0 } supplied ? supplied : ["<script>"];
+
         module.Add("platform", new PyStr("monty"));
         module.Add("maxsize", new PyInt(long.MaxValue));
-        module.Add("argv", new PyList([new PyStr("<script>")]));
+        module.Add("argv", new PyList([.. argv.Select(static value => new PyStr(value))]));
         module.Add("path", new PyList());
         module.Add("version", new PyStr("3.14.0 (Monty)"));
 
@@ -32,6 +46,11 @@ public static class SysModule
 
         module.Add("stdout", new StandardStream("stdout", machine.Write));
         module.Add("stderr", new StandardStream("stderr", machine.WriteError));
+
+        if (standardInput is not null)
+        {
+            module.Add("stdin", standardInput);
+        }
 
         module.Add("exit", static arguments =>
         {
@@ -57,6 +76,35 @@ public static class SysModule
 
         return module;
     }
+
+    /// <summary>
+    /// Builds the <c>input</c> builtin over <paramref name="standardInput"/>.
+    /// </summary>
+    /// <remarks>
+    /// It exists only when the host supplied standard input, so a program that calls it
+    /// with nothing piped in gets a <c>NameError</c> naming the problem rather than a hang.
+    /// </remarks>
+    /// <param name="machine">The machine whose output buffer a prompt is written to.</param>
+    /// <param name="standardInput">Where the line comes from.</param>
+    public static PyBuiltinFunction CreateInput(VirtualMachine machine, PyMemoryStream standardInput) =>
+        new("input", arguments =>
+        {
+            if (arguments.Length > 0)
+            {
+                machine.Write(arguments[0].Display());
+            }
+
+            var line = standardInput.ReadLine();
+
+            if (line.Length == 0)
+            {
+                throw new PyRaise(new PyException(PyExceptionType.EOFError, "EOF when reading a line"));
+            }
+
+            // `input` hands back the line without its terminator; a last line that had none
+            // is returned as it stands.
+            return new PyStr(line.TrimEnd('\n'));
+        });
 
     /// <summary>A writable stream backed by the machine's output buffers.</summary>
     private sealed class StandardStream(string name, Action<string> write) : PyObject

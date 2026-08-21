@@ -13,7 +13,9 @@ Status legend: `[ ]` not started · `[~]` in progress / partial · `[x]` done
 
 Upstream reference: `.reference/bashkit/crates/bashkit/src/`
 Acceptance suite: `tests/spec/` (2,521 runnable cases after dropping the out-of-scope
-`python` and `typescript` suites). Ratchet file: `tests/spec/baseline.json`.
+`typescript` suite). Ratchet file: `tests/spec/baseline.json`. Upstream's `python` suite
+needs a command that exists only once both halves are joined, so it lives with the
+agent-operation tests instead — see below.
 
 **Current state — shell:** solution builds clean, 156 unit tests green,
 **2,521 / 2,521 conformance cases passing (100 %)**, 27 cases skipped by upstream
@@ -21,8 +23,12 @@ directive.
 
 **Current state — python:** tokenizer, parser, bytecode compiler, VM, core types,
 builtins, the stdlib subset, dunder dispatch and the external-function boundary are all in
-place. **557 / 558 fixtures passing (99.8 %)**, with 18 unit tests covering what the
+place. **557 / 558 fixtures passing (99.8 %)**, with 40 unit tests covering what the
 corpus does not reach. No host exception escapes to a script.
+
+**Current state — joined:** 12 integration tests over one filesystem, and 195 green in
+`tests/Computerwelt.AgentTests/` — 138 covering the shell and Python operations a caller
+actually performs, plus upstream's 57 `python` command cases.
 
 The one remaining fixture is a documented divergence, not a gap — see below.
 
@@ -34,6 +40,36 @@ The one remaining fixture is a documented divergence, not a gap — see below.
 | `jq` | 124 / 124 |
 | `awk` | 126 / 126 |
 | `yq` | 26 / 26 |
+
+## Agent-operation coverage  (`tests/Computerwelt.AgentTests/`)
+
+The two conformance corpora prove each builtin is individually right. They say much less
+about the handful of shapes a caller actually types: read a file, search a tree, patch a
+source file with a short Python program, check the result. That suite was written by
+replaying a real working session against this repository and turning each operation into a
+test — 138 of them, plus upstream's 57-case `python` command corpus, which had never been
+ported because the command it exercises only exists once both halves are joined.
+
+Replaying found five defects the corpora between them did not:
+
+| Found | Was | Now |
+|---|---|---|
+| A generator with a second `yield` in it | `ArgumentOutOfRangeException` out of the host — `yield` left no value where the compiler's `Pop` expected one | The yield expression evaluates to `None`, as it does in CPython. Covered by `GeneratorTests` |
+| `sys.argv` | The constant `['<script>']`, so no script could read its own options | The invocation as written: `-c`, `-`, or the script's path, then the arguments |
+| `sys.exit(n)` / `raise SystemExit(n)` | Exit status 1 and a traceback, so `python check.py \|\| handle` never fired | Status `n`, no traceback; a non-integer argument prints and exits 1 |
+| `python -c "2 + 3"` | Printed nothing | Echoes the value, as upstream's corpus pins. Only for `-c`: a heredoc patch script ending in `open(p, 'w').write(s)` must not emit a stray byte count |
+| `python` in the middle of a pipeline | `input` and `sys.stdin` did not exist | Both read the shell's standard input, when the program did not come from it |
+
+`io` was added at the same time — `io.open` is the spelling a patch script uses to state an
+encoding, and `io.StringIO` / `io.BytesIO` are the in-memory streams that go with it.
+
+Recorded, not fixed, because upstream defines the surface and this port follows it:
+
+| Absent | Note |
+|---|---|
+| `os.walk`, `glob`, `fnmatch` | Upstream's `os` exposes eleven operations and tree-walking is not one. A five-line recursion over `os.listdir` replaces it, which is what `StandardLibrarySurfaceTests` demonstrates |
+| `open(..., newline='')` | Refused, though nothing here translates line endings and it would describe what already happens. `tests/monty-spec/open__fs.py` pins the refusal; binary mode is the way to ask for exact bytes |
+| `shutil`, `argparse`, `textwrap`, `difflib`, `tempfile`, `csv`, `hashlib`, `base64`, `string`, `functools`, … | Not ported. `StandardLibrarySurfaceTests` lists the set in both directions, so adding one is a deliberate edit rather than a silent widening |
 
 ## Known divergences
 

@@ -67,6 +67,18 @@ public sealed class Compiler
     public static CodeObject CompileModule(PyModule module, string fileName)
     {
         var compiler = new Compiler("<module>", fileName, null, isFunctionScope: false);
+
+        // A module ending in a bare expression returns its value rather than discarding
+        // it, which is what lets a host echo the result of `python -c "2 + 3"` the way an
+        // interactive session would. Anything else returns None.
+        if (module.Body is [.., ExpressionStatement last])
+        {
+            compiler.CompileStatements([.. module.Body.Take(module.Body.Count - 1)]);
+            compiler.CompileExpression(last.Value);
+            compiler.Emit(OpCode.Return, 0, last.Line);
+            return compiler._code;
+        }
+
         compiler.CompileStatements(module.Body);
         compiler.Emit(OpCode.LoadConst, compiler._code.AddConstant(PyNone.Instance), 0);
         compiler.Emit(OpCode.Return, 0, 0);

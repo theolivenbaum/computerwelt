@@ -128,6 +128,7 @@ tests/
   Computerwelt.Emulation.Python.Tests/      python unit tests
   Computerwelt.Emulation.Python.SpecTests/  python conformance over `tests/monty-spec/*.py`
   Computerwelt.Tests/                       integration: both interpreters over one filesystem
+  Computerwelt.AgentTests/                  the operations a caller performs, end to end
   spec/                                     shell acceptance corpus (from bashkit)
   monty-spec/                               python acceptance corpus (from monty)
 .reference/bashkit/          vendored bashkit source (read-only)
@@ -184,6 +185,22 @@ dotnet test                                   # everything
 dotnet test tests/Computerwelt.Emulation.Bash.SpecTests           # shell conformance only
 dotnet test tests/Computerwelt.Emulation.Python.SpecTests             # python conformance only
 ```
+
+### Joined — `tests/Computerwelt.AgentTests/`
+
+A third suite, and the one that catches what the other two structurally cannot. Both
+corpora test features; this tests *operations* — the shapes a caller actually types, taken
+from real sessions rather than invented: read a file, search a tree, patch a source file
+with a heredoc Python program, check the result, keep going. Composing correct builtins is
+where the interesting failures live, and every defect it has found so far was in code both
+corpora already covered.
+
+It also carries upstream's `python` command corpus (`spec/python.test.sh`), which the
+shell suite cannot run — that command exists only once both halves are joined. Unlike the
+two ratcheted suites it is absolute: every case must pass.
+
+When adding to it, keep the discipline: an operation goes in because someone performed it,
+not because it would round out a matrix.
 
 ## Working rules
 

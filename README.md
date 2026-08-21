@@ -77,6 +77,7 @@ behaves identically on Linux, macOS and Windows.
 | `tests/Computerwelt.Emulation.Python.Tests/` | Python unit tests |
 | `tests/Computerwelt.Emulation.Python.SpecTests/` | Python conformance runner |
 | `tests/Computerwelt.Tests/` | integration: both interpreters over one filesystem |
+| `tests/Computerwelt.AgentTests/` | the operations a caller performs, end to end, plus upstream's `python` command corpus |
 | `tests/Computerwelt.Emulation.Bash.Tests/` | shell unit tests |
 | `tests/Computerwelt.Emulation.Bash.SpecTests/` | shell conformance runner |
 | `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
@@ -108,6 +109,7 @@ Never lower a baseline to make a build green.
 |---|---|---|
 | shell | **2,521 / 2,521** | 73 commands implemented; 27 cases skipped by upstream directive |
 | python | **557 / 558** | parser, bytecode compiler, VM, types, builtins, the stdlib subset, dunders |
+| joined | **195 / 195** | 138 agent-operation tests plus upstream's 57 `python` command cases |
 
 The one Python fixture that does not pass asserts that a temporary's `id()` is handed to
 the next object of the same shape — an artifact of upstream's slot-recycling heap. Object
@@ -116,6 +118,14 @@ identity here is the host runtime's, and an id is never recycled; the reasoning 
 
 The two halves share one virtual filesystem: `src/Computerwelt/` adds `python` as a shell
 command whose `os`, `os.path` and `open` are backed by the shell's `IFileSystem`.
+
+`tests/Computerwelt.AgentTests/` covers that seam from the caller's side — not features but
+*operations*: read a file, search a tree, patch a source file with a heredoc Python
+program, check the result. The cases were taken from real sessions rather than invented,
+and the defects they surfaced (a generator with two `yield`s crashing the host, a constant
+`sys.argv`, `sys.exit(n)` not reaching the shell, no `sys.stdin`) were all in code both
+conformance corpora already covered. [`todo.md`](todo.md) lists what it found and what it
+deliberately leaves absent.
 
 See [`todo.md`](todo.md) for the ledger and [`CLAUDE.md`](CLAUDE.md) for the architecture
 and the invariants that define "correct".

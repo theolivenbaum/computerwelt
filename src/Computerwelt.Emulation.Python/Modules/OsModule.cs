@@ -369,6 +369,10 @@ public static class OsModule
         Default(given[3], "encoding", static value =>
             value is PyNone or PyStr { Value: "utf-8" or "utf8" or "UTF-8" });
         Default(given[4], "errors", static value => value is PyNone);
+        // `newline=''` is refused along with the rest, even though nothing here translates
+        // line endings and it would therefore describe what already happens: upstream's
+        // corpus pins the rejection, and a caller passing it is asking for a guarantee
+        // about newline handling that this wrapper does not make.
         Default(given[5], "newline", static value => value is PyNone);
         Default(given[6], "closefd", static value => value.IsTruthy());
         Default(given[7], "opener", static value => value is PyNone);

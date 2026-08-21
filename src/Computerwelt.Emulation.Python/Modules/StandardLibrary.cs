@@ -19,13 +19,21 @@ public static class StandardLibrary
     /// The filesystem <c>os</c> and <c>pathlib</c> are built over. With none, the
     /// filesystem modules are absent rather than present and always failing.
     /// </param>
+    /// <param name="arguments">What <c>sys.argv</c> reports, program name first.</param>
+    /// <param name="standardInput">
+    /// The stream <c>sys.stdin</c> reads, or null when the program has no standard input —
+    /// in which case the attribute is absent rather than an empty stream.
+    /// </param>
     public static Dictionary<string, PyObject> Create(
         VirtualMachine machine,
         TimeProvider? timeProvider = null,
-        IPyFileSystem? fileSystem = null)
+        IPyFileSystem? fileSystem = null,
+        IReadOnlyList<string>? arguments = null,
+        PyMemoryStream? standardInput = null)
     {
-        var modules = Core(machine, timeProvider);
+        var modules = Core(machine, timeProvider, arguments, standardInput);
         modules["pathlib"] = PathlibModule.Create(fileSystem);
+        modules["io"] = IoModule.Create(fileSystem);
 
         if (fileSystem is not null)
         {
@@ -35,14 +43,18 @@ public static class StandardLibrary
         return modules;
     }
 
-    private static Dictionary<string, PyObject> Core(VirtualMachine machine, TimeProvider? timeProvider) =>
+    private static Dictionary<string, PyObject> Core(
+        VirtualMachine machine,
+        TimeProvider? timeProvider,
+        IReadOnlyList<string>? arguments,
+        PyMemoryStream? standardInput) =>
         new(StringComparer.Ordinal)
     {
         ["re"] = ReModule.Create(),
         ["dataclasses"] = DataclassesModule.Create(machine),
         ["datetime"] = DatetimeModule.Create(timeProvider ?? TimeProvider.System),
         ["math"] = MathModule.Create(),
-        ["sys"] = SysModule.Create(machine),
+        ["sys"] = SysModule.Create(machine, arguments, standardInput),
         ["json"] = JsonModule.Create(machine),
         ["asyncio"] = AsyncioModule.Create(machine),
         ["collections"] = SupportModules.CreateCollections(machine),

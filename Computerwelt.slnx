@@ -7,6 +7,7 @@
     <Project Path="src/Computerwelt.Emulation.Python/Computerwelt.Emulation.Python.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Computerwelt.AgentTests/Computerwelt.AgentTests.csproj" />
     <Project Path="tests/Computerwelt.Emulation.Bash.SpecTests/Computerwelt.Emulation.Bash.SpecTests.csproj" />
     <Project Path="tests/Computerwelt.Emulation.Bash.Tests/Computerwelt.Emulation.Bash.Tests.csproj" />
     <Project Path="tests/Computerwelt.Tests/Computerwelt.Tests.csproj" />
