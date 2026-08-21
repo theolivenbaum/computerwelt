@@ -1,0 +1,990 @@
+//! `sqlite` / `sqlite3` builtin — embedded SQLite via [`turso_core`].
+//!
+//! See `knowledge/runtimes/sqlite-builtin.md` for the design rationale, threat model, and
+//! test plan. At a glance:
+//!
+//! - A single invocation opens a fresh database connection, runs every SQL
+//!   statement and dot-command in the script, and persists changes back to
+//!   the VFS on success.
+//! - Two backends are wired up:
+//!   - [`SqliteBackend::Memory`] — turso's `MemoryIO`, with whole-file load
+//!     from / flush to the VFS at command boundaries (Phase 1).
+//!   - [`SqliteBackend::Vfs`] — bashkit's `FileSystem` plugged into turso via
+//!     a custom `IO` impl (Phase 2). Equivalent semantics, different code path.
+//! - In-memory databases are spelled `:memory:` and bypass VFS entirely.
+//! - Dot-commands implement a curated subset of `sqlite3` shell features
+//!   (`.tables`, `.schema`, `.dump`, `.headers`, `.mode`, `.separator`,
+//!   `.nullvalue`, `.read`, `.indexes`, `.help`, `.quit`/`.exit`).
+//! - `BASHKIT_ALLOW_INPROCESS_SQLITE=1` (env or via builder) gates execution
+//!   in case operators want to keep the BETA upstream code dormant.
+//!
+//! Limits enforced (see [`SqliteLimits`]):
+//! - SQL script length capped at `max_script_bytes` (4 MiB default).
+//! - Per-result-set row count capped at `max_rows_per_query` (1M default).
+//! - Per-cell, raw result, and rendered-output bytes capped before values can
+//!   grow beyond the builtin's memory budget.
+//! - Per-database file size capped at `max_db_bytes` (256 MiB default).
+//! - Wall-clock budget per invocation at `max_duration` (30 s default; pass
+//!   [`std::time::Duration::ZERO`] to opt out).
+//! - Total statement count per invocation at `max_statements` (10k default).
+//! - `.read` recursion depth bounded by `MAX_DOT_READ_DEPTH` (16, hard-coded).
+
+mod dot_commands;
+mod engine;
+mod formatter;
+mod parser;
+mod vfs_io;
+
+#[cfg(test)]
+mod tests;
+
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::error::Result;
+use crate::fs::FileSystem;
+use crate::interpreter::ExecResult;
+
+use super::{Builtin, Context, check_help_version, resolve_path};
+use dot_commands::{DotError, DotOutcome};
+use engine::{QueryLimits, SqliteEngine};
+use formatter::{OutputMode, OutputOpts, render};
+use parser::Stmt;
+
+const SQLITE_OPT_IN_ENV: &str = "BASHKIT_ALLOW_INPROCESS_SQLITE";
+
+/// Default cap on raw SQL input (script size, summed across `-c` args, file
+/// reads, and stdin). Mirrors `python`'s defensive limits.
+const DEFAULT_MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+/// Default cap on rows materialised per query, beyond which the query aborts.
+const DEFAULT_MAX_ROWS_PER_QUERY: usize = 1_000_000;
+/// Default cap on one returned SQLite value before Bashkit clones/renders it.
+const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+/// Default cap on raw result values materialised for one SQL statement.
+/// Equal to the per-value cap so hex/blob rendering remains bounded by
+/// `max_output_bytes` under the default limits.
+const DEFAULT_MAX_RESULT_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+/// Default cap on rendered stdout produced by one sqlite invocation.
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+/// Default cap on the size of a single database file when loaded from VFS.
+const DEFAULT_MAX_DB_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+/// Default per-script wall-clock cap. Each individual statement is checked
+/// against the *remaining* budget — once spent, further `step()` calls are
+/// interrupted via turso's cooperative interrupt.
+const DEFAULT_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default cap on the number of SQL statements + dot-commands per
+/// invocation. Defence-in-depth against pathological scripts that would
+/// otherwise stay under the byte cap (e.g. millions of empty `;`s).
+const DEFAULT_MAX_STATEMENTS: usize = 10_000;
+
+/// PRAGMAs that are denied by default because they let scripted SQL push
+/// past the resource caps the builtin negotiates with the host. These are
+/// memory- or filesystem-shaped knobs, not SQL semantics.
+///
+/// Operators can override by constructing [`SqliteLimits`] with a custom
+/// [`SqliteLimits::pragma_deny`]. Anything not in the deny list passes
+/// straight through to turso, including `wal_checkpoint`, `user_version`,
+/// `foreign_keys`, etc.
+const DEFAULT_PRAGMA_DENY: &[&str] = &[
+    // Memory pressure knobs — would let a script outgrow `max_db_bytes`
+    // by allocating cache pages instead.
+    "cache_size",
+    "mmap_size",
+    "page_size",
+    "max_page_count",
+    // Filesystem-shaped knobs — these *should* be inert against our VFS,
+    // but an upstream regression that resolved them against the host FS
+    // would punch straight through the sandbox. Block defensively.
+    "temp_store_directory",
+    "data_store_directory",
+    // Environment fingerprinting — leaks build info about the host turso.
+    "compile_options",
+    // Shared-cache and locking tweaks — single-process model breaks if the
+    // script flips these out from under turso's defaults.
+    "locking_mode",
+    "shared_cache",
+];
+
+/// Choice of `IO` backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SqliteBackend {
+    /// Phase 1: load whole DB file into turso's `MemoryIO`, run, flush back.
+    /// Default — most predictable and exposes the smallest surface of the
+    /// upstream BETA codebase.
+    #[default]
+    Memory,
+    /// Phase 2: turso talks to the VFS through a custom `IO` impl.
+    /// Functionally equivalent for our use case but exercises the IO trait
+    /// path; pick this if you want to test the full integration.
+    Vfs,
+}
+
+impl SqliteBackend {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "memory" | "memio" | "mem" => Self::Memory,
+            "vfs" | "vfsio" => Self::Vfs,
+            _ => return None,
+        })
+    }
+}
+
+/// Resource limits for the embedded sqlite engine.
+#[derive(Debug, Clone)]
+pub struct SqliteLimits {
+    /// Maximum raw SQL input size in bytes.
+    pub max_script_bytes: usize,
+    /// Maximum rows materialised per query before aborting.
+    pub max_rows_per_query: usize,
+    /// Maximum bytes allowed in one returned SQLite value before cloning it.
+    pub max_value_bytes: usize,
+    /// Maximum raw bytes materialised across one query result.
+    pub max_result_bytes: usize,
+    /// Maximum rendered stdout bytes produced by one sqlite invocation.
+    pub max_output_bytes: usize,
+    /// Maximum database file size loadable from the VFS.
+    pub max_db_bytes: usize,
+    /// Wall-clock budget for the whole invocation (every statement shares
+    /// it). When the budget is exhausted, the in-flight statement is
+    /// interrupted and the run aborts with `query timed out`.
+    pub max_duration: std::time::Duration,
+    /// Maximum number of SQL statements + dot-commands per invocation.
+    pub max_statements: usize,
+    /// Backend selection.
+    pub backend: SqliteBackend,
+    /// Lower-cased PRAGMA names that the builtin will refuse to execute.
+    ///
+    /// Defaults to a curated list of resource- and sandbox-affecting
+    /// PRAGMAs: `cache_size`, `mmap_size`, `page_size`, `max_page_count`,
+    /// `temp_store_directory`, `data_store_directory`, `compile_options`,
+    /// `locking_mode`, `shared_cache`. Override via
+    /// [`SqliteLimits::pragma_deny`] (the builder method).
+    pub pragma_deny: Vec<String>,
+}
+
+impl Default for SqliteLimits {
+    fn default() -> Self {
+        Self {
+            max_script_bytes: DEFAULT_MAX_SCRIPT_BYTES,
+            max_rows_per_query: DEFAULT_MAX_ROWS_PER_QUERY,
+            max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_db_bytes: DEFAULT_MAX_DB_BYTES,
+            max_duration: DEFAULT_MAX_DURATION,
+            max_statements: DEFAULT_MAX_STATEMENTS,
+            backend: SqliteBackend::default(),
+            pragma_deny: DEFAULT_PRAGMA_DENY
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+}
+
+impl SqliteLimits {
+    /// Set max script size.
+    #[must_use]
+    pub fn max_script_bytes(mut self, n: usize) -> Self {
+        self.max_script_bytes = n;
+        self
+    }
+    /// Set max rows materialised per query.
+    #[must_use]
+    pub fn max_rows_per_query(mut self, n: usize) -> Self {
+        self.max_rows_per_query = n;
+        self
+    }
+    /// Set max bytes for one returned SQLite value.
+    #[must_use]
+    pub fn max_value_bytes(mut self, n: usize) -> Self {
+        self.max_value_bytes = n;
+        self
+    }
+    /// Set max raw bytes materialised across one query result.
+    #[must_use]
+    pub fn max_result_bytes(mut self, n: usize) -> Self {
+        self.max_result_bytes = n;
+        self
+    }
+    /// Set max rendered stdout bytes for one sqlite invocation.
+    #[must_use]
+    pub fn max_output_bytes(mut self, n: usize) -> Self {
+        self.max_output_bytes = n;
+        self
+    }
+    /// Set max DB file bytes.
+    #[must_use]
+    pub fn max_db_bytes(mut self, n: usize) -> Self {
+        self.max_db_bytes = n;
+        self
+    }
+    /// Set wall-clock budget shared across all statements in an invocation.
+    #[must_use]
+    pub fn max_duration(mut self, d: std::time::Duration) -> Self {
+        self.max_duration = d;
+        self
+    }
+    /// Set the maximum number of statements per invocation.
+    #[must_use]
+    pub fn max_statements(mut self, n: usize) -> Self {
+        self.max_statements = n;
+        self
+    }
+    /// Pick a backend.
+    #[must_use]
+    pub fn backend(mut self, backend: SqliteBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+    /// Replace the PRAGMA deny list. Names are matched case-insensitively
+    /// against the PRAGMA's identifier (the part before `=` or `(`).
+    #[must_use]
+    pub fn pragma_deny<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.pragma_deny = names
+            .into_iter()
+            .map(|n| n.into().to_ascii_lowercase())
+            .collect();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SqliteInprocessOptIn(pub bool);
+
+fn sqlite_inprocess_enabled(ctx: &Context<'_>) -> bool {
+    ctx.execution_extension::<SqliteInprocessOptIn>()
+        .is_some_and(|opt_in| opt_in.try_with(|opt_in| opt_in.0).unwrap_or(false))
+        || {
+            #[cfg(test)]
+            {
+                let is_enabled = |v: &str| matches!(v, "1" | "true" | "TRUE" | "yes" | "YES");
+                ctx.env
+                    .get(SQLITE_OPT_IN_ENV)
+                    .is_some_and(|v| is_enabled(v))
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
+}
+
+/// The `sqlite` / `sqlite3` builtin command.
+///
+/// Holds a session-scoped cache of file-backed engines so that consecutive
+/// `bash.exec("sqlite DB ...")` calls reuse the same connection. This lets
+/// transactions span shell commands (e.g. `BEGIN` in one call, `COMMIT` in
+/// the next) and avoids reloading the DB file from the VFS for every
+/// invocation.
+///
+/// `:memory:` databases bypass the cache — they are intentionally
+/// ephemeral so users get a fresh slate on every invocation.
+pub struct Sqlite {
+    /// Resource and backend configuration.
+    pub limits: SqliteLimits,
+    /// Per-database cached engine handles. Key: `(backend, canonical-ish path)`.
+    /// Value: an `Arc<TokioMutex<Option<SqliteEngine>>>` so concurrent calls
+    /// to the same path serialise without losing the cached connection.
+    engine_cache: EngineCache,
+}
+
+type CacheKey = (SqliteBackend, std::path::PathBuf);
+type EngineHandle = Arc<tokio::sync::Mutex<Option<engine::SqliteEngine>>>;
+type EngineCache = Arc<std::sync::Mutex<std::collections::HashMap<CacheKey, EngineHandle>>>;
+
+impl Sqlite {
+    /// Construct with default limits and the Memory backend.
+    pub fn new() -> Self {
+        Self {
+            limits: SqliteLimits::default(),
+            engine_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Construct with custom limits.
+    pub fn with_limits(limits: SqliteLimits) -> Self {
+        Self {
+            limits,
+            engine_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Look up (or insert) the per-database engine handle. The outer
+    /// `std::sync::Mutex` is held only briefly for HashMap access; the
+    /// inner `tokio::sync::Mutex` is what serialises concurrent `sqlite`
+    /// calls against the same database.
+    fn cache_handle(&self, key: &CacheKey) -> EngineHandle {
+        let mut cache = self
+            .engine_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .clone()
+    }
+}
+
+impl Default for Sqlite {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Builtin for Sqlite {
+    fn llm_hint(&self) -> Option<&'static str> {
+        Some(
+            "sqlite/sqlite3: Embedded SQLite-compatible engine (Turso, BETA). \
+             Usage: sqlite DB SQL... | sqlite DB <script | sqlite -separator , -header DB SELECT. \
+             Dot-commands: .tables .schema .dump .headers .mode .separator .nullvalue .read .help. \
+             Supports :memory:. No ATTACH/DETACH/VACUUM. \
+             Set BASHKIT_ALLOW_INPROCESS_SQLITE=1 to enable.",
+        )
+    }
+
+    fn reset_session_state(&self) {
+        self.engine_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    async fn execute(&self, ctx: Context<'_>) -> Result<ExecResult> {
+        let invocation_args: Vec<String> = ctx.args.to_vec();
+        if let Some(r) = check_help_version(&invocation_args, HELP_TEXT, Some("sqlite (turso 0.5)"))
+        {
+            return Ok(r);
+        }
+
+        if !sqlite_inprocess_enabled(&ctx) {
+            return Ok(ExecResult::err(
+                format!(
+                    "sqlite: in-process SQLite disabled by default; set {SQLITE_OPT_IN_ENV}=1 to enable\n"
+                ),
+                1,
+            ));
+        }
+
+        let parsed = match parse_args(&invocation_args, ctx.stdin.map(|stdin| &**stdin)) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ExecResult::err(format!("sqlite: {e}\n"), 2));
+            }
+        };
+
+        // Resolve the database path early so error messages are deterministic.
+        let db_target = resolve_db_target(&parsed.db_arg, ctx.cwd);
+
+        // Apply per-invocation limits.
+        let script_len = parsed.script.len();
+        if script_len > self.limits.max_script_bytes {
+            return Ok(ExecResult::err(
+                format!(
+                    "sqlite: script too large ({script_len} bytes; limit {})\n",
+                    self.limits.max_script_bytes
+                ),
+                1,
+            ));
+        }
+        ctx.consume_budget_input(script_len)?;
+        ctx.consume_budget_work(u64::try_from(script_len.div_ceil(64)).unwrap_or(u64::MAX))?;
+
+        // Resolve effective backend (CLI flag overrides builder default).
+        let backend = parsed.backend.unwrap_or(self.limits.backend);
+
+        // Initial output options come from the CLI flags; dot-commands may
+        // mutate them as we go.
+        let mut opts = parsed.output;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut exit_code = 0i32;
+        let stmts = parser::split(&parsed.script);
+        ctx.consume_budget_work(u64::try_from(stmts.len()).unwrap_or(u64::MAX))?;
+        if stmts.len() > self.limits.max_statements {
+            return Ok(ExecResult::err(
+                format!(
+                    "sqlite: too many statements ({} > {} limit)\n",
+                    stmts.len(),
+                    self.limits.max_statements
+                ),
+                1,
+            ));
+        }
+        let deadline = engine::Deadline::new(self.limits.max_duration);
+        let execution_budget = ctx
+            .execution_budget()
+            .and_then(|budget| budget.try_with(Clone::clone).ok());
+
+        // For `:memory:`, don't cache — every invocation gets a fresh
+        // ephemeral engine. For file-backed targets we lock a per-key
+        // handle so consecutive calls reuse the same connection
+        // (transactions can span shell commands).
+        match &db_target {
+            DbTarget::Memory => {
+                let engine = match SqliteEngine::open_pure_memory() {
+                    Ok(e) => e,
+                    Err(msg) => {
+                        return Ok(ExecResult::err(format!("sqlite: {}\n", sanitize(&msg)), 1));
+                    }
+                };
+                let outcome = run_statements(
+                    &engine,
+                    stmts,
+                    &ctx.fs,
+                    ctx.cwd,
+                    &mut opts,
+                    &mut stdout,
+                    &self.limits,
+                    deadline,
+                    execution_budget.clone(),
+                    0,
+                )
+                .await;
+                if let Err(e) = outcome {
+                    stderr.push_str(&format!("sqlite: {}\n", sanitize(&e)));
+                    exit_code = 1;
+                }
+            }
+            DbTarget::File { path } => {
+                let key: CacheKey = (backend, path.clone());
+                let handle = self.cache_handle(&key);
+                let mut guard = handle.lock().await;
+
+                // Security: if the VFS file was removed/replaced between calls,
+                // invalidate cached state and re-open from current bytes.
+                let mut reopen = guard.is_none();
+                if !reopen
+                    && let Some(engine) = guard.as_ref()
+                    && let Some(snapshot) = engine.snapshot_bytes()
+                {
+                    match ctx.fs.read_file(path).await {
+                        Ok(current) => {
+                            if let Some(budget) = &execution_budget {
+                                budget.consume_input(current.len())?;
+                            }
+                            if current != snapshot {
+                                reopen = true;
+                            }
+                        }
+                        Err(_) => {
+                            reopen = true;
+                        }
+                    }
+                }
+                if reopen {
+                    match open_file_engine(
+                        backend,
+                        path,
+                        &ctx.fs,
+                        &self.limits,
+                        execution_budget.clone(),
+                    )
+                    .await
+                    {
+                        Ok(e) => *guard = Some(e),
+                        Err(msg) => {
+                            return Ok(ExecResult::err(format!("sqlite: {}\n", sanitize(&msg)), 1));
+                        }
+                    }
+                }
+                let engine = guard.as_ref().expect("engine populated above");
+
+                let outcome = run_statements(
+                    engine,
+                    stmts,
+                    &ctx.fs,
+                    ctx.cwd,
+                    &mut opts,
+                    &mut stdout,
+                    &self.limits,
+                    deadline,
+                    execution_budget,
+                    0,
+                )
+                .await;
+                if let Err(e) = outcome {
+                    stderr.push_str(&format!("sqlite: {}\n", sanitize(&e)));
+                    exit_code = 1;
+                }
+
+                // Persist to the VFS so snapshots taken between exec()
+                // calls always pick up the latest committed state. We
+                // keep the engine in the cache unless the snapshot exceeds
+                // the configured cap; an oversized cached image would keep
+                // memory pressure alive across later shell commands.
+                let mut drop_cached_engine = false;
+                match backend {
+                    SqliteBackend::Memory => {
+                        if let Some(bytes) = engine.snapshot_bytes() {
+                            if bytes.len() > self.limits.max_db_bytes {
+                                stderr.push_str(&format!(
+                                    "sqlite: database file too large after execution ({} bytes; limit {})\n",
+                                    bytes.len(),
+                                    self.limits.max_db_bytes
+                                ));
+                                exit_code = exit_code.max(1);
+                                drop_cached_engine = true;
+                            } else if let Err(e) = ctx.fs.write_file(path, &bytes).await {
+                                stderr.push_str(&format!(
+                                    "sqlite: persist failed: {}: {e}\n",
+                                    path.display()
+                                ));
+                                exit_code = exit_code.max(1);
+                            }
+                        }
+                    }
+                    SqliteBackend::Vfs => {
+                        if let Err(e) = engine.flush_dirty().await {
+                            stderr.push_str(&format!("sqlite: flush failed: {e}\n"));
+                            exit_code = exit_code.max(1);
+                        }
+                    }
+                }
+                if drop_cached_engine {
+                    *guard = None;
+                }
+            }
+        }
+
+        let mut result = ExecResult {
+            exit_code,
+            ..Default::default()
+        };
+        result.stdout = stdout.into();
+        result.stderr = stderr.into();
+        Ok(result)
+    }
+}
+
+#[derive(Debug)]
+enum DbTarget {
+    Memory,
+    File { path: PathBuf },
+}
+
+fn resolve_db_target(arg: &str, cwd: &Path) -> DbTarget {
+    if arg == ":memory:" || arg.is_empty() {
+        return DbTarget::Memory;
+    }
+    DbTarget::File {
+        path: resolve_path(cwd, arg),
+    }
+}
+
+#[derive(Debug)]
+struct ParsedArgs {
+    db_arg: String,
+    script: String,
+    output: OutputOpts,
+    backend: Option<SqliteBackend>,
+}
+
+fn parse_args(args: &[String], stdin: Option<&str>) -> std::result::Result<ParsedArgs, String> {
+    let mut output = OutputOpts::default();
+    let mut backend: Option<SqliteBackend> = None;
+    let mut script_parts: Vec<String> = Vec::new();
+    let mut db_arg: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            // sqlite3 historical flags use a single dash.
+            "-header" | "-headers" | "--header" | "--headers" => {
+                output.headers = true;
+            }
+            "-noheader" | "--noheader" => {
+                output.headers = false;
+            }
+            "-csv" | "--csv" => {
+                output.mode = OutputMode::Csv;
+                output.separator = ",".to_string();
+            }
+            "-tabs" | "--tabs" => {
+                output.mode = OutputMode::Tabs;
+                output.separator = "\t".to_string();
+            }
+            "-line" | "--line" => {
+                output.mode = OutputMode::Line;
+            }
+            "-list" | "--list" => {
+                output.mode = OutputMode::List;
+            }
+            "-box" | "--box" => {
+                output.mode = OutputMode::Box;
+            }
+            "-column" | "--column" => {
+                output.mode = OutputMode::Column;
+            }
+            "-json" | "--json" => {
+                output.mode = OutputMode::Json;
+            }
+            "-markdown" | "--markdown" => {
+                output.mode = OutputMode::Markdown;
+            }
+            "-separator" | "--separator" => {
+                let v = next_value(args, &mut i, "-separator")?;
+                output.separator = decode_escapes(&v);
+            }
+            "-nullvalue" | "--nullvalue" => {
+                let v = next_value(args, &mut i, "-nullvalue")?;
+                output.null_text = v;
+            }
+            "-cmd" | "--cmd" => {
+                let v = next_value(args, &mut i, "-cmd")?;
+                script_parts.push(v);
+            }
+            "-backend" | "--backend" => {
+                let v = next_value(args, &mut i, "-backend")?;
+                let b = SqliteBackend::parse(&v)
+                    .ok_or_else(|| format!("invalid backend '{v}' (memory|vfs)"))?;
+                backend = Some(b);
+            }
+            "--" => {
+                i += 1;
+                // Everything after `--` is positional.
+                while i < args.len() {
+                    consume_positional(&args[i], &mut db_arg, &mut script_parts);
+                    i += 1;
+                }
+                break;
+            }
+            arg if arg.starts_with('-') && arg != "-" => {
+                return Err(format!("unknown option: {arg}"));
+            }
+            _ => {
+                consume_positional(a, &mut db_arg, &mut script_parts);
+            }
+        }
+        i += 1;
+    }
+
+    let db_arg = db_arg.unwrap_or_else(|| ":memory:".to_string());
+    let mut script = script_parts.join(";\n");
+    // Treat stdin as additional script text when no inline SQL was provided.
+    if script.trim().is_empty()
+        && let Some(input) = stdin
+        && !input.is_empty()
+    {
+        script = input.to_string();
+    }
+    Ok(ParsedArgs {
+        db_arg,
+        script,
+        output,
+        backend,
+    })
+}
+
+fn next_value(args: &[String], i: &mut usize, flag: &str) -> std::result::Result<String, String> {
+    *i += 1;
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| format!("option {flag} requires an argument"))
+}
+
+fn consume_positional(arg: &str, db: &mut Option<String>, script: &mut Vec<String>) {
+    if db.is_none() {
+        *db = Some(arg.to_string());
+    } else {
+        script.push(arg.to_string());
+    }
+}
+
+fn decode_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+        {
+            chars.next();
+            match next {
+                't' => out.push('\t'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                '0' => out.push('\0'),
+                '\\' => out.push('\\'),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Open a fresh engine for a *file-backed* database, reading the current
+/// VFS bytes for the Memory backend or constructing a `BashkitVfsIO` for
+/// the VFS backend. Called only on cache miss; once cached, the engine
+/// is reused across invocations.
+async fn open_file_engine(
+    backend: SqliteBackend,
+    path: &Path,
+    fs: &Arc<dyn FileSystem>,
+    limits: &SqliteLimits,
+    execution_budget: Option<crate::limits::ExecutionBudget>,
+) -> std::result::Result<SqliteEngine, String> {
+    match backend {
+        SqliteBackend::Memory => {
+            let initial = match fs.read_file(path).await {
+                Ok(bytes) => {
+                    if let Some(budget) = &execution_budget {
+                        budget
+                            .consume_input(bytes.len())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    if bytes.len() > limits.max_db_bytes {
+                        return Err(format!(
+                            "database file too large ({} bytes; limit {})",
+                            bytes.len(),
+                            limits.max_db_bytes
+                        ));
+                    }
+                    Some(bytes)
+                }
+                Err(_) => None,
+            };
+            SqliteEngine::open_memory(initial.as_deref())
+        }
+        SqliteBackend::Vfs => {
+            static VFS_OPEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+            let handle = vfs_io::current_handle_or_default();
+            // Security: use a unique Turso-internal path so dropped engines cannot
+            // be resurrected from Turso's process-wide database registry after
+            // Bashkit snapshot restore. The IO maps this path back to `path`.
+            let io_path = format!(
+                ":memory:bashkit-vfs-{}",
+                VFS_OPEN_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+            let io = vfs_io::BashkitVfsIO::new_with_cap_and_path_alias(
+                fs.clone(),
+                handle,
+                limits.max_db_bytes,
+                io_path.clone(),
+                path.to_path_buf(),
+            );
+            SqliteEngine::open_vfs(io, &io_path)
+        }
+    }
+}
+
+/// Hard cap on `.read` nesting depth. A self-referential script
+/// (e.g. `echo '.read /tmp/loop.sql' > /tmp/loop.sql`) would otherwise blow
+/// the stack; we bound it well under typical thread stack sizes.
+const MAX_DOT_READ_DEPTH: usize = 16;
+
+#[allow(clippy::too_many_arguments)]
+async fn run_statements(
+    engine: &SqliteEngine,
+    stmts: Vec<Stmt>,
+    fs: &Arc<dyn FileSystem>,
+    cwd: &Path,
+    opts: &mut OutputOpts,
+    stdout: &mut String,
+    limits: &SqliteLimits,
+    deadline: engine::Deadline,
+    execution_budget: Option<crate::limits::ExecutionBudget>,
+    depth: usize,
+) -> std::result::Result<(), String> {
+    if depth > MAX_DOT_READ_DEPTH {
+        return Err(format!(
+            ".read nesting too deep (limit {MAX_DOT_READ_DEPTH})"
+        ));
+    }
+    for stmt in stmts {
+        if deadline.expired() {
+            return Err("query timed out".to_string());
+        }
+        match stmt {
+            Stmt::Sql(sql) => {
+                check_sql_policy(&sql, limits)?;
+                let outcome = engine
+                    .execute(
+                        &sql,
+                        deadline,
+                        query_limits(limits, execution_budget.clone()),
+                    )
+                    .map_err(|e| sanitize(&e))?;
+                let rendered = render(&outcome.columns, &outcome.rows, opts);
+                push_stdout_bounded(stdout, &rendered, limits.max_output_bytes)?;
+            }
+            Stmt::Dot(line) => {
+                // Pass the *remaining* output budget so .dump can enforce it
+                // cumulatively during construction (DeepSec #1869).
+                let remaining = limits.max_output_bytes.saturating_sub(stdout.len());
+                let result = dot_commands::dispatch(
+                    &line,
+                    engine,
+                    opts,
+                    deadline,
+                    query_limits(limits, execution_budget.clone()),
+                    remaining,
+                );
+                match result {
+                    Ok(DotOutcome::Stdout(s)) => {
+                        push_stdout_bounded(stdout, &s, limits.max_output_bytes)?;
+                    }
+                    Ok(DotOutcome::Configured) => {}
+                    Ok(DotOutcome::Quit) => return Ok(()),
+                    Ok(DotOutcome::Read(p)) => {
+                        let abs = if p.is_absolute() { p } else { cwd.join(&p) };
+                        let bytes = fs
+                            .read_file(&abs)
+                            .await
+                            .map_err(|e| format!("cannot read {}: {e}", abs.display()))?;
+                        if let Some(budget) = &execution_budget {
+                            budget
+                                .consume_input(bytes.len())
+                                .map_err(|e| e.to_string())?;
+                        }
+                        let nested = String::from_utf8(bytes)
+                            .map_err(|_| format!("{} is not valid UTF-8", abs.display()))?;
+                        let nested_stmts = parser::split(&nested);
+                        // Recurse via Box::pin to keep the future Send + size-bounded.
+                        Box::pin(run_statements(
+                            engine,
+                            nested_stmts,
+                            fs,
+                            cwd,
+                            opts,
+                            stdout,
+                            limits,
+                            deadline,
+                            execution_budget.clone(),
+                            depth + 1,
+                        ))
+                        .await?;
+                    }
+                    Err(DotError::BadCommand(c)) => {
+                        return Err(format!("unknown dot-command: .{c}"));
+                    }
+                    Err(e) => {
+                        return Err(format!("{e}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject SQL whose leading keyword or PRAGMA name is on the policy block
+/// list. Returning `Err(reason)` aborts the run and surfaces `reason`
+/// straight to the user.
+///
+/// Decisions made here:
+///
+/// * `ATTACH` / `DETACH` are unconditionally rejected. Cross-database
+///   access would let scripts read/write VFS paths the operator did not
+///   stage, and turso's ATTACH path interacts with the registry in ways
+///   the `:memory:bashkit-N` isolation does not cover.
+/// * `VACUUM` (with or without `INTO`) is unconditionally rejected.
+///   `VACUUM INTO` opens the destination via turso's `PlatformIO`, which
+///   writes to the host filesystem and bypasses both `MemoryIO` and
+///   `BashkitVfsIO`. Plain `VACUUM` is denied for symmetry — there is no
+///   sandbox-safe way to express it today.
+/// * `PRAGMA <name>` is rejected when `<name>` (case-insensitive) is in
+///   `limits.pragma_deny`. Defaults are listed in [`DEFAULT_PRAGMA_DENY`].
+fn query_limits(
+    limits: &SqliteLimits,
+    execution_budget: Option<crate::limits::ExecutionBudget>,
+) -> QueryLimits {
+    QueryLimits {
+        max_rows: limits.max_rows_per_query,
+        max_value_bytes: limits.max_value_bytes,
+        max_result_bytes: limits.max_result_bytes,
+        execution_budget,
+    }
+}
+
+fn push_stdout_bounded(
+    stdout: &mut String,
+    chunk: &str,
+    max: usize,
+) -> std::result::Result<(), String> {
+    let next = stdout.len().saturating_add(chunk.len());
+    if next > max {
+        return Err(format!("sqlite output exceeds byte cap ({next} > {max})"));
+    }
+    stdout.push_str(chunk);
+    Ok(())
+}
+
+fn check_sql_policy(sql: &str, limits: &SqliteLimits) -> std::result::Result<(), String> {
+    match parser::leading_keyword(sql).as_deref() {
+        Some("ATTACH") | Some("DETACH") => {
+            return Err("ATTACH/DETACH is not supported in the bashkit sandbox; \
+                 cross-database access bypasses VFS isolation"
+                .to_string());
+        }
+        Some("VACUUM") => {
+            return Err("VACUUM is not supported in the bashkit sandbox; \
+                 VACUUM INTO would write to the host filesystem outside the VFS"
+                .to_string());
+        }
+        _ => {}
+    }
+    if let Some(name) = parser::pragma_name(sql)
+        && limits.pragma_deny.iter().any(|denied| denied == &name)
+    {
+        return Err(format!(
+            "PRAGMA {name} is denied by SqliteLimits::pragma_deny"
+        ));
+    }
+    Ok(())
+}
+
+/// Strip turso's internal location pointers from a message before showing it
+/// to the user (defence-in-depth; the upstream messages occasionally include
+/// crate-relative paths and pid info on assertion failures).
+fn sanitize(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for line in msg.lines() {
+        // Drop trailing `at <path>:<line>:<col>` annotations that some
+        // libraries append. Conservative: keep everything up to ` at /`.
+        let cleaned = match line.find(" at /") {
+            Some(idx) => &line[..idx],
+            None => line,
+        };
+        out.push_str(cleaned);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+const HELP_TEXT: &str = concat!(
+    "usage: sqlite [OPTIONS] DB [SQL ...]\n",
+    "       sqlite [OPTIONS] :memory: [SQL ...]\n",
+    "Options:\n",
+    "  -header, --header        Include column headers\n",
+    "  -noheader, --noheader    Suppress column headers (default)\n",
+    "  -csv, --csv              Output mode: CSV\n",
+    "  -tabs, --tabs            Output mode: tabs\n",
+    "  -line, --line            Output mode: name=value lines\n",
+    "  -list, --list            Output mode: separator-joined (default)\n",
+    "  -box, --box              Output mode: ASCII box table\n",
+    "  -column, --column        Output mode: column-aligned\n",
+    "  -json, --json            Output mode: JSON array of objects\n",
+    "  -markdown, --markdown    Output mode: Markdown table\n",
+    "  -separator SEP           Field separator (e.g. '|', ',', '\\t')\n",
+    "  -nullvalue STR           Placeholder for NULL\n",
+    "  -cmd SQL                 Run extra SQL before positional script\n",
+    "  -backend memory|vfs      Pick the IO backend (default: memory)\n",
+    "  --help                   Show this message\n",
+    "  --version                Print engine version\n",
+    "Dot-commands: .help .quit .exit .tables .schema .indexes\n",
+    "              .headers .mode .separator .nullvalue\n",
+    "              .dump .read PATH\n",
+);

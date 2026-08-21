@@ -1,0 +1,257 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "bashkit",
+# ]
+# ///
+"""Basic usage of the Bash interface.
+
+Demonstrates core Bash features: command execution, pipelines, variables,
+loops, live output callbacks, virtual filesystem persistence, snapshot/restore,
+and resource limits.
+
+Run:
+    uv run crates/bashkit-python/examples/bash_basics.py
+
+uv automatically installs bashkit from PyPI (pre-built wheels, no Rust needed).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+
+from bashkit import Bash, BuiltinContext
+
+
+def demo_sync():
+    """Synchronous API basics."""
+    print("=== Sync API ===\n")
+
+    bash = Bash()
+
+    # Simple command
+    r = bash.execute_sync("echo 'Hello from Bash!'")
+    print(f"echo: {r.stdout.strip()}")
+    assert r.success
+
+    # Pipeline
+    r = bash.execute_sync("echo -e 'banana\\napple\\ncherry' | sort")
+    print(f"sort: {r.stdout.strip()}")
+    assert r.stdout.strip() == "apple\nbanana\ncherry"
+
+    # Variables persist across calls
+    bash.execute_sync("MY_VAR='persistent'")
+    r = bash.execute_sync("echo $MY_VAR")
+    print(f"var:  {r.stdout.strip()}")
+    assert r.stdout.strip() == "persistent"
+
+    # Virtual filesystem persists
+    bash.execute_sync("mkdir -p /tmp/demo && echo 'data' > /tmp/demo/file.txt")
+    r = bash.execute_sync("cat /tmp/demo/file.txt")
+    print(f"file: {r.stdout.strip()}")
+    assert r.stdout.strip() == "data"
+
+    # Loops and arithmetic
+    r = bash.execute_sync("""
+        total=0
+        for i in 1 2 3 4 5; do
+            total=$((total + i))
+        done
+        echo $total
+    """)
+    print(f"sum:  {r.stdout.strip()}")
+    assert r.stdout.strip() == "15"
+
+    # Error handling
+    r = bash.execute_sync("exit 42")
+    print(f"exit: code={r.exit_code}, success={r.success}")
+    assert r.exit_code == 42
+    assert not r.success
+
+    # Text processing pipeline
+    r = bash.execute_sync("""
+        cat << 'EOF' | grep -c 'error'
+info: all good
+error: disk full
+info: recovered
+error: timeout
+EOF
+    """)
+    print(f"grep: {r.stdout.strip()} errors found")
+    assert r.stdout.strip() == "2"
+
+    # Reset clears state
+    bash.reset()
+    r = bash.execute_sync("echo ${MY_VAR:-unset}")
+    print(f"reset: {r.stdout.strip()}")
+    assert r.stdout.strip() == "unset"
+
+    print()
+
+
+def demo_live_output():
+    """Stream stdout/stderr chunks while a command is running."""
+    print("=== Live Output ===\n")
+
+    bash = Bash()
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def on_output(stdout: str, stderr: str) -> None:
+        # Chunks are incremental, not guaranteed to align to lines.
+        if stdout:
+            stdout_chunks.append(stdout)
+            print(stdout, end="", flush=True)
+        if stderr:
+            stderr_chunks.append(stderr)
+            print(stderr, end="", file=sys.stderr, flush=True)
+
+    result = bash.execute_sync(
+        "for i in 1 2 3; do echo out-$i; echo err-$i >&2; done",
+        on_output=on_output,
+    )
+    assert result.success
+    assert "".join(stdout_chunks) == result.stdout
+    assert "".join(stderr_chunks) == result.stderr
+
+    print("streaming callback output matched final ExecResult")
+    print()
+
+
+def demo_callback_builtins():
+    """Register Python callbacks as persistent bash builtins."""
+    print("=== Callback Builtins ===\n")
+
+    def order_cli(ctx: BuiltinContext) -> str:
+        help_str = f"usage: {ctx.name} [-h] {{get}} ...\n"
+        if not ctx.argv or ctx.argv[0] in {"help", "--help"}:
+            return help_str
+        if ctx.argv[0] == "get" and len(ctx.argv) >= 2:
+            return json.dumps({"id": ctx.argv[1], "status": "shipped", "items": ["widget"]}) + "\n"
+        return help_str
+
+    bash = Bash(custom_builtins={"order-cli": order_cli})
+
+    bash.execute_sync("mkdir -p /scratch && order-cli get 42 > /scratch/order.json")
+    r = bash.execute_sync("cat /scratch/order.json | jq -r '.items[]'")
+    print(f"item: {r.stdout.strip()}")
+    assert r.stdout.strip() == "widget"
+
+    bash.reset()
+    r = bash.execute_sync("order-cli get 7 | jq -r '.status'")
+    print(f"reset: {r.stdout.strip()}")
+    assert r.stdout.strip() == "shipped"
+
+    r = bash.execute_sync("order-cli --help")
+    print(r.stdout.strip())
+    assert r.stdout.strip() == "usage: order-cli [-h] {get} ..."
+
+    print()
+
+
+def demo_snapshot_restore():
+    """Snapshot and restore interpreter state."""
+    print("=== Snapshot / Restore ===\n")
+
+    bash = Bash()
+    bash.execute_sync("export BUILD_ID=42; mkdir -p /workspace && cd /workspace && echo ready > state.txt")
+
+    snapshot = bash.snapshot()
+    print(f"snapshot: captured {len(snapshot)} bytes")
+    assert snapshot
+
+    # Restore shell state into a freshly configured instance.
+    restored = Bash.from_snapshot(snapshot, username="agent")
+    assert restored.execute_sync("whoami").stdout.strip() == "agent"
+    assert restored.execute_sync("echo $BUILD_ID").stdout.strip() == "42"
+    assert restored.execute_sync("pwd").stdout.strip() == "/workspace"
+    assert restored.execute_sync("cat /workspace/state.txt").stdout.strip() == "ready"
+
+    # Reset and restore also works on an existing instance.
+    restored.reset()
+    restored.restore_snapshot(snapshot)
+    print(f"restore:  {restored.execute_sync('echo $BUILD_ID').stdout.strip()}")
+    assert restored.execute_sync("echo $BUILD_ID").stdout.strip() == "42"
+
+    print()
+
+
+async def demo_async():
+    """Async API basics."""
+    print("=== Async API ===\n")
+
+    bash = Bash()
+
+    # Async execution
+    r = await bash.execute("echo 'async hello'")
+    print(f"async: {r.stdout.strip()}")
+    assert r.success
+
+    # Build a JSON report with jq
+    await bash.execute("""
+        cat > /tmp/users.json << 'EOF'
+[
+  {"name": "Alice", "role": "admin"},
+  {"name": "Bob", "role": "user"},
+  {"name": "Carol", "role": "admin"}
+]
+EOF
+    """)
+    r = await bash.execute("cat /tmp/users.json | jq '[.[] | select(.role == \"admin\")] | length'")
+    print(f"admins: {r.stdout.strip()}")
+    assert r.stdout.strip() == "2"
+
+    # ExecResult as dict
+    r = await bash.execute("echo ok")
+    d = r.to_dict()
+    print(f"dict: stdout={d['stdout'].strip()!r}, exit_code={d['exit_code']}")
+    assert d["exit_code"] == 0
+
+    print()
+
+
+def demo_config():
+    """Custom configuration."""
+    print("=== Configuration ===\n")
+
+    bash = Bash(username="agent", hostname="sandbox")
+    r = bash.execute_sync("whoami")
+    print(f"whoami:   {r.stdout.strip()}")
+    assert r.stdout.strip() == "agent"
+
+    r = bash.execute_sync("hostname")
+    print(f"hostname: {r.stdout.strip()}")
+    assert r.stdout.strip() == "sandbox"
+
+    # Starting directory and environment — set directly instead of running a
+    # leading `cd`/`export`.
+    configured = Bash(cwd="/home/agent", env={"PROJECT": "bashkit"})
+    r = configured.execute_sync('echo "$PWD in $PROJECT"')
+    print(f"cwd/env:  {r.stdout.strip()}")
+    assert r.stdout.strip() == "/home/agent in bashkit"
+
+    # Resource limits
+    limited = Bash(max_loop_iterations=50)
+    r = limited.execute_sync("i=0; while true; do i=$((i+1)); done; echo $i")
+    print(f"limited:  stopped (exit_code={r.exit_code})")
+    assert r.exit_code != 0 or int(r.stdout.strip() or "0") <= 100
+
+    print()
+
+
+def main():
+    print("Bashkit — Bash interface examples\n")
+    demo_sync()
+    demo_live_output()
+    demo_callback_builtins()
+    demo_snapshot_restore()
+    asyncio.run(demo_async())
+    demo_config()
+    print("All examples passed.")
+
+
+if __name__ == "__main__":
+    main()

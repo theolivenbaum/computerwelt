@@ -1,0 +1,36 @@
+<Project>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsNotAsErrors>NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CA1848;CA2007</NoWarn>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Authors>theolivenbaum</Authors>
+    <Company>Computerwelt</Company>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/theolivenbaum/computerwelt</RepositoryUrl>
+    <Deterministic>true</Deterministic>
+    <PackageIcon>logo.png</PackageIcon>
+  </PropertyGroup>
+
+  <!-- One logo for every package, and for the icon the executables embed. -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <None Include="$(MSBuildThisFileDirectory)logo.png" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(OutputType)' == 'Exe'">
+    <ApplicationIcon>$(MSBuildThisFileDirectory)logo.ico</ApplicationIcon>
+  </PropertyGroup>
+
+</Project>

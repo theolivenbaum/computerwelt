@@ -1,0 +1,7058 @@
+//! Bashkit Python package
+//!
+//! Primary interface: `Bash` — the core interpreter with virtual filesystem.
+//! Convenience wrapper: `BashTool` — adds contract metadata (`description`,
+//! `help`, `system_prompt`, JSON schemas) on top of the core interpreter.
+//! Orchestration: `ScriptedTool` — composes Python callbacks as bash builtins.
+
+// The WebAssembly (Pyodide/Emscripten) build is a reduced-feature variant: the
+// async `execute()` family, network/credential config, host-FS mounts, the capsule
+// interop bridge, sqlite, and external_handler are all native-only (they need
+// threads, sockets, or host FS that Pyodide lacks — see knowledge/runtimes/emscripten-wheels.md).
+// That leaves a handful of imports and helper functions referenced only from the
+// native-gated code paths; silence the resulting dead-code/unused-import lints on
+// wasm rather than scattering per-item cfgs through shared conversion helpers.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
+// interop (capsule FS handoff), realfs (host mounts) and the credential-injection
+// network config require threads / host FS / sockets that wasm32-unknown-emscripten
+// (Pyodide) does not provide — see knowledge/runtimes/emscripten-wheels.md. They are native-only.
+#[cfg(not(target_arch = "wasm32"))]
+use bashkit::interop::fs::{BashkitFsAbiOwnedHandleV1, export_filesystem, import_owned_filesystem};
+use bashkit::tool::VERSION;
+use bashkit::{
+    Bash, BashTool as RustBashTool, Builtin, BuiltinContext, BuiltinRegistry,
+    DirEntry as FsDirEntry, ExcType, ExecResult as RustExecResult, ExecutionExtensions,
+    ExecutionLimits, ExtFunctionResult, FileSystem, FileSystemExt, FileType as FsFileType,
+    FsLimits, InMemoryFs, Metadata as FsMetadata, MontyException, MontyObject, NetworkAllowlist,
+    OutputCallback as RustOutputCallback, OverlayFs, PosixFs, PythonExternalFnHandler,
+    PythonLimits, ScriptedTool as RustScriptedTool, ShellStateView as RustShellStateView,
+    SnapshotOptions as RustSnapshotOptions, Tool, ToolArgs, ToolDef, ToolRequest, async_trait,
+};
+
+/// Typed named execution-policy selector for Python constructors.
+#[pyclass(name = "ExecutionProfile", eq, eq_int, from_py_object)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum PyExecutionProfile {
+    Hardened,
+    #[default]
+    Standard,
+    Interactive,
+}
+
+impl PyExecutionProfile {
+    fn core(self) -> bashkit::ExecutionProfile {
+        let name = match self {
+            Self::Hardened => bashkit::ExecutionProfileName::Hardened,
+            Self::Standard => bashkit::ExecutionProfileName::Standard,
+            Self::Interactive => bashkit::ExecutionProfileName::Interactive,
+        };
+        bashkit::ExecutionProfile::named(name)
+    }
+}
+use bashkit::{
+    CapabilityFingerprint as RustCapabilityFingerprint, CheckoutPolicy as RustCheckoutPolicy,
+    CommitOptions as RustCommitOptions, ObjectId as RustObjectId,
+    SnapshotGraph as RustSnapshotGraph,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use bashkit::{Credential, RealFs, RealFsMode};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{
+    PyBytes, PyCapsule, PyCapsuleMethods, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyModule,
+    PySet, PyString, PyTuple,
+};
+// pyo3-async-runtimes bridges Rust futures to a Python asyncio loop; it hard-pulls
+// multi-threaded tokio + mio sockets, which do not build on wasm. The async
+// `execute()` family and caller-loop callback scheduling are therefore native-only;
+// wasm exposes the blocking `execute_sync()` API. See knowledge/runtimes/emscripten-wheels.md.
+#[cfg(not(target_arch = "wasm32"))]
+use pyo3_async_runtimes::TaskLocals;
+#[cfg(not(target_arch = "wasm32"))]
+use pyo3_async_runtimes::tokio::future_into_py;
+
+// `caller_loop_locals` is a captured asyncio-loop handle, only ever `Some` when an
+// async `execute()` ran (native). On wasm there is no such loop, so the field is
+// always `None`; aliasing the type to the uninhabited `Infallible` lets the shared
+// session structs compile while making the caller-loop branches statically dead.
+#[cfg(not(target_arch = "wasm32"))]
+type CallerLoopLocals = TaskLocals;
+#[cfg(target_arch = "wasm32")]
+type CallerLoopLocals = std::convert::Infallible;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::{Mutex, oneshot};
+
+// ============================================================================
+// JSON <-> Python helpers
+// ============================================================================
+
+/// Convert serde_json::Value → Py<PyAny>
+const MAX_NESTING_DEPTH: usize = 64;
+const EXTERNAL_HANDLER_REENTRY_ERROR: &str = "external_handler cannot re-enter the same Bash instance; use handler inputs or another Bash instance for live access";
+const FILESYSTEM_CAPSULE_NAME: &std::ffi::CStr = c"bashkit.FileSystem.v1";
+
+fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    json_to_py_inner(py, val, 0)
+}
+
+fn json_to_py_inner(py: Python<'_>, val: &serde_json::Value, depth: usize) -> PyResult<Py<PyAny>> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "JSON nesting depth exceeds maximum of 64",
+        ));
+    }
+    match val {
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.into_pyobject(py)?.into_any().unbind())
+            } else if let Some(f) = n.as_f64() {
+                Ok(f.into_pyobject(py)?.into_any().unbind())
+            } else {
+                Ok(py.None())
+            }
+        }
+        serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<Py<PyAny>> = arr
+                .iter()
+                .map(|v| json_to_py_inner(py, v, depth + 1))
+                .collect::<PyResult<_>>()?;
+            Ok(PyList::new(py, &items)?.into_any().unbind())
+        }
+        serde_json::Value::Object(map) => {
+            let dict = PyDict::new(py);
+            for (k, v) in map {
+                dict.set_item(k, json_to_py_inner(py, v, depth + 1)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+    }
+}
+
+/// Convert Py<PyAny> → serde_json::Value (for schema dicts)
+fn py_to_json(py: Python<'_>, obj: &Bound<'_, pyo3::PyAny>) -> PyResult<serde_json::Value> {
+    py_to_json_inner(py, obj, 0)
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn py_to_json_inner(
+    py: Python<'_>,
+    obj: &Bound<'_, pyo3::PyAny>,
+    depth: usize,
+) -> PyResult<serde_json::Value> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Python object nesting depth exceeds maximum of 64",
+        ));
+    }
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Ok(b) = obj.extract::<bool>() {
+        return Ok(serde_json::Value::Bool(b));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(serde_json::json!(i));
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Ok(serde_json::json!(f));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(serde_json::Value::String(s));
+    }
+    if let Ok(list) = obj.cast::<PyList>() {
+        let arr: Vec<serde_json::Value> = list
+            .iter()
+            .map(|item| py_to_json_inner(py, &item, depth + 1))
+            .collect::<PyResult<_>>()?;
+        return Ok(serde_json::Value::Array(arr));
+    }
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract()?;
+            map.insert(key, py_to_json_inner(py, &v, depth + 1)?);
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    // Fallback: str()
+    let s = obj.str()?.extract::<String>()?;
+    Ok(serde_json::Value::String(s))
+}
+
+/// Real filesystem mount config (internal, parsed from Python dicts).
+#[derive(Clone)]
+struct RealMountConfig {
+    host_path: String,
+    vfs_mount: Option<String>,
+    writable: bool,
+}
+
+enum PyFileMount {
+    Static { path: String, content: String },
+    Lazy { path: String, provider: Py<PyAny> },
+}
+
+const PY_FILE_PROVIDER_TYPE_ERROR_PREFIX: &str = "__bashkit_py_file_provider_type_error__:";
+
+// ============================================================================
+// Interpreter-exit boundary and deterministic teardown (TM-PY-030)
+//
+// Decision: teardown is fully deterministic while the interpreter is alive
+// (workers joined, asyncio loops closed, tokio blocking pool joined before
+// drop returns) and hands-off once the interpreter begins exiting. The
+// boundary is an `atexit` handler registered at module import: CPython runs
+// atexit callbacks at the very start of `Py_FinalizeEx`, strictly before the
+// finalization phase in which native threads may no longer attach (attaching
+// then aborts the process on CPython < 3.13 — see TM-PY-030 variant 3).
+// After the flag flips, threads skip Python entirely and the OS reclaims
+// resources at process exit; before it flips, the interpreter is fully alive
+// and every attach/join below is safe.
+// ============================================================================
+
+static INTERPRETER_AT_EXIT: AtomicBool = AtomicBool::new(false);
+
+fn interpreter_at_exit() -> bool {
+    INTERPRETER_AT_EXIT.load(Ordering::Acquire)
+}
+
+/// Registered with `atexit` at module import; not part of the public API.
+#[pyfunction]
+fn _mark_interpreter_at_exit() {
+    INTERPRETER_AT_EXIT.store(true, Ordering::Release);
+}
+
+/// Run `f` (a blocking join) without holding the GIL, so threads that must
+/// attach to finish can make progress. Detaches first when the calling
+/// thread is attached (the pyclass-dealloc case); runs `f` directly when it
+/// is not. Callers must check `interpreter_at_exit()` first: once the
+/// interpreter is exiting, joining threads that may touch Python is unsafe.
+///
+/// abi3: `PyGILState_Check` is not in the limited API, and pyo3 documents it as
+/// unreliable for this purpose (spurious `1` once sub-interpreter APIs have been
+/// used). Probe with the public `Python::try_attach` instead: it attaches only
+/// when the interpreter is live and attachable (not finalizing, not mid
+/// `__traverse__`) — reattaching reentrantly when the caller already holds the
+/// GIL (the pyclass-dealloc path) — and `py.detach` then releases the GIL for
+/// the join regardless. When it can't attach, the closure never runs and we
+/// join directly (a plain thread join touches no Python state).
+fn join_without_gil<F: FnOnce() + Send>(f: F) {
+    let mut f = Some(f);
+    let attached = Python::try_attach(|py| {
+        let f = f.take().expect("try_attach runs the closure at most once");
+        py.detach(f);
+    });
+    if attached.is_none() {
+        // Interpreter not attachable; run the join without touching Python.
+        if let Some(f) = f.take() {
+            f();
+        }
+    }
+}
+
+/// Pyclass-held handle to the shared per-instance tokio runtime.
+///
+/// THREAT[TM-PY-030]: while the interpreter is alive, dropping the last
+/// handle joins the runtime's blocking pool deterministically with the GIL
+/// released (`join_without_gil`), so in-flight callback tasks that must
+/// re-attach to finish can do so — restoring deterministic cleanup without
+/// the GIL deadlock that a blocking join while attached produced (a 6 h CI
+/// hang in `test_async_callback_execute_sync_honors_timeout`). Once the
+/// interpreter is exiting, joining is unsafe (threads attaching during
+/// finalization abort the process on CPython < 3.13), so the drop falls
+/// back to `shutdown_background()` and the OS reclaims resources. The same
+/// hands-off path is taken when the last clone drops *inside* a tokio context
+/// (e.g. a `Bash` dropped mid-`await execute()` finishes on a runtime worker
+/// thread, dropping its custom-builtin adapters' `PyRuntime` clones there): a
+/// blocking runtime drop in that context panics, so `shutdown_background()`
+/// is used instead.
+struct PyRuntime(Option<Arc<Runtime>>);
+
+impl Clone for PyRuntime {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl std::ops::Deref for PyRuntime {
+    type Target = Arc<Runtime>;
+    fn deref(&self) -> &Arc<Runtime> {
+        self.0.as_ref().expect("runtime taken only in Drop")
+    }
+}
+
+impl Drop for PyRuntime {
+    fn drop(&mut self) {
+        let Some(rt) = self.0.take().and_then(Arc::into_inner) else {
+            return;
+        };
+        // Two cases must avoid the blocking join:
+        //   - `interpreter_at_exit()`: joining threads that may re-attach is
+        //     unsafe during finalization (see the type doc).
+        //   - `Handle::try_current().is_ok()`: the last clone is dropping
+        //     *inside* a tokio context. This happens when a `Bash` is dropped
+        //     while `await execute()` is still in flight: the future holds the
+        //     last `Arc<Mutex<Bash>>` and, on completion, drops it on a
+        //     pyo3-async-runtimes worker thread — cascading into the
+        //     custom-builtin adapters that hold `PyRuntime` clones. Dropping a
+        //     runtime (a blocking join) from within another runtime panics
+        //     with "Cannot drop a runtime in a context where blocking is not
+        //     allowed", so hand off to `shutdown_background()` instead.
+        // The normal path — last clone dropping on a Python thread with no
+        // tokio context — keeps #2009's deterministic `join_without_gil`.
+        if interpreter_at_exit() || Handle::try_current().is_ok() {
+            rt.shutdown_background();
+        } else {
+            join_without_gil(move || drop(rt));
+        }
+    }
+}
+
+fn make_runtime() -> PyResult<PyRuntime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map(|rt| PyRuntime(Some(Arc::new(rt))))
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))
+}
+
+/// Parse `mounts` kwarg (list of dicts) into internal config.
+/// Each dict: { "host_path": str, "vfs_path"?: str, "writable"?: bool }.
+/// Internal storage for the Python `network=` kwarg.
+///
+/// Covers phases 1 and 2 of `feat(python): expose outbound HTTP/network config` (#1348):
+/// allowlist patterns, `allow_all`, `block_private_ips`, plus credential
+/// injection (`credentials`) and placeholder-mode credential injection
+/// (`credential_placeholders`). Callbacks and bot-auth land in later phases.
+#[derive(Debug, Clone, Default)]
+struct PyNetworkConfig {
+    allow: Vec<String>,
+    allow_all: bool,
+    block_private_ips: bool,
+    credentials: Vec<PyCredentialInjection>,
+    credential_placeholders: Vec<PyCredentialPlaceholder>,
+}
+
+#[derive(Debug, Clone)]
+struct PyCredentialInjection {
+    pattern: String,
+    spec: PyCredentialSpec,
+}
+
+#[derive(Debug, Clone)]
+struct PyCredentialPlaceholder {
+    env: String,
+    pattern: String,
+    spec: PyCredentialSpec,
+}
+
+#[derive(Debug, Clone)]
+enum PyCredentialSpec {
+    Bearer { token: String },
+    Header { name: String, value: String },
+    Headers { headers: Vec<(String, String)> },
+}
+
+// `Credential` is a core type gated behind `http_client`; the conversion is
+// native-only (network injection is unavailable on wasm — see parse_network_config).
+#[cfg(not(target_arch = "wasm32"))]
+impl PyCredentialSpec {
+    fn into_credential(self) -> Credential {
+        match self {
+            Self::Bearer { token } => Credential::bearer(token),
+            Self::Header { name, value } => Credential::header(name, value),
+            Self::Headers { headers } => Credential::headers(headers),
+        }
+    }
+}
+
+impl PyNetworkConfig {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn to_allowlist(&self) -> NetworkAllowlist {
+        let base = if self.allow_all {
+            NetworkAllowlist::allow_all()
+        } else {
+            NetworkAllowlist::new().allow_many(self.allow.iter().cloned())
+        };
+        base.block_private_ips(self.block_private_ips)
+    }
+
+    // `network()`, `credential()` and `credential_placeholder()` live behind the
+    // core `http_client` feature, which is off on wasm (no sockets in Pyodide).
+    // On wasm the whole network config is inert — `parse_network_config` rejects
+    // it up front (see that fn), so this is a native-only pass-through.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply(&self, mut builder: bashkit::BashBuilder) -> bashkit::BashBuilder {
+        builder = builder.network(self.to_allowlist());
+        for inj in &self.credentials {
+            builder = builder.credential(&inj.pattern, inj.spec.clone().into_credential());
+        }
+        for ph in &self.credential_placeholders {
+            builder = builder.credential_placeholder(
+                &ph.env,
+                &ph.pattern,
+                ph.spec.clone().into_credential(),
+            );
+        }
+        builder
+    }
+}
+
+/// Parse the `network=` kwarg into a `PyNetworkConfig`.
+///
+/// Returns `None` when omitted (network disabled). When provided, the dict
+/// must specify either `allow` (a list of URL patterns) or `allow_all=True`,
+/// not both. `block_private_ips` defaults to `True` to preserve the Rust
+/// default. Unknown keys raise `ValueError` so typos surface immediately.
+// The Pyodide/Emscripten build has no outbound HTTP client (no sockets in the
+// browser sandbox), so accepting a network allowlist would silently do nothing.
+// Fail loudly instead. See knowledge/runtimes/emscripten-wheels.md.
+#[cfg(target_arch = "wasm32")]
+fn parse_network_config(network: Option<&Bound<'_, PyDict>>) -> PyResult<Option<PyNetworkConfig>> {
+    if network.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "network configuration is not available in the WebAssembly (Pyodide) build: \
+             outbound HTTP is unsupported in this environment",
+        ));
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_network_config(network: Option<&Bound<'_, PyDict>>) -> PyResult<Option<PyNetworkConfig>> {
+    let Some(dict) = network else {
+        return Ok(None);
+    };
+
+    {
+        const KNOWN_KEYS: &[&str] = &[
+            "allow",
+            "allow_all",
+            "block_private_ips",
+            "credentials",
+            "credential_placeholders",
+        ];
+        for (key_obj, _) in dict.iter() {
+            let key: String = key_obj.extract()?;
+            if !KNOWN_KEYS.contains(&key.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "network: unknown key '{key}' (supported: allow, allow_all, block_private_ips, credentials, credential_placeholders)"
+                )));
+            }
+        }
+
+        let allow_all: bool = dict
+            .get_item("allow_all")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or(false);
+
+        let allow_obj = dict.get_item("allow")?;
+        if allow_all && allow_obj.is_some() {
+            return Err(PyValueError::new_err(
+                "network: 'allow' and 'allow_all' are mutually exclusive",
+            ));
+        }
+        if !allow_all && allow_obj.is_none() {
+            return Err(PyValueError::new_err(
+                "network: must provide 'allow' (list of URL patterns) or 'allow_all=True'",
+            ));
+        }
+
+        let mut allow: Vec<String> = Vec::new();
+        if let Some(value) = allow_obj {
+            let list = value.cast::<PyList>().map_err(|_| {
+                PyValueError::new_err("network['allow'] must be a list of URL pattern strings")
+            })?;
+            for item in list.iter() {
+                allow.push(item.extract()?);
+            }
+        }
+
+        let block_private_ips: bool = dict
+            .get_item("block_private_ips")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or(true);
+
+        let credentials = parse_credential_injections(dict.get_item("credentials")?.as_ref())?;
+        let credential_placeholders =
+            parse_credential_placeholders(dict.get_item("credential_placeholders")?.as_ref())?;
+
+        Ok(Some(PyNetworkConfig {
+            allow,
+            allow_all,
+            block_private_ips,
+            credentials,
+            credential_placeholders,
+        }))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_credential_injections(
+    value: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Vec<PyCredentialInjection>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let list = value.cast::<PyList>().map_err(|_| {
+        PyValueError::new_err("network['credentials'] must be a list of credential dicts")
+    })?;
+    let mut out = Vec::with_capacity(list.len());
+    for (idx, item) in list.iter().enumerate() {
+        let dict = item.cast::<PyDict>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "network['credentials'][{idx}] must be a dict with 'pattern' and 'kind'"
+            ))
+        })?;
+        let label = format!("credentials[{idx}]");
+        let pattern = require_string(dict, "pattern", &label)?;
+        let spec = parse_credential_spec(dict, &label, &["pattern"])?;
+        out.push(PyCredentialInjection { pattern, spec });
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_credential_placeholders(
+    value: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Vec<PyCredentialPlaceholder>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let list = value.cast::<PyList>().map_err(|_| {
+        PyValueError::new_err(
+            "network['credential_placeholders'] must be a list of credential placeholder dicts",
+        )
+    })?;
+    let mut out = Vec::with_capacity(list.len());
+    for (idx, item) in list.iter().enumerate() {
+        let dict = item.cast::<PyDict>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "network['credential_placeholders'][{idx}] must be a dict with 'env', 'pattern', and 'kind'"
+            ))
+        })?;
+        let label = format!("credential_placeholders[{idx}]");
+        let env = require_string(dict, "env", &label)?;
+        if env.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "network['{label}']['env'] must be a non-empty environment variable name"
+            )));
+        }
+        let pattern = require_string(dict, "pattern", &label)?;
+        let spec = parse_credential_spec(dict, &label, &["env", "pattern"])?;
+        out.push(PyCredentialPlaceholder { env, pattern, spec });
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn require_string(dict: &Bound<'_, PyDict>, key: &str, label: &str) -> PyResult<String> {
+    let value = dict.get_item(key)?.ok_or_else(|| {
+        PyValueError::new_err(format!("network['{label}'] missing required '{key}' key"))
+    })?;
+    value
+        .extract::<String>()
+        .map_err(|_| PyValueError::new_err(format!("network['{label}']['{key}'] must be a string")))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_credential_spec(
+    dict: &Bound<'_, PyDict>,
+    label: &str,
+    extra_keys: &[&str],
+) -> PyResult<PyCredentialSpec> {
+    let kind = require_string(dict, "kind", label)?;
+    let spec = match kind.as_str() {
+        "bearer" => {
+            let allowed = build_allowed_keys(&["kind", "token"], extra_keys);
+            reject_unknown_keys(dict, &allowed, label)?;
+            let token = require_string(dict, "token", label)?;
+            PyCredentialSpec::Bearer { token }
+        }
+        "header" => {
+            let allowed = build_allowed_keys(&["kind", "name", "value"], extra_keys);
+            reject_unknown_keys(dict, &allowed, label)?;
+            let name = require_string(dict, "name", label)?;
+            if name.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "network['{label}']['name'] must be a non-empty header name"
+                )));
+            }
+            let value = require_string(dict, "value", label)?;
+            PyCredentialSpec::Header { name, value }
+        }
+        "headers" => {
+            let allowed = build_allowed_keys(&["kind", "headers"], extra_keys);
+            reject_unknown_keys(dict, &allowed, label)?;
+            let raw = dict.get_item("headers")?.ok_or_else(|| {
+                PyValueError::new_err(format!("network['{label}'] missing required 'headers' key"))
+            })?;
+            let list = raw.cast::<PyList>().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "network['{label}']['headers'] must be a list of (name, value) pairs"
+                ))
+            })?;
+            if list.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "network['{label}']['headers'] must contain at least one (name, value) pair"
+                )));
+            }
+            let mut headers = Vec::with_capacity(list.len());
+            for (idx, item) in list.iter().enumerate() {
+                let pair = extract_string_pair(&item).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "network['{label}']['headers'][{idx}] must be a (name, value) pair of strings"
+                    ))
+                })?;
+                if pair.0.is_empty() {
+                    return Err(PyValueError::new_err(format!(
+                        "network['{label}']['headers'][{idx}] header name must be non-empty"
+                    )));
+                }
+                headers.push(pair);
+            }
+            PyCredentialSpec::Headers { headers }
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "network['{label}']['kind'] must be one of 'bearer', 'header', 'headers' (got '{other}')"
+            )));
+        }
+    };
+    Ok(spec)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn extract_string_pair(item: &Bound<'_, PyAny>) -> PyResult<(String, String)> {
+    if let Ok(tup) = item.cast::<PyTuple>() {
+        if tup.len() != 2 {
+            return Err(PyValueError::new_err("expected a (name, value) pair"));
+        }
+        return Ok((tup.get_item(0)?.extract()?, tup.get_item(1)?.extract()?));
+    }
+    if let Ok(list) = item.cast::<PyList>() {
+        if list.len() != 2 {
+            return Err(PyValueError::new_err("expected a [name, value] pair"));
+        }
+        return Ok((list.get_item(0)?.extract()?, list.get_item(1)?.extract()?));
+    }
+    Err(PyValueError::new_err("expected a 2-element pair"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_allowed_keys(base: &[&str], extra: &[&str]) -> Vec<String> {
+    let mut all: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+    all.extend(extra.iter().map(|s| s.to_string()));
+    all
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reject_unknown_keys(dict: &Bound<'_, PyDict>, allowed: &[String], label: &str) -> PyResult<()> {
+    for (key_obj, _) in dict.iter() {
+        let key: String = key_obj.extract()?;
+        if !allowed.iter().any(|k| k == &key) {
+            return Err(PyValueError::new_err(format!(
+                "network['{label}']: unknown key '{key}' (allowed: {})",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_mounts(mounts: Option<&Bound<'_, PyList>>) -> PyResult<Vec<RealMountConfig>> {
+    let Some(list) = mounts else {
+        return Ok(Vec::new());
+    };
+    // Host-directory mounts need the `realfs` backend, which the wasm build omits
+    // (Pyodide has no host filesystem). Reject loudly instead of silently dropping.
+    #[cfg(target_arch = "wasm32")]
+    if !list.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "host directory mounts are not available in the WebAssembly (Pyodide) build",
+        ));
+    }
+    let mut configs = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let dict = item
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("each mount must be a dict with 'host_path' key"))?;
+        let host_path: String = dict
+            .get_item("host_path")?
+            .ok_or_else(|| PyValueError::new_err("mount dict missing required 'host_path' key"))?
+            .extract()?;
+        let vfs_mount: Option<String> = dict
+            .get_item("vfs_path")?
+            .map(|v| v.extract())
+            .transpose()?;
+        let writable: bool = dict
+            .get_item("writable")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or(false);
+        configs.push(RealMountConfig {
+            host_path,
+            vfs_mount,
+            writable,
+        });
+    }
+    Ok(configs)
+}
+
+fn parse_files(files: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<PyFileMount>> {
+    let Some(dict) = files else {
+        return Ok(Vec::new());
+    };
+
+    let mut mounts = Vec::with_capacity(dict.len());
+    for (path_obj, value_obj) in dict.iter() {
+        let path: String = path_obj.extract()?;
+        if let Ok(content) = value_obj.extract::<String>() {
+            mounts.push(PyFileMount::Static { path, content });
+            continue;
+        }
+        if value_obj.is_callable() {
+            mounts.push(PyFileMount::Lazy {
+                path,
+                provider: value_obj.unbind(),
+            });
+            continue;
+        }
+        return Err(PyTypeError::new_err(format!(
+            "files['{path}'] must be str or callable returning str"
+        )));
+    }
+    Ok(mounts)
+}
+
+fn parse_custom_builtins(
+    py: Python<'_>,
+    custom_builtins: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Vec<PyCustomBuiltinEntry>> {
+    let Some(dict) = custom_builtins else {
+        return Ok(Vec::new());
+    };
+
+    let mut builtins = Vec::with_capacity(dict.len());
+    for (name_obj, callback_obj) in dict.iter() {
+        let name: String = name_obj.extract()?;
+        builtins.push(build_py_custom_builtin_entry(
+            py,
+            name,
+            callback_obj.unbind(),
+        )?);
+    }
+    Ok(builtins)
+}
+
+fn parse_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
+    if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+        return Err(PyValueError::new_err(
+            "timeout_seconds must be a finite number >= 0",
+        ));
+    }
+    Ok(Duration::from_secs_f64(timeout_seconds))
+}
+
+fn clone_file_mounts(py: Python<'_>, mounts: &[PyFileMount]) -> Vec<PyFileMount> {
+    mounts
+        .iter()
+        .map(|mount| match mount {
+            PyFileMount::Static { path, content } => PyFileMount::Static {
+                path: path.clone(),
+                content: content.clone(),
+            },
+            PyFileMount::Lazy { path, provider } => PyFileMount::Lazy {
+                path: path.clone(),
+                provider: provider.clone_ref(py),
+            },
+        })
+        .collect()
+}
+
+fn map_fs_error_to_py(err: impl ToString) -> PyErr {
+    let msg = err.to_string();
+    if let Some((_, rest)) = msg.split_once(PY_FILE_PROVIDER_TYPE_ERROR_PREFIX) {
+        PyTypeError::new_err(rest.to_string())
+    } else {
+        PyRuntimeError::new_err(msg)
+    }
+}
+
+// Lazy Python file providers need read-time Python exceptions, so the binding
+// keeps them in a small overlay wrapper instead of bashkit's byte-only lazy loader.
+struct PythonLazyFilesFs {
+    overlay: Arc<OverlayFs>,
+    providers: RwLock<std::collections::HashMap<PathBuf, Py<PyAny>>>,
+}
+
+impl PythonLazyFilesFs {
+    fn new(lower: Arc<dyn FileSystem>, files: &[PyFileMount]) -> Self {
+        let overlay = Arc::new(OverlayFs::new(lower));
+        let mut providers = std::collections::HashMap::new();
+
+        for file in files {
+            if let PyFileMount::Lazy { path, provider } = file {
+                overlay
+                    .upper()
+                    .add_lazy_file(path, 0, 0o644, Arc::new(Vec::<u8>::new));
+                providers.insert(
+                    bashkit::normalize_path(Path::new(path)),
+                    Python::attach(|py| provider.clone_ref(py)),
+                );
+            }
+        }
+
+        Self {
+            overlay,
+            providers: RwLock::new(providers),
+        }
+    }
+
+    fn normalize_path(path: &Path) -> PathBuf {
+        bashkit::normalize_path(path)
+    }
+
+    async fn materialize_if_needed(&self, path: &Path) -> bashkit::Result<()> {
+        let normalized = Self::normalize_path(path);
+        let provider = {
+            let mut providers = self.providers.write().unwrap();
+            providers.remove(&normalized)
+        };
+        let Some(provider) = provider else {
+            return Ok(());
+        };
+
+        // THREAT[TM-DOS-FFI]: Lazy Python file providers are host callbacks
+        // reachable from sandboxed reads; cap returned bytes before copying into
+        // Rust-owned VFS data, then keep the provider retryable if VFS write fails.
+        let loaded = Python::attach(|py| -> std::result::Result<Vec<u8>, String> {
+            let value = provider.bind(py).call0().map_err(|e| e.to_string())?;
+            let text = value.cast::<PyString>().map_err(|_| {
+                format!(
+                    "{PY_FILE_PROVIDER_TYPE_ERROR_PREFIX}file provider for '{}' must return str",
+                    normalized.display()
+                )
+            })?;
+            // `to_cow` (not `to_str`) for abi3: `PyString::to_str` needs the
+            // non-limited API on <3.10; `to_cow` is in the stable ABI and keeps
+            // the same UnicodeEncodeError on unpaired surrogates.
+            let text = text.to_cow().map_err(|e| e.to_string())?;
+            let content_size = text.len();
+            let max_file_size = FsLimits::default().max_file_size as usize;
+            if content_size > max_file_size {
+                return Err(format!(
+                    "file size limit exceeded: {} bytes > {} bytes",
+                    content_size, max_file_size
+                ));
+            }
+            Ok(text.as_bytes().to_vec())
+        });
+
+        let content = match loaded {
+            Ok(content) => content,
+            Err(message) => {
+                self.providers.write().unwrap().insert(normalized, provider);
+                return Err(std::io::Error::other(message).into());
+            }
+        };
+
+        if let Err(err) = self.overlay.write_file(&normalized, &content).await {
+            self.providers.write().unwrap().insert(normalized, provider);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn remove_provider_paths(&self, path: &Path, recursive: bool) {
+        let normalized = Self::normalize_path(path);
+        let mut providers = self.providers.write().unwrap();
+        providers.retain(|candidate, _| {
+            !(candidate == &normalized || (recursive && candidate.starts_with(&normalized)))
+        });
+    }
+
+    fn move_provider_paths(&self, from: &Path, to: &Path) {
+        let from = Self::normalize_path(from);
+        let to = Self::normalize_path(to);
+        let mut providers = self.providers.write().unwrap();
+        let mut moved = Vec::new();
+
+        for (path, provider) in &*providers {
+            if path == &from || path.starts_with(&from) {
+                let new_path = if path == &from {
+                    to.clone()
+                } else {
+                    to.join(path.strip_prefix(&from).unwrap())
+                };
+                moved.push((
+                    path.clone(),
+                    new_path,
+                    Python::attach(|py| provider.clone_ref(py)),
+                ));
+            }
+        }
+
+        for (old_path, _, _) in &moved {
+            providers.remove(old_path);
+        }
+        for (_, new_path, provider) in moved {
+            providers.insert(new_path, provider);
+        }
+    }
+}
+
+#[async_trait]
+impl FileSystemExt for PythonLazyFilesFs {}
+
+#[async_trait]
+impl FileSystem for PythonLazyFilesFs {
+    async fn read_file(&self, path: &Path) -> bashkit::Result<Vec<u8>> {
+        self.materialize_if_needed(path).await?;
+        self.overlay.read_file(path).await
+    }
+
+    async fn write_file(&self, path: &Path, content: &[u8]) -> bashkit::Result<()> {
+        self.remove_provider_paths(path, false);
+        self.overlay.write_file(path, content).await
+    }
+
+    async fn append_file(&self, path: &Path, content: &[u8]) -> bashkit::Result<()> {
+        self.materialize_if_needed(path).await?;
+        self.overlay.append_file(path, content).await
+    }
+
+    async fn mkdir(&self, path: &Path, recursive: bool) -> bashkit::Result<()> {
+        self.overlay.mkdir(path, recursive).await
+    }
+
+    async fn remove(&self, path: &Path, recursive: bool) -> bashkit::Result<()> {
+        self.remove_provider_paths(path, recursive);
+        self.overlay.remove(path, recursive).await
+    }
+
+    async fn stat(&self, path: &Path) -> bashkit::Result<FsMetadata> {
+        self.overlay.stat(path).await
+    }
+
+    async fn read_dir(&self, path: &Path) -> bashkit::Result<Vec<FsDirEntry>> {
+        self.overlay.read_dir(path).await
+    }
+
+    async fn exists(&self, path: &Path) -> bashkit::Result<bool> {
+        self.overlay.exists(path).await
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> bashkit::Result<()> {
+        self.overlay.rename(from, to).await?;
+        self.move_provider_paths(from, to);
+        Ok(())
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> bashkit::Result<()> {
+        self.materialize_if_needed(from).await?;
+        self.overlay.copy(from, to).await
+    }
+
+    async fn symlink(&self, target: &Path, link: &Path) -> bashkit::Result<()> {
+        self.overlay.symlink(target, link).await
+    }
+
+    async fn read_link(&self, path: &Path) -> bashkit::Result<PathBuf> {
+        self.overlay.read_link(path).await
+    }
+
+    async fn chmod(&self, path: &Path, mode: u32) -> bashkit::Result<()> {
+        self.overlay.chmod(path, mode).await
+    }
+}
+
+/// Apply `files` dict and `mounts` list to a builder.
+fn apply_fs_config(
+    mut builder: bashkit::BashBuilder,
+    files: &[PyFileMount],
+    real_mounts: &[RealMountConfig],
+) -> PyResult<bashkit::BashBuilder> {
+    let lazy_files: Vec<PyFileMount> = files
+        .iter()
+        .filter_map(|file| match file {
+            PyFileMount::Lazy { path, provider } => Some(PyFileMount::Lazy {
+                path: path.clone(),
+                provider: Python::attach(|py| provider.clone_ref(py)),
+            }),
+            PyFileMount::Static { .. } => None,
+        })
+        .collect();
+
+    if !lazy_files.is_empty() {
+        builder = builder.fs(Arc::new(PythonLazyFilesFs::new(
+            Arc::new(InMemoryFs::new()),
+            &lazy_files,
+        )));
+    }
+
+    for file in files {
+        if let PyFileMount::Static { path, content } = file {
+            builder = builder.mount_text(path, content.clone());
+        }
+    }
+
+    // Host-directory mounts require the `realfs` backend (tokio::fs), unavailable
+    // on wasm. `parse_mounts` already rejects a non-empty `mounts` list on wasm,
+    // so this loop is native-only. See knowledge/runtimes/emscripten-wheels.md.
+    #[cfg(not(target_arch = "wasm32"))]
+    for mount in real_mounts {
+        builder = match (mount.writable, &mount.vfs_mount) {
+            (false, None) => builder.mount_real_readonly(&mount.host_path),
+            (false, Some(vfs_mount)) => builder.mount_real_readonly_at(&mount.host_path, vfs_mount),
+            (true, None) => builder.mount_real_readwrite(&mount.host_path),
+            (true, Some(vfs_mount)) => builder.mount_real_readwrite_at(&mount.host_path, vfs_mount),
+        };
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = real_mounts;
+
+    Ok(builder)
+}
+
+fn system_time_to_unix_seconds(time: SystemTime) -> f64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn file_type_name(file_type: FsFileType) -> &'static str {
+    match file_type {
+        FsFileType::File => "file",
+        FsFileType::Directory => "directory",
+        FsFileType::Symlink => "symlink",
+        FsFileType::Fifo => "fifo",
+    }
+}
+
+fn metadata_to_pydict(py: Python<'_>, metadata: &FsMetadata) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("file_type", file_type_name(metadata.file_type))?;
+    dict.set_item("size", metadata.size)?;
+    dict.set_item("mode", metadata.mode)?;
+    dict.set_item("modified", system_time_to_unix_seconds(metadata.modified))?;
+    dict.set_item("created", system_time_to_unix_seconds(metadata.created))?;
+    Ok(dict.into_any().unbind())
+}
+
+fn dir_entry_to_pydict(py: Python<'_>, entry: &FsDirEntry) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &entry.name)?;
+    dict.set_item("metadata", metadata_to_pydict(py, &entry.metadata)?)?;
+    Ok(dict.into_any().unbind())
+}
+
+#[derive(Clone)]
+enum FileSystemHandle {
+    Static(Arc<dyn FileSystem>),
+    Live {
+        inner: Arc<Mutex<Bash>>,
+        external_handler_reentry_depth: Option<Arc<AtomicUsize>>,
+    },
+}
+
+impl FileSystemHandle {
+    /// A `Static` handle wraps an `Arc<dyn FileSystem>` directly, so resolving
+    /// it never touches the interpreter lock. Used to pick a re-entrancy-safe
+    /// dispatch path in `PyFileSystem::with_fs`.
+    fn is_static(&self) -> bool {
+        matches!(self, Self::Static(_))
+    }
+
+    async fn resolve(&self) -> PyResult<Arc<dyn FileSystem>> {
+        match self {
+            Self::Static(fs) => Ok(Arc::clone(fs)),
+            Self::Live {
+                inner,
+                external_handler_reentry_depth,
+            } => {
+                reject_external_handler_reentry_depth(external_handler_reentry_depth.as_ref())?;
+                let bash = inner.lock().await;
+                Ok(bash.fs())
+            }
+        }
+    }
+}
+
+fn reject_external_handler_reentry_depth(
+    external_handler_reentry_depth: Option<&Arc<AtomicUsize>>,
+) -> PyResult<()> {
+    if let Some(depth) = external_handler_reentry_depth
+        && depth.load(Ordering::Relaxed) > 0
+    {
+        return Err(PyRuntimeError::new_err(EXTERNAL_HANDLER_REENTRY_ERROR));
+    }
+    Ok(())
+}
+
+struct ExternalHandlerReentryScope {
+    depth: Arc<AtomicUsize>,
+}
+
+impl ExternalHandlerReentryScope {
+    fn enter(depth: Arc<AtomicUsize>) -> Self {
+        depth.fetch_add(1, Ordering::Relaxed);
+        Self { depth }
+    }
+}
+
+impl Drop for ExternalHandlerReentryScope {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn with_live_fs<T, F, Fut>(rt: &Arc<Runtime>, inner: &Arc<Mutex<Bash>>, f: F) -> PyResult<T>
+where
+    F: FnOnce(Arc<dyn FileSystem>) -> Fut,
+    Fut: Future<Output = PyResult<T>>,
+{
+    let inner = inner.clone();
+    rt.block_on(async move {
+        let fs = {
+            let bash = inner.lock().await;
+            bash.fs()
+        };
+        f(fs).await
+    })
+}
+
+fn read_text_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+) -> PyResult<String> {
+    with_live_fs(rt, inner, move |fs| async move {
+        let bytes = fs
+            .read_file(Path::new(&path))
+            .await
+            .map_err(map_fs_error_to_py)?;
+        String::from_utf8(bytes).map_err(|e| PyRuntimeError::new_err(format!("Invalid UTF-8: {e}")))
+    })
+}
+
+fn write_text_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+    content: String,
+) -> PyResult<()> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.write_file(Path::new(&path), content.as_bytes())
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn append_text_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+    content: String,
+) -> PyResult<()> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.append_file(Path::new(&path), content.as_bytes())
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn mkdir_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+    recursive: bool,
+) -> PyResult<()> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.mkdir(Path::new(&path), recursive)
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn remove_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+    recursive: bool,
+) -> PyResult<()> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.remove(Path::new(&path), recursive)
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn exists_via_live_fs(rt: &Arc<Runtime>, inner: &Arc<Mutex<Bash>>, path: String) -> PyResult<bool> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.exists(Path::new(&path))
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn stat_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+) -> PyResult<FsMetadata> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.stat(Path::new(&path)).await.map_err(map_fs_error_to_py)
+    })
+}
+
+fn chmod_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+    mode: u32,
+) -> PyResult<()> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.chmod(Path::new(&path), mode)
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn symlink_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    target: String,
+    link: String,
+) -> PyResult<()> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.symlink(Path::new(&target), Path::new(&link))
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn read_link_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+) -> PyResult<String> {
+    with_live_fs(rt, inner, move |fs| async move {
+        let target = fs
+            .read_link(Path::new(&path))
+            .await
+            .map_err(map_fs_error_to_py)?;
+        Ok(target.display().to_string())
+    })
+}
+
+fn read_dir_via_live_fs(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    path: String,
+) -> PyResult<Vec<FsDirEntry>> {
+    with_live_fs(rt, inner, move |fs| async move {
+        fs.read_dir(Path::new(&path))
+            .await
+            .map_err(map_fs_error_to_py)
+    })
+}
+
+fn is_safe_glob_pattern(pattern: &str) -> bool {
+    pattern.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(ch, '*' | '?' | '[' | ']' | '.' | '_' | '-' | '/' | ' ')
+    })
+}
+
+fn glob_match_path(value: &str, pattern: &str) -> bool {
+    let mut value_chars = value.chars().peekable();
+    let mut pattern_chars = pattern.chars().peekable();
+
+    loop {
+        match (pattern_chars.peek(), value_chars.peek()) {
+            (None, None) => return true,
+            (None, Some(_)) => return false,
+            (Some('*'), _) => {
+                pattern_chars.next();
+                if pattern_chars.peek().is_none() {
+                    return true;
+                }
+                while value_chars.peek().is_some() {
+                    let remaining_value: String = value_chars.clone().collect();
+                    let remaining_pattern: String = pattern_chars.clone().collect();
+                    if glob_match_path(&remaining_value, &remaining_pattern) {
+                        return true;
+                    }
+                    value_chars.next();
+                }
+                let remaining_pattern: String = pattern_chars.collect();
+                return glob_match_path("", &remaining_pattern);
+            }
+            (Some('?'), Some(_)) => {
+                pattern_chars.next();
+                value_chars.next();
+            }
+            (Some('?'), None) => return false,
+            (Some(p), Some(v)) => {
+                if *p == *v {
+                    pattern_chars.next();
+                    value_chars.next();
+                } else {
+                    return false;
+                }
+            }
+            (Some(_), None) => return false,
+        }
+    }
+}
+
+fn normalize_find_path(path: &str) -> String {
+    if let Some(stripped) = path.strip_prefix("//") {
+        format!("/{}", stripped)
+    } else {
+        path.to_string()
+    }
+}
+
+const GLOB_MAX_RESULTS: usize = 10_000;
+// Direct VFS glob runs outside Bash::exec, so it needs its own traversal budget
+// and timeout to bound no-match walks over large RealFs mounts.
+const GLOB_MAX_VISITED_ENTRIES: usize = 10_000;
+
+fn glob_search_root(pattern: &str) -> String {
+    let wildcard_idx = pattern.find(['*', '?', '[']);
+    let Some(idx) = wildcard_idx else {
+        return pattern.to_string();
+    };
+    let prefix = &pattern[..idx];
+    let Some(last_slash) = prefix.rfind('/') else {
+        return "/".to_string();
+    };
+    if last_slash == 0 {
+        "/".to_string()
+    } else {
+        prefix[..last_slash].to_string()
+    }
+}
+
+fn glob_timeout(timeout_seconds: Option<f64>) -> Duration {
+    timeout_seconds
+        .map(Duration::from_secs_f64)
+        .unwrap_or_else(|| ExecutionLimits::default().timeout)
+}
+
+fn glob_via_bash(
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    pattern: String,
+    timeout: Duration,
+) -> Vec<String> {
+    if !is_safe_glob_pattern(&pattern) {
+        return Vec::new();
+    }
+
+    let inner = inner.clone();
+    rt.block_on(async move {
+        let fs = {
+            let bash = inner.lock().await;
+            bash.fs()
+        };
+
+        tokio::time::timeout(timeout, async move {
+            let root = normalize_find_path(&glob_search_root(&pattern));
+            let root_path = Path::new(&root);
+            let mut matches = Vec::new();
+            let mut stack = vec![root.clone()];
+            let mut visited_dirs = HashSet::from([root.clone()]);
+            let mut visited_entries = 0usize;
+
+            // If the root resolves to a single file (no wildcards in pattern),
+            // just match against it and return. Otherwise fall through to walk
+            // the directory tree rooted at `root`.
+            if let Ok(metadata) = fs.stat(root_path).await
+                && metadata.file_type == FsFileType::File
+            {
+                if glob_match_path(&root, &pattern) {
+                    matches.push(root);
+                }
+                return matches;
+            }
+
+            while let Some(dir) = stack.pop() {
+                let entries = match fs.read_dir(Path::new(&dir)).await {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+
+                for entry in entries {
+                    visited_entries += 1;
+                    if visited_entries > GLOB_MAX_VISITED_ENTRIES {
+                        return matches;
+                    }
+
+                    let child = if dir == "/" {
+                        format!("/{}", entry.name)
+                    } else {
+                        format!("{}/{}", dir, entry.name)
+                    };
+
+                    match entry.metadata.file_type {
+                        FsFileType::Directory if visited_dirs.insert(child.clone()) => {
+                            stack.push(child);
+                        }
+                        FsFileType::File if glob_match_path(&child, &pattern) => {
+                            matches.push(child);
+                            if matches.len() >= GLOB_MAX_RESULTS {
+                                return matches;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            matches
+        })
+        .await
+        .unwrap_or_default()
+    })
+}
+
+// Decision: snapshot factories build with caller kwargs first, then restore
+// bytes into that configured instance so limits and identity settings survive.
+fn raise_snapshot_error<E: std::fmt::Display>(err: E) -> PyErr {
+    BashError::new_err(err.to_string())
+}
+
+fn snapshot_live_bash(
+    py: Python<'_>,
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    exclude_filesystem: bool,
+    exclude_functions: bool,
+) -> PyResult<Vec<u8>> {
+    let rt = rt.clone();
+    let inner = inner.clone();
+    py.detach(|| {
+        rt.block_on(async move {
+            let bash = inner.lock().await;
+            bash.snapshot_with_options(RustSnapshotOptions {
+                exclude_filesystem,
+                exclude_functions,
+            })
+            .map_err(raise_snapshot_error)
+        })
+    })
+}
+
+fn snapshot_live_bash_keyed(
+    py: Python<'_>,
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    key: Vec<u8>,
+    exclude_filesystem: bool,
+    exclude_functions: bool,
+) -> PyResult<Vec<u8>> {
+    let rt = rt.clone();
+    let inner = inner.clone();
+    py.detach(|| {
+        rt.block_on(async move {
+            let bash = inner.lock().await;
+            bash.snapshot_to_bytes_keyed_with_options(
+                &key,
+                RustSnapshotOptions {
+                    exclude_filesystem,
+                    exclude_functions,
+                },
+            )
+            .map_err(raise_snapshot_error)
+        })
+    })
+}
+
+fn restore_live_bash_with_env_overrides(
+    py: Python<'_>,
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    data: Vec<u8>,
+    env_overrides: &[(String, String)],
+) -> PyResult<()> {
+    let rt = rt.clone();
+    let inner = inner.clone();
+    let env_overrides = env_overrides.to_vec();
+    py.detach(|| {
+        rt.block_on(async move {
+            let mut bash = inner.lock().await;
+            bash.restore_snapshot(&data).map_err(raise_snapshot_error)?;
+            if env_overrides.is_empty() {
+                return Ok(());
+            }
+            let mut state = bash.shell_state();
+            for (key, value) in env_overrides {
+                state.env.insert(key, value);
+            }
+            bash.restore_shell_state(&state);
+            Ok(())
+        })
+    })
+}
+
+fn restore_live_bash_keyed_with_env_overrides(
+    py: Python<'_>,
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    data: Vec<u8>,
+    key: Vec<u8>,
+    env_overrides: &[(String, String)],
+) -> PyResult<()> {
+    let rt = rt.clone();
+    let inner = inner.clone();
+    let env_overrides = env_overrides.to_vec();
+    py.detach(|| {
+        rt.block_on(async move {
+            let mut bash = inner.lock().await;
+            bash.restore_snapshot_keyed(&data, &key)
+                .map_err(raise_snapshot_error)?;
+            if env_overrides.is_empty() {
+                return Ok(());
+            }
+            let mut state = bash.shell_state();
+            for (env_key, env_value) in env_overrides {
+                state.env.insert(env_key, env_value);
+            }
+            bash.restore_shell_state(&state);
+            Ok(())
+        })
+    })
+}
+
+// ============================================================================
+// Snapshot history: commits, forks, and the object graph
+// ============================================================================
+
+// Decision: the Python store is a plain `dict[str, bytes]` keyed by hex object
+// ID, not a custom class. Hosts persist these objects in their own database, so
+// the binding hands back exactly what a DB driver, JSON column, or blob store
+// already accepts. Conversion copies, which is the cost of not owning storage.
+
+/// Parse a hex object ID coming from Python.
+fn parse_object_id(value: &str) -> PyResult<RustObjectId> {
+    RustObjectId::from_hex(value)
+        .map_err(|e| PyValueError::new_err(format!("invalid snapshot object id: {e}")))
+}
+
+/// Convert a `dict[str, bytes]` object store into its Rust form.
+fn store_from_py(store: HashMap<String, Vec<u8>>) -> PyResult<HashMap<RustObjectId, Vec<u8>>> {
+    store
+        .into_iter()
+        .map(|(id, blob)| Ok((parse_object_id(&id)?, blob)))
+        .collect()
+}
+
+fn policy_from_py(policy: &str) -> PyResult<RustCheckoutPolicy> {
+    match policy.to_ascii_lowercase().as_str() {
+        "strict" => Ok(RustCheckoutPolicy::Strict),
+        "superset" => Ok(RustCheckoutPolicy::Superset),
+        "force" => Ok(RustCheckoutPolicy::Force),
+        other => Err(PyValueError::new_err(format!(
+            "unknown checkout policy {other:?}; expected 'strict', 'superset', or 'force'"
+        ))),
+    }
+}
+
+/// A commit plus the objects a host needs to persist.
+#[pyclass(name = "PackedCommit", module = "bashkit", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyPackedCommit {
+    id: String,
+    objects: HashMap<String, Vec<u8>>,
+    object_count: usize,
+    stored_bytes: usize,
+    self_contained: bool,
+    packed: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyPackedCommit {
+    /// Content address of this commit — the value to store per message.
+    #[getter]
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Objects to persist, as `{hex_id: bytes}`.
+    #[getter]
+    fn objects(&self) -> HashMap<String, Vec<u8>> {
+        self.objects.clone()
+    }
+
+    /// Number of new objects this commit emitted.
+    #[getter]
+    fn object_count(&self) -> usize {
+        self.object_count
+    }
+
+    /// Total encoded size of the new objects — what this commit costs the store.
+    #[getter]
+    fn stored_bytes(&self) -> usize {
+        self.stored_bytes
+    }
+
+    /// Whether this commit carries every object needed to restore it.
+    ///
+    /// False once `have=` has excluded anything.
+    #[getter]
+    fn is_self_contained(&self) -> bool {
+        self.self_contained
+    }
+
+    /// Serialize into one self-contained blob, like `snapshot()`.
+    ///
+    /// Raises if the commit is incremental — packing one would produce bytes
+    /// that cannot be restored.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        match &self.packed {
+            Some(bytes) => Ok(PyBytes::new(py, bytes)),
+            None => Err(BashError::new_err(
+                "cannot pack an incremental commit: it omits objects the store already holds",
+            )),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PackedCommit(id='{}', object_count={}, stored_bytes={})",
+            self.id, self.object_count, self.stored_bytes
+        )
+    }
+}
+
+/// What changed between two commits.
+#[pyclass(name = "SnapshotDiff", module = "bashkit", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PySnapshotDiff {
+    #[pyo3(get)]
+    files_added: Vec<String>,
+    #[pyo3(get)]
+    files_modified: Vec<String>,
+    #[pyo3(get)]
+    files_removed: Vec<String>,
+    #[pyo3(get)]
+    shell_changed: bool,
+}
+
+#[pymethods]
+impl PySnapshotDiff {
+    /// True when nothing changed.
+    fn is_empty(&self) -> bool {
+        self.files_added.is_empty()
+            && self.files_modified.is_empty()
+            && self.files_removed.is_empty()
+            && !self.shell_changed
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SnapshotDiff(added={}, modified={}, removed={}, shell_changed={})",
+            self.files_added.len(),
+            self.files_modified.len(),
+            self.files_removed.len(),
+            self.shell_changed
+        )
+    }
+}
+
+/// The environment that produced a commit.
+#[pyclass(
+    name = "CapabilityFingerprint",
+    module = "bashkit",
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyCapabilityFingerprint {
+    #[pyo3(get)]
+    bashkit_version: String,
+    #[pyo3(get)]
+    builtins: Vec<String>,
+    #[pyo3(get)]
+    features: Vec<String>,
+    #[pyo3(get)]
+    fs_backend: String,
+}
+
+#[pymethods]
+impl PyCapabilityFingerprint {
+    fn __repr__(&self) -> String {
+        format!(
+            "CapabilityFingerprint(bashkit_version='{}', builtins={}, features={:?}, fs_backend='{}')",
+            self.bashkit_version,
+            self.builtins.len(),
+            self.features,
+            self.fs_backend
+        )
+    }
+}
+
+impl From<RustCapabilityFingerprint> for PyCapabilityFingerprint {
+    fn from(caps: RustCapabilityFingerprint) -> Self {
+        Self {
+            bashkit_version: caps.bashkit_version,
+            builtins: caps.builtins,
+            features: caps.features,
+            fs_backend: caps.fs_backend,
+        }
+    }
+}
+
+/// Read-only operations over a snapshot object graph.
+///
+/// Every method takes the objects it needs, because bashkit never reaches into
+/// host storage. Methods walk only as far as the supplied store reaches.
+#[pyclass(name = "SnapshotGraph", module = "bashkit")]
+pub struct PySnapshotGraph;
+
+#[pymethods]
+impl PySnapshotGraph {
+    #[new]
+    fn new() -> PyResult<Self> {
+        Err(PyTypeError::new_err(
+            "SnapshotGraph is a namespace of static methods and cannot be instantiated",
+        ))
+    }
+
+    /// Commits `commit_id` descends from.
+    #[staticmethod]
+    fn parents(commit_id: &str, objects: HashMap<String, Vec<u8>>) -> PyResult<Vec<String>> {
+        let store = store_from_py(objects)?;
+        let parents = RustSnapshotGraph::parents(parse_object_id(commit_id)?, &store)
+            .map_err(raise_snapshot_error)?;
+        Ok(parents.iter().copied().map(RustObjectId::to_hex).collect())
+    }
+
+    /// Host metadata attached when the commit was made.
+    #[staticmethod]
+    fn meta(
+        commit_id: &str,
+        objects: HashMap<String, Vec<u8>>,
+    ) -> PyResult<HashMap<String, String>> {
+        let store = store_from_py(objects)?;
+        let meta = RustSnapshotGraph::meta(parse_object_id(commit_id)?, &store)
+            .map_err(raise_snapshot_error)?;
+        Ok(meta.into_iter().collect())
+    }
+
+    /// Capability fingerprint of the instance that produced this commit.
+    #[staticmethod]
+    fn capabilities(
+        commit_id: &str,
+        objects: HashMap<String, Vec<u8>>,
+    ) -> PyResult<PyCapabilityFingerprint> {
+        let store = store_from_py(objects)?;
+        let caps = RustSnapshotGraph::capabilities(parse_object_id(commit_id)?, &store)
+            .map_err(raise_snapshot_error)?;
+        Ok(caps.into())
+    }
+
+    /// Walk ancestry newest-first, stopping at `limit` or at the first commit
+    /// the store does not contain.
+    #[staticmethod]
+    #[pyo3(signature = (commit_id, objects, limit=100))]
+    fn ancestry(
+        commit_id: &str,
+        objects: HashMap<String, Vec<u8>>,
+        limit: usize,
+    ) -> PyResult<Vec<String>> {
+        let store = store_from_py(objects)?;
+        let walked = RustSnapshotGraph::ancestry(parse_object_id(commit_id)?, &store, limit)
+            .map_err(raise_snapshot_error)?;
+        Ok(walked.iter().copied().map(RustObjectId::to_hex).collect())
+    }
+
+    /// Object IDs needed to check out `commit_id` that `objects` lacks.
+    ///
+    /// Call repeatedly — fetching one wave reveals the next — until it returns
+    /// an empty list.
+    #[staticmethod]
+    fn plan_checkout(commit_id: &str, objects: HashMap<String, Vec<u8>>) -> PyResult<Vec<String>> {
+        let store = store_from_py(objects)?;
+        let need = RustSnapshotGraph::plan_checkout(parse_object_id(commit_id)?, &store)
+            .map_err(raise_snapshot_error)?;
+        Ok(need.iter().copied().map(RustObjectId::to_hex).collect())
+    }
+
+    /// Every object this commit reaches, for host-side garbage collection.
+    #[staticmethod]
+    fn reachable(commit_id: &str, objects: HashMap<String, Vec<u8>>) -> PyResult<Vec<String>> {
+        let store = store_from_py(objects)?;
+        let live = RustSnapshotGraph::reachable(parse_object_id(commit_id)?, &store)
+            .map_err(raise_snapshot_error)?;
+        Ok(live.iter().copied().map(RustObjectId::to_hex).collect())
+    }
+
+    /// Compare two commits.
+    #[staticmethod]
+    fn diff(
+        commit_a: &str,
+        commit_b: &str,
+        objects: HashMap<String, Vec<u8>>,
+    ) -> PyResult<PySnapshotDiff> {
+        let store = store_from_py(objects)?;
+        let diff = RustSnapshotGraph::diff(
+            parse_object_id(commit_a)?,
+            parse_object_id(commit_b)?,
+            &store,
+        )
+        .map_err(raise_snapshot_error)?;
+        Ok(PySnapshotDiff {
+            files_added: diff.files_added,
+            files_modified: diff.files_modified,
+            files_removed: diff.files_removed,
+            shell_changed: diff.shell_changed,
+        })
+    }
+}
+
+/// Build a commit from a live interpreter, off the GIL.
+#[allow(clippy::too_many_arguments)]
+fn commit_live_bash(
+    py: Python<'_>,
+    rt: &PyRuntime,
+    inner: &Arc<Mutex<Bash>>,
+    parents: Vec<String>,
+    meta: HashMap<String, String>,
+    have: Vec<String>,
+    exclude_filesystem: bool,
+    exclude_functions: bool,
+) -> PyResult<PyPackedCommit> {
+    let parent_ids: Vec<RustObjectId> = parents
+        .iter()
+        .map(|p| parse_object_id(p))
+        .collect::<PyResult<_>>()?;
+    let have_ids: Vec<RustObjectId> = have
+        .iter()
+        .map(|h| parse_object_id(h))
+        .collect::<PyResult<_>>()?;
+
+    let rt = rt.clone();
+    let inner = inner.clone();
+    py.detach(|| {
+        rt.block_on(async move {
+            let bash = inner.lock().await;
+            let mut options = RustCommitOptions::new()
+                .have(have_ids.iter())
+                .exclude_filesystem(exclude_filesystem)
+                .exclude_functions(exclude_functions);
+            for parent in parent_ids {
+                options = options.parent(parent);
+            }
+            for (key, value) in meta {
+                options = options.meta(key, value);
+            }
+
+            let packed = bash.commit(options).map_err(raise_snapshot_error)?;
+            let id = packed.id().to_hex();
+            let object_count = packed.object_count();
+            let stored_bytes = packed.stored_bytes();
+            let self_contained = packed.is_self_contained();
+            // Pack eagerly only when it can succeed, so `to_bytes()` stays
+            // infallible for the self-contained case.
+            let bytes = self_contained.then(|| packed.to_bytes()).transpose();
+            let bytes = bytes.map_err(raise_snapshot_error)?;
+            let objects = packed
+                .objects()
+                .map(|(oid, blob)| (oid.to_hex(), blob.to_vec()))
+                .collect();
+
+            Ok(PyPackedCommit {
+                id,
+                objects,
+                object_count,
+                stored_bytes,
+                self_contained,
+                packed: bytes,
+            })
+        })
+    })
+}
+
+/// Restore a commit into a live interpreter, off the GIL.
+fn checkout_live_bash(
+    py: Python<'_>,
+    rt: &PyRuntime,
+    inner: &Arc<Mutex<Bash>>,
+    commit_id: &str,
+    objects: HashMap<String, Vec<u8>>,
+    policy: &str,
+    env_overrides: &[(String, String)],
+) -> PyResult<()> {
+    let root = parse_object_id(commit_id)?;
+    let store = store_from_py(objects)?;
+    let policy = policy_from_py(policy)?;
+    let rt = rt.clone();
+    let inner = inner.clone();
+    let env_overrides = env_overrides.to_vec();
+    py.detach(|| {
+        rt.block_on(async move {
+            let mut bash = inner.lock().await;
+            bash.checkout(root, &store, policy)
+                .map_err(raise_snapshot_error)?;
+            if env_overrides.is_empty() {
+                return Ok(());
+            }
+            let mut state = bash.shell_state();
+            for (key, value) in env_overrides {
+                state.env.insert(key, value);
+            }
+            bash.restore_shell_state(&state);
+            Ok(())
+        })
+    })
+}
+
+fn placeholder_env_overrides(
+    state: &ShellState,
+    network_config: &Option<PyNetworkConfig>,
+) -> Vec<(String, String)> {
+    let Some(config) = network_config else {
+        return Vec::new();
+    };
+    config
+        .credential_placeholders
+        .iter()
+        .filter_map(|ph| {
+            state
+                .env
+                .get(&ph.env)
+                .map(|value| (ph.env.clone(), value.clone()))
+        })
+        .collect()
+}
+
+static MAPPING_PROXY_TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn mapping_proxy(py: Python<'_>, dict: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+    let mapping_proxy_type =
+        MAPPING_PROXY_TYPE.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+            Ok(PyModule::import(py, "types")?
+                .getattr("MappingProxyType")?
+                .unbind())
+        })?;
+    Ok(mapping_proxy_type.bind(py).call1((dict,))?.unbind())
+}
+
+fn readonly_string_map(py: Python<'_>, map: &HashMap<String, String>) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    for (key, value) in map {
+        dict.set_item(key, value)?;
+    }
+    mapping_proxy(py, dict)
+}
+
+fn readonly_indexed_arrays(
+    py: Python<'_>,
+    map: &HashMap<String, HashMap<usize, String>>,
+) -> PyResult<Py<PyAny>> {
+    let outer = PyDict::new(py);
+    for (name, values) in map {
+        let inner = PyDict::new(py);
+        for (index, value) in values {
+            inner.set_item(*index, value)?;
+        }
+        outer.set_item(name, mapping_proxy(py, inner)?)?;
+    }
+    mapping_proxy(py, outer)
+}
+
+fn readonly_assoc_arrays(
+    py: Python<'_>,
+    map: &HashMap<String, HashMap<String, String>>,
+) -> PyResult<Py<PyAny>> {
+    let outer = PyDict::new(py);
+    for (name, values) in map {
+        let inner = PyDict::new(py);
+        for (key, value) in values {
+            inner.set_item(key, value)?;
+        }
+        outer.set_item(name, mapping_proxy(py, inner)?)?;
+    }
+    mapping_proxy(py, outer)
+}
+
+fn capture_shell_state(
+    py: Python<'_>,
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+) -> PyResult<ShellState> {
+    let rt = rt.clone();
+    let inner = inner.clone();
+    py.detach(|| {
+        rt.block_on(async move {
+            let shell_state = {
+                let bash = inner.lock().await;
+                bash.shell_state_view()
+            };
+            Ok(ShellState::from(shell_state))
+        })
+    })
+}
+
+#[pyclass(name = "FileSystem")]
+struct PyFileSystem {
+    inner: FileSystemHandle,
+    rt: PyRuntime,
+}
+
+impl PyFileSystem {
+    fn from_static(inner: Arc<dyn FileSystem>, rt: PyRuntime) -> Self {
+        Self {
+            inner: FileSystemHandle::Static(inner),
+            rt,
+        }
+    }
+
+    fn from_live(inner: Arc<Mutex<Bash>>, rt: PyRuntime) -> Self {
+        Self {
+            inner: FileSystemHandle::Live {
+                inner,
+                external_handler_reentry_depth: None,
+            },
+            rt,
+        }
+    }
+
+    fn from_live_with_reentry_guard(
+        inner: Arc<Mutex<Bash>>,
+        rt: PyRuntime,
+        external_handler_reentry_depth: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            inner: FileSystemHandle::Live {
+                inner,
+                external_handler_reentry_depth: Some(external_handler_reentry_depth),
+            },
+            rt,
+        }
+    }
+
+    // The `Send` bounds are load-bearing for the worker-thread branch below
+    // (`std::thread::scope` moves `f`, its future, and the result `T` across the
+    // thread boundary). They are NOT an extra restriction in practice, so there
+    // is no non-`Send` fast path worth splitting out:
+    //   - `with_fs` is only ever called inside `py.detach(...)` (see every
+    //     caller), so the GIL is released and a closure physically cannot hold a
+    //     `Bound<'py>` / `Python<'py>` ref across the await — the canonical
+    //     source of a non-`Send` fs future.
+    //   - `FileSystem: FileSystemExt: Send + Sync` and the trait is
+    //     `#[async_trait]`, so every fs method already returns a `Send`-boxed
+    //     future and `Arc<dyn FileSystem>` is `Send + Sync`. Any closure that
+    //     just awaits fs ops (all of them do) satisfies `Fut: Send` for free.
+    // A separate non-`Send` `with_fs_local` would therefore have no caller today
+    // (dead code), and the runtime branch means a single method can't statically
+    // pick local-vs-send anyway. Keep one helper; the bound documents the real
+    // off-thread-dispatch invariant.
+    fn with_fs<T, F, Fut>(&self, f: F) -> PyResult<T>
+    where
+        F: FnOnce(Arc<dyn FileSystem>) -> Fut + Send,
+        Fut: Future<Output = PyResult<T>> + Send,
+        T: Send,
+    {
+        let inner = self.inner.clone();
+        // A `Static` handle (e.g. a custom builtin's `ctx.fs`) operates on a
+        // cloned `Arc<dyn FileSystem>` with no interpreter lock. When such a
+        // handle is used while a tokio runtime is already active on this thread
+        // — `execute_sync` drives the interpreter via `self.rt.block_on` and the
+        // custom builtin callback runs within it; the same holds on a
+        // multi-thread runtime worker when `await execute()` drives a *sync*
+        // builtin — calling `block_on` again here panics ("Cannot start a
+        // runtime from within a runtime"). Run the op on a throwaway thread with
+        // its own runtime instead.
+        //
+        // Cost: this spawns one OS thread and builds one current-thread runtime
+        // per op, so a callback doing many `ctx.fs` ops in a tight loop pays
+        // that scaffolding each time. Fine for occasional `ctx.fs` use; if it
+        // ever gets hot, amortize with a long-lived worker thread + runtime
+        // reused across ops via a channel (note: `block_in_place` is not an
+        // option while `make_runtime` builds a current-thread runtime).
+        //
+        // A `Static` handle used from a thread with *no* tokio context falls
+        // through to `self.rt.block_on` below. This is the async-callback case:
+        // the callback body runs on an asyncio loop thread — the caller's loop
+        // under `await execute()`, the private loop under `execute_sync()` — not
+        // a tokio worker, so `Handle::try_current()` is `Err`. Under
+        // `execute_sync()` that `block_on` runs on a *second* thread while the
+        // main thread holds the current-thread scheduler core; it completes only
+        // because tokio's parker fallback polls the future without owning the
+        // core. That is fine for VFS ops (they never need the runtime's
+        // timer/IO drivers) — but a timer- or IO-dependent fs future added here
+        // would stall this path, so keep `inner.resolve()` + fs ops driver-free.
+        //
+        // `Live` handles keep the original fast path: they lock the interpreter.
+        // Re-entrant use of a `Live` handle from inside the shared runtime is
+        // unsupported — it re-enters `self.rt.block_on` and panics with the same
+        // nested-runtime error. That is NOT a deadlock, and it is NOT caught by
+        // the `external_handler` reentry guard (which only fires inside an
+        // external_handler, not a custom builtin); the loud panic is preferable
+        // to silently deadlocking or corrupting interpreter state.
+        if inner.is_static() && Handle::try_current().is_ok() {
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        // A fresh runtime, not `self.rt`: the outer `block_on`
+                        // driving this callback still owns `self.rt`, and a
+                        // current-thread runtime can't be entered twice.
+                        let rt = make_runtime()?;
+                        rt.block_on(async move {
+                            let fs = inner.resolve().await?;
+                            f(fs).await
+                        })
+                    })
+                    .join()
+                    // Drop the panic payload deliberately: a `Box<dyn Any>` can't
+                    // be formatted without downcasting and may carry internal
+                    // Debug shapes / host paths (TM-INF-022). Point the user at
+                    // the stderr backtrace the default panic hook prints instead
+                    // — actionable in headless setups where the hint is the only
+                    // breadcrumb, and leaks nothing (static string, no payload).
+                    .map_err(|_| {
+                        PyRuntimeError::new_err(
+                            "internal error: bashkit filesystem worker thread panicked. \
+                             This is a bug in bashkit, not your script. A backtrace was \
+                             printed to stderr; re-run with RUST_BACKTRACE=1 for the full \
+                             trace and please report it.",
+                        )
+                    })?
+            });
+        }
+        self.rt.block_on(async move {
+            let fs = inner.resolve().await?;
+            f(fs).await
+        })
+    }
+
+    fn export_fs(&self, py: Python<'_>) -> PyResult<Arc<dyn FileSystem>> {
+        py.detach(|| self.with_fs(|fs| async move { Ok(fs) }))
+    }
+}
+
+#[pymethods]
+impl PyFileSystem {
+    #[new]
+    fn new() -> PyResult<Self> {
+        let rt = make_runtime()?;
+        Ok(Self::from_static(Arc::new(InMemoryFs::new()), rt))
+    }
+
+    // `FileSystem.real()` needs the realfs backend (host FS), and the capsule
+    // bridge (`from_capsule`/`to_capsule`) needs the `interop` ABI — both pull
+    // threads/host-FS deps absent on wasm, so these constructors are native-only.
+    // See knowledge/runtimes/emscripten-wheels.md.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[staticmethod]
+    #[pyo3(signature = (host_path, writable=false))]
+    #[allow(deprecated)] // Python constructors cannot await RealFs::open.
+    fn real(host_path: String, writable: bool) -> PyResult<Self> {
+        let rt = make_runtime()?;
+        let mode = if writable {
+            RealFsMode::ReadWrite
+        } else {
+            RealFsMode::ReadOnly
+        };
+        let backend =
+            RealFs::new(&host_path, mode).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let fs: Arc<dyn FileSystem> = PosixFs::new(backend).into();
+        Ok(Self::from_static(fs, rt))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[staticmethod]
+    fn from_capsule(capsule: Bound<'_, PyAny>) -> PyResult<Self> {
+        let capsule = capsule
+            .cast::<PyCapsule>()
+            .map_err(|_| PyTypeError::new_err("capsule must be a PyCapsule"))?;
+        let ptr = capsule.pointer_checked(Some(FILESYSTEM_CAPSULE_NAME))?;
+        let exported = unsafe { &*ptr.as_ptr().cast::<BashkitFsAbiOwnedHandleV1>() };
+        // SAFETY: capsule was created by export_filesystem; the embedded
+        // ABI handle is valid as long as the capsule is alive.
+        let fs = unsafe { import_owned_filesystem(exported) }
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let rt = make_runtime()?;
+        Ok(Self::from_static(fs, rt))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn to_capsule<'py>(&self, py: Python<'py>) -> PyResult<Py<PyCapsule>> {
+        let fs = self.export_fs(py)?;
+        let exported = export_filesystem(fs).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let capsule = PyCapsule::new_with_value(py, exported, FILESYSTEM_CAPSULE_NAME)?;
+        Ok(capsule.unbind())
+    }
+
+    fn read_file<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyBytes>> {
+        let data = py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.read_file(Path::new(&path))
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })?;
+        Ok(PyBytes::new(py, &data))
+    }
+
+    fn write_file(&self, py: Python<'_>, path: String, content: Vec<u8>) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.write_file(Path::new(&path), &content)
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    fn append_file(&self, py: Python<'_>, path: String, content: Vec<u8>) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.append_file(Path::new(&path), &content)
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    #[pyo3(signature = (path, recursive=false))]
+    fn mkdir(&self, py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.mkdir(Path::new(&path), recursive)
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    #[pyo3(signature = (path, recursive=false))]
+    fn remove(&self, py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.remove(Path::new(&path), recursive)
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    fn stat(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        let metadata = py.detach(|| {
+            self.with_fs(
+                |fs| async move { fs.stat(Path::new(&path)).await.map_err(map_fs_error_to_py) },
+            )
+        })?;
+        metadata_to_pydict(py, &metadata)
+    }
+
+    fn read_dir(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        let entries = py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.read_dir(Path::new(&path))
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })?;
+        let items: Vec<Py<PyAny>> = entries
+            .iter()
+            .map(|entry| dir_entry_to_pydict(py, entry))
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new(py, &items)?.into_any().unbind())
+    }
+
+    fn exists(&self, py: Python<'_>, path: String) -> PyResult<bool> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.exists(Path::new(&path))
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    fn rename(&self, py: Python<'_>, from_path: String, to_path: String) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.rename(Path::new(&from_path), Path::new(&to_path))
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    fn copy(&self, py: Python<'_>, from_path: String, to_path: String) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.copy(Path::new(&from_path), Path::new(&to_path))
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    fn symlink(&self, py: Python<'_>, target: String, link: String) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.symlink(Path::new(&target), Path::new(&link))
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    fn chmod(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+        py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.chmod(Path::new(&path), mode)
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })
+    }
+
+    fn read_link(&self, py: Python<'_>, path: String) -> PyResult<String> {
+        let target = py.detach(|| {
+            self.with_fs(|fs| async move {
+                fs.read_link(Path::new(&path))
+                    .await
+                    .map_err(map_fs_error_to_py)
+            })
+        })?;
+        Ok(target.display().to_string())
+    }
+}
+
+// ============================================================================
+// ExecResult
+// ============================================================================
+
+// Decision: Python ShellState is an inspection-focused view, not a full Rust
+// ShellState mirror. Copy only Python-friendly fields so Rust-only additions
+// like AST-backed functions do not silently widen the Python API surface. Use
+// snapshot(exclude_filesystem=True) when callers need shell-only restore bytes.
+/// Read-only snapshot of shell state for prompt rendering and inspection.
+///
+/// Transient fields like `last_exit_code` and `traps` reflect the captured
+/// snapshot, but the core interpreter clears them before each top-level
+/// `execute()` or `execute_sync()` call.
+#[pyclass(skip_from_py_object)]
+pub struct ShellState {
+    env: HashMap<String, String>,
+    variables: HashMap<String, String>,
+    arrays: HashMap<String, HashMap<usize, String>>,
+    assoc_arrays: HashMap<String, HashMap<String, String>>,
+    cwd: String,
+    last_exit_code: i32,
+    aliases: HashMap<String, String>,
+    traps: HashMap<String, String>,
+    cached_env: PyOnceLock<Py<PyAny>>,
+    cached_variables: PyOnceLock<Py<PyAny>>,
+    cached_arrays: PyOnceLock<Py<PyAny>>,
+    cached_assoc_arrays: PyOnceLock<Py<PyAny>>,
+    cached_aliases: PyOnceLock<Py<PyAny>>,
+    cached_traps: PyOnceLock<Py<PyAny>>,
+}
+
+impl From<RustShellStateView> for ShellState {
+    fn from(inner: RustShellStateView) -> Self {
+        let RustShellStateView {
+            env,
+            variables,
+            arrays,
+            assoc_arrays,
+            cwd,
+            last_exit_code,
+            aliases,
+            traps,
+            ..
+        } = inner;
+        Self {
+            env,
+            variables,
+            arrays,
+            assoc_arrays,
+            cwd: cwd.to_string_lossy().into_owned(),
+            last_exit_code,
+            aliases,
+            traps,
+            cached_env: PyOnceLock::new(),
+            cached_variables: PyOnceLock::new(),
+            cached_arrays: PyOnceLock::new(),
+            cached_assoc_arrays: PyOnceLock::new(),
+            cached_aliases: PyOnceLock::new(),
+            cached_traps: PyOnceLock::new(),
+        }
+    }
+}
+
+impl ShellState {
+    fn cached_mapping<F>(
+        &self,
+        py: Python<'_>,
+        cache: &PyOnceLock<Py<PyAny>>,
+        build: F,
+    ) -> PyResult<Py<PyAny>>
+    where
+        F: FnOnce(Python<'_>) -> PyResult<Py<PyAny>>,
+    {
+        cache
+            .get_or_try_init(py, || build(py))
+            .map(|mapping| mapping.clone_ref(py))
+    }
+}
+
+#[pymethods]
+impl ShellState {
+    fn __repr__(&self) -> String {
+        format!(
+            "ShellState(cwd={:?}, last_exit_code={}, env={}, variables={}, arrays={}, assoc_arrays={}, aliases={}, traps={})",
+            self.cwd,
+            self.last_exit_code,
+            self.env.len(),
+            self.variables.len(),
+            self.arrays.len(),
+            self.assoc_arrays.len(),
+            self.aliases.len(),
+            self.traps.len(),
+        )
+    }
+
+    #[getter]
+    fn env(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.cached_mapping(py, &self.cached_env, |py| {
+            readonly_string_map(py, &self.env)
+        })
+    }
+
+    #[getter]
+    fn variables(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.cached_mapping(py, &self.cached_variables, |py| {
+            readonly_string_map(py, &self.variables)
+        })
+    }
+
+    #[getter]
+    fn arrays(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.cached_mapping(py, &self.cached_arrays, |py| {
+            readonly_indexed_arrays(py, &self.arrays)
+        })
+    }
+
+    #[getter]
+    fn assoc_arrays(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.cached_mapping(py, &self.cached_assoc_arrays, |py| {
+            readonly_assoc_arrays(py, &self.assoc_arrays)
+        })
+    }
+
+    #[getter]
+    fn cwd(&self) -> String {
+        self.cwd.clone()
+    }
+
+    #[getter]
+    fn last_exit_code(&self) -> i32 {
+        self.last_exit_code
+    }
+
+    #[getter]
+    fn aliases(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.cached_mapping(py, &self.cached_aliases, |py| {
+            readonly_string_map(py, &self.aliases)
+        })
+    }
+
+    #[getter]
+    fn traps(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.cached_mapping(py, &self.cached_traps, |py| {
+            readonly_string_map(py, &self.traps)
+        })
+    }
+}
+
+/// Result from executing bash commands
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct ExecResult {
+    #[pyo3(get)]
+    pub stdout: String,
+    #[pyo3(get)]
+    pub stdout_bytes: Vec<u8>,
+    #[pyo3(get)]
+    pub stderr: String,
+    #[pyo3(get)]
+    pub stderr_bytes: Vec<u8>,
+    #[pyo3(get)]
+    pub exit_code: i32,
+    #[pyo3(get)]
+    pub error: Option<String>,
+    #[pyo3(get)]
+    pub stdout_truncated: bool,
+    #[pyo3(get)]
+    pub stderr_truncated: bool,
+    #[pyo3(get)]
+    pub final_env: Option<std::collections::HashMap<String, String>>,
+}
+
+#[pymethods]
+impl ExecResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "ExecResult(stdout={:?}, stderr={:?}, exit_code={}, error={:?}, stdout_truncated={}, stderr_truncated={}, final_env={:?})",
+            self.stdout,
+            self.stderr,
+            self.exit_code,
+            self.error,
+            self.stdout_truncated,
+            self.stderr_truncated,
+            self.final_env
+        )
+    }
+
+    fn __str__(&self) -> String {
+        if self.exit_code == 0 {
+            self.stdout.clone()
+        } else {
+            format!("Error ({}): {}", self.exit_code, self.stderr)
+        }
+    }
+
+    /// Check if command succeeded
+    #[getter]
+    fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+
+    /// Return output as dict
+    fn to_dict(&self) -> pyo3::PyResult<pyo3::Py<PyDict>> {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("stdout", &self.stdout)?;
+            dict.set_item("stderr", &self.stderr)?;
+            dict.set_item("exit_code", self.exit_code)?;
+            dict.set_item("error", &self.error)?;
+            dict.set_item("stdout_truncated", self.stdout_truncated)?;
+            dict.set_item("stderr_truncated", self.stderr_truncated)?;
+            dict.set_item("final_env", &self.final_env)?;
+            Ok(dict.into())
+        })
+    }
+}
+
+/// One simple command found by `analyze()`.
+///
+/// `name` and each entry of `args` are `None` when the word is not fully
+/// literal — a computed name or argument is reported as unknown, never as safe.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct AnalyzedCommand {
+    /// Command name, or `None` when it is not statically known.
+    #[pyo3(get)]
+    pub name: Option<String>,
+    /// One entry per argument; `None` when not fully literal.
+    #[pyo3(get)]
+    pub args: Vec<Option<String>>,
+    /// `"direct"`, `"substitution"`, or `"function_body"`.
+    #[pyo3(get)]
+    pub context: String,
+    /// Names of prefix assignments (`FOO=1 cmd` → `["FOO"]`).
+    #[pyo3(get)]
+    pub assignments: Vec<String>,
+    /// True for a bare assignment (`FOO=1`), which names no command and hides
+    /// nothing — distinguishes it from a genuinely unknown name.
+    #[pyo3(get)]
+    pub is_assignment_only: bool,
+}
+
+#[pymethods]
+impl AnalyzedCommand {
+    fn __repr__(&self) -> String {
+        format!(
+            "AnalyzedCommand(name={:?}, args={:?}, context={:?}, assignments={:?})",
+            self.name, self.args, self.context, self.assignments
+        )
+    }
+
+    /// Return the command as a plain dictionary.
+    fn to_dict(&self) -> PyResult<Py<PyDict>> {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", &self.name)?;
+            dict.set_item("args", &self.args)?;
+            dict.set_item("context", &self.context)?;
+            dict.set_item("assignments", &self.assignments)?;
+            dict.set_item("is_assignment_only", self.is_assignment_only)?;
+            Ok(dict.into())
+        })
+    }
+}
+
+/// One file redirect found by `analyze()`.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct AnalyzedRedirect {
+    /// Target path, or `None` when it is not fully literal.
+    #[pyo3(get)]
+    pub path: Option<String>,
+    /// `"read"`, `"write"`, or `"append"`.
+    #[pyo3(get)]
+    pub mode: String,
+    /// True for modes that can create or modify a file.
+    #[pyo3(get)]
+    pub is_write: bool,
+}
+
+#[pymethods]
+impl AnalyzedRedirect {
+    fn __repr__(&self) -> String {
+        format!(
+            "AnalyzedRedirect(path={:?}, mode={:?}, is_write={})",
+            self.path, self.mode, self.is_write
+        )
+    }
+
+    /// Return the redirect as a plain dictionary.
+    fn to_dict(&self) -> PyResult<Py<PyDict>> {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("path", &self.path)?;
+            dict.set_item("mode", &self.mode)?;
+            dict.set_item("is_write", self.is_write)?;
+            Ok(dict.into())
+        })
+    }
+}
+
+/// Result of `analyze()` — what a script statically refers to.
+///
+/// **Advisory only.** Static analysis cannot see through dynamic dispatch,
+/// `eval`, functions, or aliases; those set `is_opaque`. Enforcement stays with
+/// the builtin registry, the network allowlist, and the mount policy.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct ScriptAnalysis {
+    /// Every simple command, in source order.
+    #[pyo3(get)]
+    pub commands: Vec<AnalyzedCommand>,
+    /// Every file redirect target, in source order.
+    #[pyo3(get)]
+    pub redirects: Vec<AnalyzedRedirect>,
+    /// Function names the script defines.
+    #[pyo3(get)]
+    pub functions: Vec<String>,
+    /// Distinct statically known command names, in first-seen order.
+    #[pyo3(get)]
+    pub command_names: Vec<String>,
+    /// Some command name is not statically known.
+    #[pyo3(get)]
+    pub has_dynamic_commands: bool,
+    /// Script contains `$(…)`, backticks, or process substitution.
+    #[pyo3(get)]
+    pub has_command_substitution: bool,
+    /// Script hands a script back to the interpreter: `eval`, `source`, `.`,
+    /// or a nested `bash`/`sh`.
+    #[pyo3(get)]
+    pub has_interpreter_reentry: bool,
+    /// Node budget hit — `commands` and `redirects` are incomplete.
+    #[pyo3(get)]
+    pub truncated: bool,
+    /// The script hides work: dynamic command, `eval`/`source`, or truncated.
+    /// Allowlist checks must treat this as "ask the user".
+    #[pyo3(get)]
+    pub is_opaque: bool,
+}
+
+#[pymethods]
+impl ScriptAnalysis {
+    fn __repr__(&self) -> String {
+        format!(
+            "ScriptAnalysis(command_names={:?}, functions={:?}, redirects={}, is_opaque={})",
+            self.command_names,
+            self.functions,
+            self.redirects.len(),
+            self.is_opaque
+        )
+    }
+
+    /// Commands invoking `name`, in source order.
+    fn commands_named(&self, name: &str) -> Vec<AnalyzedCommand> {
+        self.commands
+            .iter()
+            .filter(|c| c.name.as_deref() == Some(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Return the analysis as a plain dictionary.
+    fn to_dict(&self) -> PyResult<Py<PyDict>> {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            let commands = pyo3::types::PyList::empty(py);
+            for command in &self.commands {
+                commands.append(command.to_dict()?)?;
+            }
+            dict.set_item("commands", commands)?;
+            let redirects = pyo3::types::PyList::empty(py);
+            for redirect in &self.redirects {
+                redirects.append(redirect.to_dict()?)?;
+            }
+            dict.set_item("redirects", redirects)?;
+            dict.set_item("functions", &self.functions)?;
+            dict.set_item("command_names", &self.command_names)?;
+            dict.set_item("has_dynamic_commands", self.has_dynamic_commands)?;
+            dict.set_item("has_command_substitution", self.has_command_substitution)?;
+            dict.set_item("has_interpreter_reentry", self.has_interpreter_reentry)?;
+            dict.set_item("truncated", self.truncated)?;
+            dict.set_item("is_opaque", self.is_opaque)?;
+            Ok(dict.into())
+        })
+    }
+}
+
+impl From<bashkit::ScriptAnalysis> for ScriptAnalysis {
+    fn from(analysis: bashkit::ScriptAnalysis) -> Self {
+        Self {
+            command_names: analysis
+                .command_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            is_opaque: analysis.is_opaque(),
+            commands: analysis
+                .commands
+                .iter()
+                .map(|c| AnalyzedCommand {
+                    name: c.name.clone(),
+                    args: c.args.clone(),
+                    context: c.context.as_str().to_owned(),
+                    assignments: c.assignments.clone(),
+                    is_assignment_only: c.is_assignment_only(),
+                })
+                .collect(),
+            redirects: analysis
+                .redirects
+                .iter()
+                .map(|r| AnalyzedRedirect {
+                    path: r.path.clone(),
+                    mode: r.mode.as_str().to_owned(),
+                    is_write: r.mode.is_write(),
+                })
+                .collect(),
+            functions: analysis.functions,
+            has_dynamic_commands: analysis.has_dynamic_commands,
+            has_command_substitution: analysis.has_command_substitution,
+            has_interpreter_reentry: analysis.has_interpreter_reentry,
+            truncated: analysis.truncated,
+        }
+    }
+}
+
+/// Analyze a script using an instance's parser limits.
+fn analyze_script(
+    py: Python<'_>,
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    script: &str,
+) -> PyResult<ScriptAnalysis> {
+    let rt = rt.clone();
+    let inner = inner.clone();
+    let script = script.to_owned();
+    py.detach(|| {
+        rt.block_on(async move {
+            let bash = inner.lock().await;
+            bash.analyze(&script)
+                .map(ScriptAnalysis::from)
+                .map_err(|e| BashError::new_err(e.to_string()))
+        })
+    })
+}
+
+/// Shell-facing result returned by Python-backed custom builtins.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct BuiltinResult {
+    #[pyo3(get, set)]
+    pub stdout: String,
+    #[pyo3(get, set)]
+    pub stderr: String,
+    #[pyo3(get, set)]
+    pub exit_code: i32,
+}
+
+#[pymethods]
+impl BuiltinResult {
+    #[new]
+    #[pyo3(signature = (stdout=String::new(), stderr=String::new(), exit_code=0))]
+    fn new(stdout: String, stderr: String, exit_code: i32) -> Self {
+        Self {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BuiltinResult(stdout={:?}, stderr={:?}, exit_code={})",
+            self.stdout, self.stderr, self.exit_code
+        )
+    }
+}
+
+// ============================================================================
+// Bash — core interpreter
+// ============================================================================
+
+fn py_exec_result_from_rust(result: RustExecResult) -> ExecResult {
+    let stdout_bytes = result.stdout.as_bytes().to_vec();
+    let stderr_bytes = result.stderr.as_bytes().to_vec();
+    ExecResult {
+        stdout: result.stdout.to_string(),
+        stdout_bytes,
+        stderr: result.stderr.to_string(),
+        stderr_bytes,
+        exit_code: result.exit_code,
+        error: None,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
+        final_env: result.final_env,
+    }
+}
+
+fn py_exec_result_from_error(err: impl ToString) -> ExecResult {
+    let msg = err.to_string();
+    ExecResult {
+        stdout: String::new(),
+        stdout_bytes: Vec::new(),
+        stderr: msg.clone(),
+        stderr_bytes: msg.as_bytes().to_vec(),
+        exit_code: 1,
+        error: Some(msg),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        final_env: None,
+    }
+}
+
+fn py_exec_result_from_bash_result(result: bashkit::Result<RustExecResult>) -> ExecResult {
+    match result {
+        Ok(result) => py_exec_result_from_rust(result),
+        Err(err) => py_exec_result_from_error(err),
+    }
+}
+
+// Snapshot caller-owned ContextVars at execute*-call time so output callbacks
+// invoked later from the Rust runtime still see the embedding framework's
+// request-scoped state. Keep inspect.isawaitable cached so callbacks that
+// accidentally return coroutine/awaitable objects fail synchronously.
+struct PyOutputHandler {
+    callback: Py<PyAny>,
+    context: Py<PyAny>,
+    is_awaitable: Py<PyAny>,
+}
+
+fn copy_current_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    py.import("contextvars")?
+        .call_method0("copy_context")
+        .map(|ctx| ctx.unbind())
+}
+
+fn is_coroutine_callable(py: Python<'_>, callable: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let inspect = py.import("inspect")?;
+    let is_coro_fn = inspect.getattr("iscoroutinefunction")?;
+    Ok(is_coro_fn.call1((callable,))?.extract::<bool>()?
+        || callable
+            .getattr("__call__")
+            .ok()
+            .and_then(|c| is_coro_fn.call1((c,)).ok())
+            .and_then(|r| r.extract::<bool>().ok())
+            .unwrap_or(false))
+}
+
+fn validate_python_callback(
+    py: Python<'_>,
+    callable: &Bound<'_, PyAny>,
+    callable_error: impl FnOnce() -> String,
+) -> PyResult<bool> {
+    if !callable.is_callable() {
+        return Err(PyTypeError::new_err(callable_error()));
+    }
+    is_coroutine_callable(py, callable)
+}
+
+fn prepare_output_handler(
+    py: Python<'_>,
+    on_output: Option<Py<PyAny>>,
+) -> PyResult<Option<PyOutputHandler>> {
+    let Some(on_output) = on_output else {
+        return Ok(None);
+    };
+
+    let bound = on_output.bind(py);
+    if !bound.is_callable() {
+        return Err(PyTypeError::new_err("on_output must be callable"));
+    }
+    if is_coroutine_callable(py, bound)? {
+        return Err(PyTypeError::new_err(
+            "on_output must be a synchronous callable (async/coroutine handlers are not supported)",
+        ));
+    }
+
+    let is_awaitable = py.import("inspect")?.getattr("isawaitable")?.unbind();
+
+    Ok(Some(PyOutputHandler {
+        callback: on_output,
+        context: copy_current_context(py)?,
+        is_awaitable,
+    }))
+}
+
+// Decision: `custom_builtins` mirror Rust builtin semantics with a shell-first
+// context object (`argv`, `stdin`, `env`, `cwd`, `fs`); `ScriptedTool` remains
+// schema-first and continues to pass `(params, stdin)`.
+//
+// `fs` wraps the *same* `Arc<dyn FileSystem>` the interpreter is running on
+// (mirroring how the embedded `python3`/Monty builtin receives `ctx.fs`), so it
+// is a live view, not a snapshot. It is a `Static` `PyFileSystem` handle, which
+// bypasses the interpreter lock — `PyFileSystem::with_fs` runs its ops off the
+// shared runtime thread so they are safe from within the callback.
+//
+// Still deliberately omitted: mutable shell variables, mutable `cwd`, and
+// feature-gated network/git/ssh clients from Rust `BuiltinContext`. Reasonable
+// follow-ups, kept out to keep the Python surface small and shell-first.
+/// Execution context passed to Python-backed custom builtins.
+///
+/// `name`, `argv`, `stdin`, `env`, and `cwd` are snapshots of the shell state at
+/// invocation time; `fs` is a live handle to the interpreter's virtual
+/// filesystem.
+#[pyclass(name = "BuiltinContext", skip_from_py_object)]
+struct PyBuiltinContext {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    argv: Vec<String>,
+    #[pyo3(get)]
+    stdin: Option<String>,
+    #[pyo3(get)]
+    env: std::collections::HashMap<String, String>,
+    #[pyo3(get)]
+    cwd: String,
+    #[pyo3(get)]
+    fs: Py<PyFileSystem>,
+}
+
+#[pymethods]
+impl PyBuiltinContext {
+    fn __repr__(&self) -> String {
+        format!(
+            "BuiltinContext(name={:?}, argv={:?}, stdin={:?}, cwd={:?})",
+            self.name, self.argv, self.stdin, self.cwd
+        )
+    }
+}
+
+fn make_py_builtin_context(
+    py: Python<'_>,
+    name: &str,
+    ctx: &BuiltinContext<'_>,
+    rt: &PyRuntime,
+) -> Result<Py<PyBuiltinContext>, String> {
+    // Wrap the interpreter's live VFS as a `Static` handle so callbacks read and
+    // write the same filesystem without re-locking the interpreter.
+    let fs = Py::new(py, PyFileSystem::from_static(ctx.fs.clone(), rt.clone()))
+        .map_err(|e| e.to_string())?;
+    Py::new(
+        py,
+        PyBuiltinContext {
+            name: name.to_string(),
+            argv: ctx.args.to_vec(),
+            stdin: ctx.stdin.map(ToString::to_string),
+            env: ctx.env.clone(),
+            cwd: ctx.cwd.to_string_lossy().into_owned(),
+            fs,
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+// Decision: split long-lived callback machinery from per-execution callback
+// state. The engine owns reusable sync-fallback resources; each execute*()
+// call owns its captured ContextVars, caller loop, and cancellable callback
+// tasks via a fresh session.
+//
+// Decision: sync-fallback loop reuse is surface-specific. Bash/BashTool keep
+// one shared private loop because persistent custom builtins may retain
+// loop-bound asyncio state across execute_sync() calls. ScriptedTool sessions
+// use a per-execution private loop so concurrent execute_sync() calls on one
+// tool never race on run_until_complete.
+struct PyCallbackSessionState {
+    context: Py<PyAny>,
+    caller_loop_locals: Option<CallerLoopLocals>,
+}
+
+#[derive(Clone, Copy)]
+enum PySyncLoopMode {
+    SharedAcrossSessions,
+    PerSession,
+}
+
+// Work item sent to the dedicated private-loop worker thread.
+// The worker owns the asyncio event loop and runs awaitables sequentially on
+// the same OS thread, satisfying asyncio's thread-affinity requirement.
+struct PrivateLoopWorkItem {
+    awaitable: Py<PyAny>,
+    context: Py<PyAny>,
+    result_tx: std::sync::mpsc::SyncSender<PyResult<Py<PyAny>>>,
+}
+
+// The lazily spawned worker behind a PyPrivateAsyncLoop: channel sender plus
+// the join handle used for deterministic teardown.
+struct PrivateLoopWorker {
+    // Unbounded so send() never blocks with the GIL held (TM-PY-030 root-cause fix).
+    tx: std::sync::mpsc::Sender<PrivateLoopWorkItem>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+struct PyPrivateAsyncLoop {
+    // Dedicated worker thread that owns the asyncio event loop. Lazily
+    // started on first use; `None` before the first call and after shutdown.
+    // Decision: single dedicated thread per PyPrivateAsyncLoop instance so that
+    // all run_until_complete calls happen on the thread that created the loop,
+    // satisfying asyncio's thread-affinity requirement (review comment on
+    // spawn_blocking scheduling successive callbacks on different OS threads).
+    worker: StdMutex<Option<PrivateLoopWorker>>,
+    // The worker's asyncio loop, set once by the worker thread after it
+    // creates the loop. Read by cancel_inflight() to schedule a threadsafe
+    // task cancellation; never run from any other thread.
+    event_loop: Arc<OnceLock<Py<PyAny>>>,
+    // The asyncio.Task currently driven by run_until_complete, if any.
+    // Published by the worker around each item so teardown can cancel it.
+    current_task: Arc<StdMutex<Option<Py<PyAny>>>>,
+    // Set by shutdown(); the worker rejects queued-but-unstarted items so a
+    // teardown join is bounded by the (cancelled) in-flight item only.
+    closing: Arc<AtomicBool>,
+    // Cached Python helper for background-thread fallback (Jupyter/IPython compatibility).
+    bg_thread_runner: StdMutex<Option<Py<PyAny>>>,
+}
+
+impl PyPrivateAsyncLoop {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            worker: StdMutex::new(None),
+            event_loop: Arc::new(OnceLock::new()),
+            current_task: Arc::new(StdMutex::new(None)),
+            closing: Arc::new(AtomicBool::new(false)),
+            bg_thread_runner: StdMutex::new(None),
+        })
+    }
+
+    // Lazily start the dedicated worker thread and return a clone of its sender.
+    // The worker thread creates the asyncio event loop on its own OS thread and
+    // keeps it there for the lifetime of the PyPrivateAsyncLoop. This pins all
+    // run_until_complete calls to a single thread, matching asyncio's thread-
+    // affinity contract.
+    fn ensure_worker_tx(&self) -> PyResult<std::sync::mpsc::Sender<PrivateLoopWorkItem>> {
+        let mut guard = self.worker.lock().expect("private loop worker lock");
+        if let Some(ref worker) = *guard {
+            return Ok(worker.tx.clone());
+        }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("private loop is shutting down"));
+        }
+        // Unbounded channel: send() never blocks, so GIL need not be released
+        // around the send (TM-PY-030 root-cause fix). Queue depth ≤ 1 in practice
+        // because the caller blocks on result_rx.recv() before issuing another send.
+        let (tx, rx) = std::sync::mpsc::channel::<PrivateLoopWorkItem>();
+        let event_loop_slot = self.event_loop.clone();
+        let current_task = self.current_task.clone();
+        let closing = self.closing.clone();
+        let handle = std::thread::Builder::new()
+            .name("bashkit-py-loop".into())
+            .spawn(move || {
+                // Create the event loop on this thread and keep it here for its
+                // entire lifetime; this is the only thread that calls run_until_complete.
+                let event_loop: Py<PyAny> = Python::attach(|py| {
+                    let event_loop = py
+                        .import("asyncio")
+                        .and_then(|a| a.call_method0("new_event_loop"))
+                        .expect("asyncio.new_event_loop()");
+                    // Publish the loop so cancel_inflight() can schedule a
+                    // threadsafe cancellation from other threads.
+                    let _ = event_loop_slot.set(event_loop.clone().unbind());
+                    event_loop.unbind()
+                });
+
+                while let Ok(item) = rx.recv() {
+                    if closing.load(Ordering::Acquire) {
+                        // Teardown started: reject without touching the
+                        // awaitable so the join is not extended by queued
+                        // work. Dropping the item's Py refs unattached is
+                        // safe (pyo3 defers the decrefs).
+                        let _ = item.result_tx.send(Err(PyRuntimeError::new_err(
+                            "private loop is shutting down",
+                        )));
+                        continue;
+                    }
+                    let result = Python::attach(|py| {
+                        // Create the task under the captured context so
+                        // ContextVars propagate (asyncio.Task snapshots the
+                        // current context at creation), then publish it so
+                        // teardown can cancel a long-running callback.
+                        let task = item.context.bind(py).call_method1(
+                            "run",
+                            (
+                                event_loop.bind(py).getattr("create_task")?,
+                                item.awaitable.bind(py),
+                            ),
+                        )?;
+                        *current_task.lock().expect("private loop task slot") =
+                            Some(task.clone().unbind());
+                        let result = event_loop
+                            .bind(py)
+                            .call_method1("run_until_complete", (task,));
+                        *current_task.lock().expect("private loop task slot") = None;
+                        result.map(|v| v.unbind())
+                    });
+                    // Ignore send errors: the caller timed out and moved on.
+                    let _ = item.result_tx.send(result);
+                }
+
+                // THREAT[TM-PY-030]: while the interpreter is alive, close the
+                // loop deterministically (releases its epoll/self-pipe fds
+                // before the teardown join returns). Once the interpreter is
+                // exiting, do NOT touch Python: the worker often wakes here
+                // because the engine was gc'd inside Py_Finalize, and
+                // attaching then crashes CPython (PyGILState_Release fatal;
+                // Python::try_attach cannot detect finalization before 3.13).
+                // The atexit-set flag flips strictly before that phase.
+                if !interpreter_at_exit() {
+                    Python::attach(|py| {
+                        let _ = event_loop.bind(py).call_method0("close");
+                    });
+                }
+                // Unattached drop is safe either way (deferred decref).
+                drop(event_loop);
+            })
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to spawn private loop thread: {e}"))
+            })?;
+        let tx_clone = tx.clone();
+        *guard = Some(PrivateLoopWorker { tx, handle });
+        Ok(tx_clone)
+    }
+
+    /// Cancel the asyncio task currently running on the worker, if any.
+    /// Cooperative: the callback observes `asyncio.CancelledError` at its
+    /// next await point. Callers must ensure the interpreter is alive.
+    fn cancel_inflight(&self) {
+        let Some(event_loop) = self.event_loop.get() else {
+            return;
+        };
+        Python::attach(|py| {
+            let task = self
+                .current_task
+                .lock()
+                .expect("private loop task slot")
+                .as_ref()
+                .map(|t| t.clone_ref(py));
+            let Some(task) = task else { return };
+            // call_soon_threadsafe is the only thread-safe entry point into a
+            // loop running on another thread. Errors (loop already closed,
+            // task already done) mean there is nothing left to cancel.
+            if let Ok(cancel) = task.bind(py).getattr("cancel") {
+                let _ = event_loop
+                    .bind(py)
+                    .call_method1("call_soon_threadsafe", (cancel,));
+            }
+        });
+    }
+
+    /// Deterministic teardown: stop accepting work, cancel the in-flight
+    /// callback, and join the worker (which closes its loop) before
+    /// returning. Idempotent. At interpreter exit this degrades to dropping
+    /// the channel — joining is unsafe then (the worker may no longer attach)
+    /// and the OS reclaims everything at process exit.
+    fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
+        let worker = self.worker.lock().expect("private loop worker lock").take();
+        let Some(PrivateLoopWorker { tx, handle }) = worker else {
+            return;
+        };
+        drop(tx);
+        if interpreter_at_exit() {
+            return;
+        }
+        self.cancel_inflight();
+        // THREAT[TM-PY-030]: the worker needs the GIL to finish the cancelled
+        // item and close its loop, so the join must not hold it.
+        join_without_gil(move || {
+            let _ = handle.join();
+        });
+    }
+
+    fn bg_thread_runner(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let mut runner = self.bg_thread_runner.lock().expect("bg thread runner lock");
+        if runner.is_none() {
+            // Spawns a daemon thread with a fresh event loop, runs the coroutine inside the
+            // supplied context so ContextVars propagate correctly, then joins and returns the
+            // result. The join() releases the GIL so the child thread can acquire it.
+            *runner = Some(
+                pyo3::types::PyModule::from_code(
+                    py,
+                    c"import asyncio, threading
+def _run(coro, ctx):
+    r = [None]; e = [None]
+    def w():
+        loop = asyncio.new_event_loop()
+        try:
+            r[0] = ctx.run(loop.run_until_complete, coro)
+        except BaseException as ex:
+            e[0] = ex
+        finally:
+            loop.close()
+    t = threading.Thread(target=w, daemon=True)
+    t.start()
+    t.join()
+    if e[0] is not None:
+        raise e[0]
+    return r[0]",
+                    c"<bashkit_bg_loop>",
+                    c"_bashkit_bg_loop",
+                )?
+                .getattr("_run")?
+                .unbind(),
+            );
+        }
+        Ok(runner.as_ref().expect("runner prepared").clone_ref(py))
+    }
+
+    // `context` is the captured ContextVar snapshot; needed for the background-thread
+    // path so that Tasks inherit the correct ContextVars (background threads start with
+    // an empty context, unlike the calling thread whose ContextVars are already set).
+    fn run_awaitable(
+        &self,
+        py: Python<'_>,
+        awaitable: &Py<PyAny>,
+        context: &Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        // When a loop is already running on this thread (e.g. Jupyter / IPython),
+        // asyncio forbids run_until_complete on any loop — even a brand-new one.
+        // Fall back to a background thread that owns its own fresh event loop.
+        if py
+            .import("asyncio")?
+            .call_method0("get_running_loop")
+            .is_ok()
+        {
+            return self
+                .bg_thread_runner(py)?
+                .bind(py)
+                .call1((awaitable.bind(py), context.bind(py)))
+                .map(|v| v.unbind());
+        }
+
+        // Dispatch to the dedicated worker thread that owns the asyncio event loop.
+        // This ensures all run_until_complete calls happen on the same OS thread,
+        // preserving asyncio thread-affinity. The GIL is released while waiting so
+        // the worker thread can acquire it to run Python.
+        let tx = self.ensure_worker_tx()?;
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        let item = PrivateLoopWorkItem {
+            awaitable: awaitable.clone_ref(py),
+            context: context.clone_ref(py),
+            result_tx,
+        };
+        // THREAT[TM-PY-030]: send() is non-blocking (unbounded channel), so the
+        // GIL need not be released around the send. Only result_rx.recv() blocks;
+        // detach releases the GIL so the worker can acquire it to run Python.
+        // `move` ensures result_rx (Send, not Sync) is owned by the closure.
+        let send_result = tx
+            .send(item)
+            .map_err(|_| PyRuntimeError::new_err("private loop worker channel closed"));
+        py.detach(move || {
+            send_result?;
+            result_rx
+                .recv()
+                .map_err(|_| PyRuntimeError::new_err("private loop worker disconnected"))
+        })?
+    }
+}
+
+impl Drop for PyPrivateAsyncLoop {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct PyCallbackEngine {
+    shared_private_async_loop: Arc<PyPrivateAsyncLoop>,
+    // Live per-session private loops (PySyncLoopMode::PerSession), tracked so
+    // pyclass Drop can cancel in-flight callbacks it cannot reach through the
+    // session Arcs (an abandoned timed-out callback task holds its own
+    // session Arc, so the loop's Drop alone would wait out the callback).
+    session_private_loops: StdMutex<Vec<Weak<PyPrivateAsyncLoop>>>,
+    caller: Py<PyAny>,
+}
+
+impl PyCallbackEngine {
+    fn new(py: Python<'_>) -> PyResult<Arc<Self>> {
+        Ok(Arc::new(Self {
+            shared_private_async_loop: PyPrivateAsyncLoop::new(),
+            session_private_loops: StdMutex::new(Vec::new()),
+            caller: create_context_callback_caller(py)?,
+        }))
+    }
+
+    fn register_session_loop(&self, private_loop: &Arc<PyPrivateAsyncLoop>) {
+        let mut loops = self
+            .session_private_loops
+            .lock()
+            .expect("session private loops lock");
+        loops.retain(|w| w.strong_count() > 0);
+        loops.push(Arc::downgrade(private_loop));
+    }
+
+    /// Cancel every in-flight private-loop callback owned by this engine.
+    /// Called from pyclass Drop (interpreter alive) BEFORE the tokio runtime
+    /// join, so teardown is bounded by cooperative cancellation instead of
+    /// full callback duration.
+    fn cancel_inflight_callbacks(&self) {
+        self.shared_private_async_loop.cancel_inflight();
+        let loops: Vec<Arc<PyPrivateAsyncLoop>> = {
+            let guard = self
+                .session_private_loops
+                .lock()
+                .expect("session private loops lock");
+            guard.iter().filter_map(Weak::upgrade).collect()
+        };
+        for private_loop in loops {
+            private_loop.cancel_inflight();
+        }
+    }
+
+    fn invoke(
+        &self,
+        py: Python<'_>,
+        context: &Py<PyAny>,
+        callback: &Py<PyAny>,
+        args: Vec<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let args = PyTuple::new(py, &args)?;
+        self.caller.call1(py, (context, callback, args))
+    }
+}
+
+struct PyCallbackSession {
+    state: StdMutex<PyCallbackSessionState>,
+    active_caller_tasks: Arc<StdMutex<Vec<Py<PyAny>>>>,
+    private_async_loop: Arc<PyPrivateAsyncLoop>,
+    engine: Arc<PyCallbackEngine>,
+}
+
+impl PyCallbackSession {
+    fn capture(
+        py: Python<'_>,
+        engine: Arc<PyCallbackEngine>,
+        needs_async_callbacks: bool,
+        use_caller_loop: bool,
+        sync_loop_mode: PySyncLoopMode,
+    ) -> PyResult<Arc<Self>> {
+        let private_async_loop = match sync_loop_mode {
+            PySyncLoopMode::SharedAcrossSessions => engine.shared_private_async_loop.clone(),
+            PySyncLoopMode::PerSession => {
+                let private_loop = PyPrivateAsyncLoop::new();
+                // Track it so pyclass Drop can cancel in-flight callbacks
+                // even when an abandoned task still holds the session Arc.
+                engine.register_session_loop(&private_loop);
+                private_loop
+            }
+        };
+        Ok(Arc::new(Self {
+            state: StdMutex::new(capture_callback_state(
+                py,
+                needs_async_callbacks,
+                use_caller_loop,
+            )?),
+            active_caller_tasks: Arc::new(StdMutex::new(Vec::new())),
+            private_async_loop,
+            engine,
+        }))
+    }
+
+    fn current_context(&self, py: Python<'_>) -> Py<PyAny> {
+        self.state
+            .lock()
+            .expect("tool callback session lock")
+            .context
+            .clone_ref(py)
+    }
+
+    // Native: the caller-loop locals are a non-Copy TaskLocals, so clone out of the
+    // lock. Wasm: CallerLoopLocals is uninhabited and the field is always None, so
+    // return None without touching the (Copy) Option.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn current_caller_loop_locals(&self) -> Option<CallerLoopLocals> {
+        self.state
+            .lock()
+            .expect("tool callback session lock")
+            .caller_loop_locals
+            .clone()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn current_caller_loop_locals(&self) -> Option<CallerLoopLocals> {
+        None
+    }
+
+    fn active_caller_tasks(&self) -> Arc<StdMutex<Vec<Py<PyAny>>>> {
+        self.active_caller_tasks.clone()
+    }
+
+    fn cancel_active_caller_tasks(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(locals) = self.current_caller_loop_locals() else {
+            return Ok(());
+        };
+        // On wasm `locals` is `Infallible`, so this point is unreachable; the
+        // caller-loop scheduling helpers it would call are native-only.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = py;
+            match locals {}
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let tasks = self
+                .active_caller_tasks
+                .lock()
+                .expect("tool active caller tasks lock")
+                .drain(..)
+                .collect::<Vec<_>>();
+            for task in tasks {
+                cancel_python_task(py, &locals, &task)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn invoke(
+        &self,
+        py: Python<'_>,
+        callback: &Py<PyAny>,
+        args: Vec<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let context = self.current_context(py);
+        self.engine.invoke(py, &context, callback, args)
+    }
+
+    fn run_awaitable_on_private_loop(
+        &self,
+        py: Python<'_>,
+        awaitable: &Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let context = self.current_context(py);
+        self.private_async_loop
+            .run_awaitable(py, awaitable, &context)
+    }
+}
+
+struct PyCustomBuiltinEntry {
+    name: String,
+    callback: Py<PyAny>,
+    is_async: bool,
+}
+
+fn capture_callback_state(
+    py: Python<'_>,
+    needs_async_callbacks: bool,
+    use_caller_loop: bool,
+) -> PyResult<PyCallbackSessionState> {
+    // The caller-loop path captures the running asyncio loop's TaskLocals so async
+    // callbacks can be scheduled on it. That only happens under async `execute()`,
+    // which is native-only — on wasm we always fall through to the private-loop path.
+    #[cfg(not(target_arch = "wasm32"))]
+    if needs_async_callbacks && use_caller_loop {
+        let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        return Ok(PyCallbackSessionState {
+            context: locals.context(py).unbind(),
+            caller_loop_locals: Some(locals),
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (needs_async_callbacks, use_caller_loop);
+
+    Ok(PyCallbackSessionState {
+        context: copy_current_context(py)?,
+        caller_loop_locals: None,
+    })
+}
+
+fn create_context_callback_caller(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pyo3::types::PyModule::from_code(
+        py,
+        c"def _call(ctx, fn, args):\n    return ctx.run(fn, *args)",
+        c"<bashkit_callback>",
+        c"_bashkit_callback",
+    )?
+    .getattr("_call")
+    .map(|caller| caller.unbind())
+}
+
+fn asyncio_cancelled_error(py: Python<'_>) -> PyResult<PyErr> {
+    Ok(PyErr::from_value(
+        py.import("asyncio")?.call_method0("CancelledError")?,
+    ))
+}
+
+// Caller-loop task scheduling/cancellation — native-only (see CallerLoopLocals).
+#[cfg(not(target_arch = "wasm32"))]
+fn call_soon_threadsafe_with_context(
+    py: Python<'_>,
+    locals: &TaskLocals,
+    callback: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("context", locals.context(py))?;
+    locals
+        .event_loop(py)
+        .call_method("call_soon_threadsafe", (callback,), Some(&kwargs))?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cancel_python_task(py: Python<'_>, locals: &TaskLocals, task: &Py<PyAny>) -> PyResult<()> {
+    let cancel = task.bind(py).getattr("cancel")?;
+    call_soon_threadsafe_with_context(py, locals, &cancel)
+}
+
+fn remove_active_caller_task(
+    active_caller_tasks: &Arc<StdMutex<Vec<Py<PyAny>>>>,
+    task: &Bound<'_, PyAny>,
+) {
+    let task_ptr = task.as_ptr();
+    if let Ok(mut active_tasks) = active_caller_tasks.lock() {
+        active_tasks.retain(|active_task| active_task.bind(task.py()).as_ptr() != task_ptr);
+    }
+}
+
+#[pyclass]
+struct PyCallbackTaskCompleter {
+    tx: Option<oneshot::Sender<PyResult<Py<PyAny>>>>,
+    active_caller_tasks: Arc<StdMutex<Vec<Py<PyAny>>>>,
+}
+
+#[pymethods]
+impl PyCallbackTaskCompleter {
+    #[pyo3(signature = (task))]
+    fn __call__(&mut self, task: &Bound<'_, PyAny>) -> PyResult<()> {
+        remove_active_caller_task(&self.active_caller_tasks, task);
+        let result = match task.call_method0("result") {
+            Ok(value) => Ok(value.unbind()),
+            Err(err) => Err(err),
+        };
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(result);
+        }
+        Ok(())
+    }
+}
+
+#[pyclass]
+struct PyScheduleCallbackTask {
+    awaitable: Py<PyAny>,
+    on_complete: Py<PyAny>,
+    shared_task: Arc<StdMutex<Option<Py<PyAny>>>>,
+    active_caller_tasks: Arc<StdMutex<Vec<Py<PyAny>>>>,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl PyScheduleCallbackTask {
+    fn __call__(&self) -> PyResult<()> {
+        Python::attach(|py| {
+            let task = py
+                .import("asyncio")?
+                .call_method1("ensure_future", (self.awaitable.bind(py),))?;
+            *self.shared_task.lock().expect("tool callback task lock") =
+                Some(task.clone().unbind());
+            self.active_caller_tasks
+                .lock()
+                .expect("tool active caller tasks lock")
+                .push(task.clone().unbind());
+            task.call_method1("add_done_callback", (self.on_complete.bind(py),))?;
+            if self.cancel_requested.load(Ordering::Relaxed) {
+                let _ = task.call_method0("cancel");
+            }
+            Ok(())
+        })
+    }
+}
+
+#[pyclass]
+struct PyCancelActiveCallbackTasks {
+    session: Arc<PyCallbackSession>,
+}
+
+#[pymethods]
+impl PyCancelActiveCallbackTasks {
+    #[pyo3(signature = (future))]
+    fn __call__(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future.call_method0("cancelled")?.extract::<bool>()? {
+            self.session.cancel_active_caller_tasks(future.py())?;
+        }
+        Ok(())
+    }
+}
+
+fn attach_future_cancellation_callback(
+    py: Python<'_>,
+    future: &Bound<'_, PyAny>,
+    session: Arc<PyCallbackSession>,
+) -> PyResult<()> {
+    let on_cancel = Py::new(py, PyCancelActiveCallbackTasks { session })?
+        .into_bound(py)
+        .into_any()
+        .unbind();
+    future.call_method1("add_done_callback", (on_cancel.bind(py),))?;
+    Ok(())
+}
+
+#[pyclass]
+struct PyCancelActiveCallbackTasksNow {
+    session: Arc<PyCallbackSession>,
+}
+
+#[pymethods]
+impl PyCancelActiveCallbackTasksNow {
+    fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+        self.session.cancel_active_caller_tasks(py)
+    }
+}
+
+fn create_execute_cancel_wrapper(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pyo3::types::PyModule::from_code(
+        py,
+        c"import asyncio\nclass _CancelForwardingAwaitable:\n    def __init__(self, inner, on_cancel):\n        self._inner = inner\n        self._on_cancel = on_cancel\n    def cancel(self):\n        self._on_cancel()\n        return self._inner.cancel()\n    def __await__(self):\n        async def _await_inner():\n            try:\n                return await self._inner\n            except asyncio.CancelledError:\n                self._on_cancel()\n                self._inner.cancel()\n                raise\n        return _await_inner().__await__()\n    def __getattr__(self, name):\n        return getattr(self._inner, name)\ndef wrap(inner, on_cancel):\n    return _CancelForwardingAwaitable(inner, on_cancel)",
+        c"<bashkit_cancel_wrapper>",
+        c"_bashkit_cancel_wrapper",
+    )?
+    .getattr("wrap")
+    .map(|wrap| wrap.unbind())
+}
+
+fn wrap_future_with_cancel<'py>(
+    py: Python<'py>,
+    future: Bound<'py, PyAny>,
+    session: Arc<PyCallbackSession>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let on_cancel = Py::new(py, PyCancelActiveCallbackTasksNow { session })?
+        .into_bound(py)
+        .into_any()
+        .unbind();
+    create_execute_cancel_wrapper(py)?
+        .bind(py)
+        .call1((future, on_cancel.bind(py)))
+}
+
+// Schedules an async callback on the caller's asyncio loop and awaits its result
+// with cancellation propagation — caller-loop-only, hence native-only. On wasm,
+// async callbacks run via the private-loop fallback in `call_python_callback_async`.
+#[cfg(not(target_arch = "wasm32"))]
+struct PyCancellableLoopFuture {
+    result_rx: Option<oneshot::Receiver<PyResult<Py<PyAny>>>>,
+    locals: TaskLocals,
+    shared_task: Arc<StdMutex<Option<Py<PyAny>>>>,
+    cancel_requested: Arc<AtomicBool>,
+    completed: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PyCancellableLoopFuture {
+    fn new(
+        py: Python<'_>,
+        session: Arc<PyCallbackSession>,
+        awaitable: Py<PyAny>,
+    ) -> PyResult<Self> {
+        let locals = session
+            .current_caller_loop_locals()
+            .expect("caller loop locals required for async callback session");
+        let (tx, rx) = oneshot::channel();
+        let shared_task = Arc::new(StdMutex::new(None));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let active_caller_tasks = session.active_caller_tasks();
+        let on_complete = Py::new(
+            py,
+            PyCallbackTaskCompleter {
+                tx: Some(tx),
+                active_caller_tasks: active_caller_tasks.clone(),
+            },
+        )?
+        .into_bound(py)
+        .into_any()
+        .unbind();
+        let scheduler = Py::new(
+            py,
+            PyScheduleCallbackTask {
+                awaitable,
+                on_complete,
+                shared_task: shared_task.clone(),
+                active_caller_tasks,
+                cancel_requested: cancel_requested.clone(),
+            },
+        )?
+        .into_bound(py)
+        .into_any()
+        .unbind();
+        call_soon_threadsafe_with_context(py, &locals, scheduler.bind(py))?;
+        Ok(Self {
+            result_rx: Some(rx),
+            locals,
+            shared_task,
+            cancel_requested,
+            completed: false,
+        })
+    }
+
+    async fn wait(mut self) -> PyResult<Py<PyAny>> {
+        let result_rx = self.result_rx.take().expect("callback result receiver");
+        let result = match result_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(Python::attach(asyncio_cancelled_error)?),
+        };
+        self.completed = true;
+        result
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PyCancellableLoopFuture {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        self.cancel_requested.store(true, Ordering::Relaxed);
+        Python::attach(|py| {
+            let maybe_task = self
+                .shared_task
+                .lock()
+                .ok()
+                .and_then(|shared_task| shared_task.as_ref().map(|task| task.clone_ref(py)));
+            if let Some(task) = maybe_task {
+                let _ = cancel_python_task(py, &self.locals, &task);
+            }
+        });
+    }
+}
+
+fn build_py_custom_builtin_entry(
+    py: Python<'_>,
+    name: String,
+    callback: Py<PyAny>,
+) -> PyResult<PyCustomBuiltinEntry> {
+    let bound = callback.bind(py);
+    let is_async = validate_python_callback(py, bound, || {
+        format!("custom_builtins['{name}'] must be callable")
+    })?;
+    Ok(PyCustomBuiltinEntry {
+        name,
+        callback,
+        is_async,
+    })
+}
+
+fn build_py_tool_entry(
+    py: Python<'_>,
+    name: String,
+    description: String,
+    callback: Py<PyAny>,
+    schema: Option<Bound<'_, pyo3::PyAny>>,
+) -> PyResult<PyToolEntry> {
+    let schema_val = match schema {
+        Some(ref schema) => py_to_json(py, schema)?,
+        None => serde_json::Value::Object(Default::default()),
+    };
+    let bound = callback.bind(py);
+    let is_async = validate_python_callback(py, bound, || {
+        format!("tool '{name}' callback must be callable")
+    })?;
+    Ok(PyToolEntry {
+        name,
+        description,
+        schema: schema_val,
+        callback,
+        is_async,
+    })
+}
+
+fn make_py_tool_callback_args(py: Python<'_>, args: &ToolArgs) -> Result<Vec<Py<PyAny>>, String> {
+    let params = json_to_py(py, &args.params).map_err(|e: PyErr| e.to_string())?;
+    let stdin_arg = match args.stdin.as_deref() {
+        Some(stdin) => stdin
+            .into_pyobject(py)
+            .expect("str -> Python object")
+            .into_any()
+            .unbind(),
+        None => py.None(),
+    };
+    Ok(vec![params, stdin_arg])
+}
+
+fn python_type_name(obj: &Bound<'_, PyAny>) -> String {
+    obj.get_type()
+        .str()
+        .and_then(|ty| ty.extract::<String>())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn call_python_callback_sync(
+    py: Python<'_>,
+    session: &PyCallbackSession,
+    callback_name: &str,
+    callback: &Py<PyAny>,
+    args: Vec<Py<PyAny>>,
+) -> Result<Py<PyAny>, String> {
+    session
+        .invoke(py, callback, args)
+        .map_err(|e| format!("{callback_name}: {e}"))
+}
+
+async fn call_python_callback_async(
+    session: Arc<PyCallbackSession>,
+    callback_name: &str,
+    callback: &Py<PyAny>,
+    args: Vec<Py<PyAny>>,
+) -> Result<Py<PyAny>, String> {
+    let awaitable = Python::attach(|py| session.invoke(py, callback, args))
+        .map_err(|e| format!("{callback_name}: {e}"))?;
+
+    // Caller-loop scheduling is native-only; on wasm we always use the private
+    // event-loop fallback (current-thread, no cross-loop bridging).
+    #[cfg(not(target_arch = "wasm32"))]
+    let result = if session.current_caller_loop_locals().is_some() {
+        let future = Python::attach(|py| PyCancellableLoopFuture::new(py, session, awaitable))
+            .map_err(|e| format!("{callback_name}: {e}"))?;
+        future
+            .wait()
+            .await
+            .map_err(|e| format!("{callback_name}: {e}"))?
+    } else {
+        run_private_loop_awaitable_yielding(session, awaitable)
+            .await
+            .map_err(|e| format!("{callback_name}: {e}"))?
+    };
+    #[cfg(target_arch = "wasm32")]
+    let result = Python::attach(|py| session.run_awaitable_on_private_loop(py, &awaitable))
+        .map_err(|e| format!("{callback_name}: {e}"))?;
+
+    Ok(result)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_private_loop_awaitable_yielding(
+    session: Arc<PyCallbackSession>,
+    awaitable: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    // THREAT[TM-DOS-057]: execute_sync() has no caller asyncio loop. Run the
+    // private Python event loop on Tokio's blocking pool so the interpreter
+    // future yields and Bashkit's execution timeout can preempt slow callbacks.
+    tokio::task::spawn_blocking(move || {
+        Python::attach(|py| session.run_awaitable_on_private_loop(py, &awaitable))
+    })
+    .await
+    .map_err(|e| PyRuntimeError::new_err(format!("Python async callback worker failed: {e}")))?
+}
+
+fn extract_python_string_callback_result(
+    py: Python<'_>,
+    callback_name: &str,
+    result: &Py<PyAny>,
+) -> Result<String, String> {
+    result
+        .extract::<String>(py)
+        .map_err(|e| format!("{callback_name}: callback must return str, got {e}"))
+}
+
+// Decision: keep Python custom builtin returns shell-first and narrow.
+// Accept `str` for compatibility and `BuiltinResult` for explicit
+// stdout/stderr/exit-code control, but do not expose interpreter-internal
+// ExecResult fields through this callback surface.
+fn extract_custom_builtin_callback_result(
+    py: Python<'_>,
+    callback_name: &str,
+    result: &Py<PyAny>,
+) -> Result<RustExecResult, String> {
+    let result = result.bind(py);
+    if let Ok(stdout) = result.extract::<String>() {
+        return Ok(RustExecResult::ok(stdout));
+    }
+
+    if let Ok(shell_result) = result.extract::<PyRef<'_, BuiltinResult>>() {
+        return Ok(RustExecResult {
+            stdout: shell_result.stdout.clone().into(),
+            stderr: shell_result.stderr.clone().into(),
+            exit_code: shell_result.exit_code,
+            ..Default::default()
+        });
+    }
+
+    Err(format!(
+        "{callback_name}: callback must return str or BuiltinResult, got {}",
+        python_type_name(result)
+    ))
+}
+
+fn call_python_string_callback_sync(
+    py: Python<'_>,
+    session: &PyCallbackSession,
+    callback_name: &str,
+    callback: &Py<PyAny>,
+    args: Vec<Py<PyAny>>,
+) -> Result<String, String> {
+    let result = call_python_callback_sync(py, session, callback_name, callback, args)?;
+    extract_python_string_callback_result(py, callback_name, &result)
+}
+
+async fn call_python_string_callback_async(
+    session: Arc<PyCallbackSession>,
+    callback_name: &str,
+    callback: &Py<PyAny>,
+    args: Vec<Py<PyAny>>,
+) -> Result<String, String> {
+    let result = call_python_callback_async(session, callback_name, callback, args).await?;
+    Python::attach(|py| extract_python_string_callback_result(py, callback_name, &result))
+}
+
+struct PyCustomBuiltinAdapter {
+    name: String,
+    callback: Py<PyAny>,
+    is_async: bool,
+    /// Shared runtime, threaded into each invocation's `ctx.fs` handle. A
+    /// `PyRuntime` clone is a refcount bump on the same `Arc<Runtime>` the
+    /// interpreter runs on; deterministic teardown still only fires when the
+    /// last clone drops (`Arc::into_inner` in `PyRuntime::drop`).
+    rt: PyRuntime,
+}
+
+impl PyCustomBuiltinAdapter {
+    fn from_entry(py: Python<'_>, entry: &PyCustomBuiltinEntry, rt: &PyRuntime) -> Self {
+        Self {
+            name: entry.name.clone(),
+            callback: entry.callback.clone_ref(py),
+            is_async: entry.is_async,
+            rt: rt.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl Builtin for PyCustomBuiltinAdapter {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<RustExecResult> {
+        let session = ctx.execution_extension::<Arc<PyCallbackSession>>();
+        let builtin_arg = Python::attach(|py| -> Result<Py<PyAny>, String> {
+            let builtin_arg = make_py_builtin_context(py, &self.name, &ctx, &self.rt)
+                .map_err(|e| format!("{}: {}", self.name, e))?
+                .into_bound(py)
+                .into_any()
+                .unbind();
+            Ok(builtin_arg)
+        });
+        let callback_result = match builtin_arg {
+            Ok(builtin_arg) if self.is_async => match session {
+                Some(session) => match session.try_with(Clone::clone) {
+                    Ok(callback_session) => session
+                        .run(call_python_callback_async(
+                            callback_session,
+                            &self.name,
+                            &self.callback,
+                            vec![builtin_arg],
+                        ))
+                        .await
+                        .unwrap_or_else(|error| Err(format!("{}: {error}", self.name))),
+                    Err(error) => Err(format!("{}: {error}", self.name)),
+                },
+                None => Err(format!("{}: missing Python callback session", self.name)),
+            },
+            Ok(builtin_arg) => match session {
+                Some(session) => session
+                    .try_with(|session| {
+                        Python::attach(|py| {
+                            call_python_callback_sync(
+                                py,
+                                session.as_ref(),
+                                &self.name,
+                                &self.callback,
+                                vec![builtin_arg],
+                            )
+                        })
+                    })
+                    .unwrap_or_else(|error| Err(format!("{}: {error}", self.name))),
+                None => Err(format!("{}: missing Python callback session", self.name)),
+            },
+            Err(err) => Err(err),
+        };
+
+        Ok(match callback_result {
+            Ok(result) => {
+                Python::attach(|py| extract_custom_builtin_callback_result(py, &self.name, &result))
+                    .unwrap_or_else(|msg| RustExecResult::err(msg, 1))
+            }
+            Err(msg) => RustExecResult::err(msg, 1),
+        })
+    }
+}
+
+fn build_runtime_custom_builtin_impls(
+    py: Python<'_>,
+    builtins: &[PyCustomBuiltinEntry],
+    rt: &PyRuntime,
+) -> Vec<PyCustomBuiltinAdapter> {
+    builtins
+        .iter()
+        .map(|entry| PyCustomBuiltinAdapter::from_entry(py, entry, rt))
+        .collect()
+}
+
+/// Populate a host-owned [`BuiltinRegistry`] from the per-instance entry list.
+///
+/// The registry is the live dispatch source — the same handle is threaded into
+/// the bashkit builder *and* retained on `PyBash`/`BashTool` so post-construction
+/// `add_builtin` / `remove_builtin` calls modify the in-flight interpreter
+/// without rebuilding it.
+fn populate_registry_from_entries(
+    py: Python<'_>,
+    registry: &BuiltinRegistry,
+    builtins: &[PyCustomBuiltinEntry],
+    rt: &PyRuntime,
+) {
+    for builtin in build_runtime_custom_builtin_impls(py, builtins, rt) {
+        registry.insert(builtin.name.clone(), Arc::new(builtin));
+    }
+}
+
+fn capture_custom_builtin_session(
+    py: Python<'_>,
+    builtins: &StdMutex<Vec<PyCustomBuiltinEntry>>,
+    engine: &Arc<PyCallbackEngine>,
+    use_caller_loop: bool,
+) -> PyResult<Option<Arc<PyCallbackSession>>> {
+    let (is_empty, has_async) = {
+        let guard = builtins
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("custom_builtins lock poisoned"))?;
+        (guard.is_empty(), guard.iter().any(|entry| entry.is_async))
+    };
+    if is_empty {
+        return Ok(None);
+    }
+    PyCallbackSession::capture(
+        py,
+        engine.clone(),
+        has_async,
+        use_caller_loop,
+        PySyncLoopMode::SharedAcrossSessions,
+    )
+    .map(Some)
+}
+
+/// Ordered log of host `set_env()` calls, replayed on rebuild.
+///
+/// A `Vec` rather than a map so replay follows call order. One entry per key:
+/// re-setting a key replaces its entry, which keeps last-write-wins semantics
+/// and bounds the log by distinct key count — a host that calls `set_env()` per
+/// request must not accumulate an entry per call.
+type RuntimeEnvLog = Arc<StdMutex<Vec<(String, String)>>>;
+
+/// Ordered log of host runtime mounts (vfs path + live filesystem), replayed on
+/// rebuild. The `Arc` is retained, so a replayed mount is the *same* filesystem,
+/// not a copy — writes made through it before the reset are still there after.
+type RuntimeMountLog = Arc<StdMutex<Vec<(String, Arc<dyn bashkit::FileSystem>)>>>;
+
+/// Record a host `set_env()` call for replay on the next rebuild.
+///
+/// A poisoned log is surfaced rather than swallowed: silently skipping the
+/// record would leave the caller believing a value survives `reset()` when it
+/// would not.
+fn record_runtime_env(log: &RuntimeEnvLog, key: &str, value: &str) -> PyResult<()> {
+    let mut entries = log
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("runtime env log poisoned"))?;
+    entries.retain(|(existing, _)| existing != key);
+    entries.push((key.to_string(), value.to_string()));
+    Ok(())
+}
+
+/// Record a host runtime mount for replay on the next rebuild.
+///
+/// A mount at an already-recorded path replaces that record: the live VFS keeps
+/// one filesystem per mount point, so the replay must too.
+fn record_runtime_mount(
+    log: &RuntimeMountLog,
+    vfs_path: &str,
+    fs: Arc<dyn bashkit::FileSystem>,
+) -> PyResult<()> {
+    let mut mounts = log
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("runtime mount log poisoned"))?;
+    mounts.retain(|(path, _)| path != vfs_path);
+    mounts.push((vfs_path.to_string(), fs));
+    Ok(())
+}
+
+/// Retract a recorded mount so `reset()` does not resurrect it after `unmount()`.
+fn forget_runtime_mount(log: &RuntimeMountLog, vfs_path: &str) -> PyResult<()> {
+    let mut mounts = log
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("runtime mount log poisoned"))?;
+    mounts.retain(|(path, _)| path != vfs_path);
+    Ok(())
+}
+
+fn replace_live_bash_with_builder(
+    py: Python<'_>,
+    rt: &Arc<Runtime>,
+    inner: &Arc<Mutex<Bash>>,
+    cancelled: &Arc<RwLock<Arc<AtomicBool>>>,
+    builder: bashkit::BashBuilder,
+    runtime_env: &RuntimeEnvLog,
+    runtime_mounts: &RuntimeMountLog,
+) -> PyResult<()> {
+    let rt = rt.clone();
+    let inner = inner.clone();
+    let cancelled = cancelled.clone();
+    let replay_env = runtime_env
+        .lock()
+        .map(|entries| entries.clone())
+        .unwrap_or_default();
+    let replay_mounts = runtime_mounts
+        .lock()
+        .map(|mounts| mounts.clone())
+        .unwrap_or_default();
+    py.detach(|| {
+        rt.block_on(async move {
+            let mut bash = inner.lock().await;
+            let mut rebuilt = builder.build();
+            // Replay host mounts. A recorded mount was accepted once on a live
+            // instance; a failure here means the path is no longer mountable
+            // (e.g. shadowed by a constructor mount). Skipping keeps reset
+            // infallible, and the absent mount is observable, unlike a panic
+            // mid-rebuild.
+            for (vfs_path, fs) in &replay_mounts {
+                let _ = rebuilt.mount(Path::new(vfs_path), Arc::clone(fs));
+            }
+            // Host env goes last so it wins over constructor `env` for the same
+            // key, matching what happened on the live instance.
+            for (key, value) in &replay_env {
+                rebuilt.set_env(key, value);
+            }
+            let token = rebuilt.cancellation_token();
+            *bash = rebuilt;
+            if let Ok(mut current) = cancelled.write() {
+                *current = token;
+            }
+            Ok(())
+        })
+    })
+}
+
+fn take_output_handler_error(callback_error: &StdMutex<Option<PyErr>>) -> Option<PyErr> {
+    callback_error
+        .lock()
+        .ok()
+        .and_then(|mut callback_error| callback_error.take())
+}
+
+fn close_awaitable_if_possible(awaitable: &Bound<'_, PyAny>) {
+    if let Ok(close) = awaitable.getattr("close") {
+        let _ = close.call0();
+    }
+}
+
+fn build_python_output_callback(
+    on_output: PyOutputHandler,
+    cancelled: Arc<AtomicBool>,
+    callback_requested_cancel: Arc<AtomicBool>,
+    callback_error: Arc<StdMutex<Option<PyErr>>>,
+) -> RustOutputCallback {
+    Box::new(move |stdout_chunk, stderr_chunk| {
+        let has_error = callback_error
+            .lock()
+            .map(|callback_error| callback_error.is_some())
+            .unwrap_or(false);
+        if has_error {
+            return;
+        }
+
+        let callback_result = Python::attach(|py| {
+            // Re-enter the caller's copied ContextVar snapshot for each chunk.
+            let result = on_output.context.bind(py).call_method1(
+                "run",
+                (
+                    on_output.callback.bind(py),
+                    stdout_chunk.to_string(),
+                    stderr_chunk.to_string(),
+                ),
+            )?;
+            let is_awaitable = on_output
+                .is_awaitable
+                .bind(py)
+                .call1((&result,))?
+                .extract::<bool>()?;
+            if is_awaitable {
+                close_awaitable_if_possible(&result);
+                return Err(PyTypeError::new_err(
+                    "on_output must be synchronous and must not return an awaitable",
+                ));
+            }
+            Ok(())
+        });
+
+        if let Err(err) = callback_result {
+            if let Ok(mut callback_error) = callback_error.lock()
+                && callback_error.is_none()
+            {
+                *callback_error = Some(err);
+            }
+            if !cancelled.swap(true, Ordering::Relaxed) {
+                callback_requested_cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+}
+
+async fn exec_bash_with_optional_output(
+    bash: &mut Bash,
+    commands: &str,
+    on_output: Option<PyOutputHandler>,
+    builtin_session: Option<Arc<PyCallbackSession>>,
+) -> PyResult<ExecResult> {
+    let mut execution_extensions = ExecutionExtensions::new();
+    if let Some(session) = builtin_session {
+        let _ = execution_extensions.insert(session);
+    }
+
+    let result = if let Some(on_output) = on_output {
+        // Preserve explicit cancel() calls across execute* entry. Only clear
+        // cancellation if an on_output failure introduced it for this call.
+        let cancelled = bash.cancellation_token();
+        let callback_requested_cancel = Arc::new(AtomicBool::new(false));
+        let callback_error = Arc::new(StdMutex::new(None));
+        let output_callback = build_python_output_callback(
+            on_output,
+            cancelled.clone(),
+            callback_requested_cancel.clone(),
+            callback_error.clone(),
+        );
+        let result = bash
+            .exec_streaming_with_extensions(commands, output_callback, execution_extensions)
+            .await;
+        if let Some(err) = take_output_handler_error(&callback_error) {
+            if callback_requested_cancel.load(Ordering::Relaxed) {
+                cancelled.store(false, Ordering::Relaxed);
+            }
+            return Err(err);
+        }
+        result
+    } else {
+        bash.exec_with_extensions(commands, execution_extensions)
+            .await
+    };
+
+    Ok(py_exec_result_from_bash_result(result))
+}
+
+/// Build a `PythonExternalFnHandler` from a Python async callable.
+///
+/// The handler converts MontyObject args/kwargs to Python objects, calls the
+/// async handler coroutine, awaits it, and converts the result back.
+// Decision: reject same-instance live Bash access from external_handler.
+// Releasing the interpreter mutex during Python callbacks would widen the
+// execution model; a targeted guard keeps the failure explicit and local.
+// Drives an async Python coroutine handler via pyo3-async-runtimes — native-only.
+// On wasm, external_handler is rejected at construction.
+#[cfg(not(target_arch = "wasm32"))]
+fn make_external_handler(
+    py_handler: Py<PyAny>,
+    external_handler_reentry_depth: Arc<AtomicUsize>,
+) -> PythonExternalFnHandler {
+    Arc::new(move |fn_name, args, kwargs| {
+        let py_handler = Python::attach(|py| py_handler.clone_ref(py));
+        let external_handler_reentry_depth = external_handler_reentry_depth.clone();
+        Box::pin(async move {
+            let _reentry_scope = ExternalHandlerReentryScope::enter(external_handler_reentry_depth);
+            let fut = Python::attach(|py| {
+                let py_args = args
+                    .iter()
+                    .map(|o| monty_to_py(py, o))
+                    .collect::<PyResult<Vec<_>>>()?;
+                let py_args_list = PyList::new(py, &py_args)?;
+                let py_kwargs = PyDict::new(py);
+                for (k, v) in &kwargs {
+                    py_kwargs.set_item(monty_to_py(py, k)?, monty_to_py(py, v)?)?;
+                }
+                let coro = py_handler.call1(py, (fn_name, py_args_list, py_kwargs))?;
+                pyo3_async_runtimes::tokio::into_future(coro.into_bound(py))
+            });
+            match fut {
+                Err(e) => ExtFunctionResult::Error(MontyException::new(
+                    ExcType::RuntimeError,
+                    Some(e.to_string()),
+                )),
+                Ok(awaitable) => match awaitable.await {
+                    Err(e) => ExtFunctionResult::Error(MontyException::new(
+                        ExcType::RuntimeError,
+                        Some(e.to_string()),
+                    )),
+                    Ok(py_result) => {
+                        Python::attach(|py| match py_to_monty(py, py_result.bind(py)) {
+                            Ok(v) => ExtFunctionResult::Return(v),
+                            Err(e) => ExtFunctionResult::Error(MontyException::new(
+                                ExcType::RuntimeError,
+                                Some(e.to_string()),
+                            )),
+                        })
+                    }
+                },
+            }
+        })
+    })
+}
+
+/// Apply python/external_handler configuration to a `BashBuilder`.
+///
+/// Centralises the logic shared between `new()` and `reset()`.
+fn apply_python_config(
+    mut builder: bashkit::BashBuilder,
+    python: bool,
+    limits: PythonLimits,
+    fn_names: Vec<String>,
+    handler: Option<Py<PyAny>>,
+    external_handler_reentry_depth: Arc<AtomicUsize>,
+) -> bashkit::BashBuilder {
+    // By construction, handler.is_some() implies python=true (validated in new()).
+    // On wasm, external_handler is rejected at construction, so handler is always
+    // None and the external-handler arm is native-only.
+    match (python, handler) {
+        #[cfg(not(target_arch = "wasm32"))]
+        (true, Some(h)) => {
+            builder = builder.python_with_external_handler(
+                limits,
+                fn_names,
+                make_external_handler(h, external_handler_reentry_depth),
+            );
+            // Passing python=True from Python is itself the explicit opt-in for
+            // in-process Python execution; propagate that to the builtin's env gate.
+            builder = builder.env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1");
+        }
+        #[cfg(target_arch = "wasm32")]
+        (true, Some(_)) => unreachable!("external_handler rejected at construction on wasm"),
+        (true, None) => {
+            let _ = (&fn_names, &external_handler_reentry_depth);
+            builder = builder.python_with_limits(limits);
+            builder = builder.env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1");
+        }
+        (false, _) => {}
+    }
+    builder
+}
+
+/// Apply the sqlite-builtin opt-in to a `BashBuilder`.
+///
+/// Mirrors `apply_python_config`: passing `sqlite=True` from Python is the
+/// explicit opt-in for in-process SQLite execution, so we register the
+/// builtin and inject the runtime gate env var. The deny-list defaults
+/// (resource/FS-shaped PRAGMAs) come from `SqliteLimits::default()`.
+#[cfg(not(target_arch = "wasm32"))]
+type ProfileSqliteLimits = bashkit::SqliteLimits;
+
+#[cfg(target_arch = "wasm32")]
+type ProfileSqliteLimits = ();
+
+fn profile_sqlite_limits(profile: &bashkit::ExecutionProfile) -> ProfileSqliteLimits {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        profile.sqlite_limits().clone()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = profile;
+    }
+}
+
+fn apply_sqlite_config(
+    builder: bashkit::BashBuilder,
+    sqlite: bool,
+    profile_limits: ProfileSqliteLimits,
+    timeout_seconds: Option<f64>,
+    max_memory: Option<u64>,
+) -> PyResult<bashkit::BashBuilder> {
+    // The embedded SQLite (Turso) backend needs the multi-threaded tokio runtime to
+    // bridge its sync IO trait back to the async VFS, so the core `sqlite` feature is
+    // off on wasm. Reject `sqlite=True` loudly there. See knowledge/runtimes/emscripten-wheels.md.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (profile_limits, timeout_seconds, max_memory);
+        if sqlite {
+            return Err(PyRuntimeError::new_err(
+                "the sqlite builtin is not available in the WebAssembly (Pyodide) build",
+            ));
+        }
+        Ok(builder)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut builder = builder;
+        if sqlite {
+            let mut limits = profile_limits;
+            if let Some(ts) = timeout_seconds {
+                limits = limits.max_duration(parse_timeout_seconds(ts)?);
+            }
+            if let Some(mm) = max_memory {
+                limits = limits.max_db_bytes(usize::try_from(mm).unwrap_or(usize::MAX));
+            }
+            builder = builder.sqlite_with_limits(limits);
+            builder = builder.env("BASHKIT_ALLOW_INPROCESS_SQLITE", "1");
+        }
+        Ok(builder)
+    }
+}
+
+/// Core bash interpreter with virtual filesystem.
+///
+/// State persists between calls — files created in one `execute()` are
+/// available in subsequent calls. This is the primary interface.
+///
+/// Example:
+///     ```python
+///     from bashkit import Bash
+///
+///     bash = Bash()
+///     result = await bash.execute("echo 'Hello, World!'")
+///     print(result.stdout)  # Hello, World!
+///     ```
+#[pyclass(name = "Bash")]
+#[allow(dead_code)]
+pub struct PyBash {
+    inner: Arc<Mutex<Bash>>,
+    /// Shared tokio runtime — reused across all sync calls to avoid
+    /// per-call OS thread/fd exhaustion (issue #414).
+    rt: PyRuntime,
+    /// Cancellation token. Wrapped in RwLock so reset() can swap it to
+    /// the new interpreter's token without requiring &mut self.
+    cancelled: Arc<RwLock<Arc<AtomicBool>>>,
+    username: Option<String>,
+    profile: PyExecutionProfile,
+    hostname: Option<String>,
+    /// Initial working directory for the shell (mirrors `Bash::builder().cwd()`).
+    cwd: Option<String>,
+    /// Initial environment variables (mirrors `Bash::builder().env()`).
+    env: Option<HashMap<String, String>>,
+    /// Whether Monty Python execution is enabled (`python`/`python3` builtins).
+    python: bool,
+    /// Whether the embedded SQLite (`sqlite`/`sqlite3`) builtin is enabled.
+    sqlite: bool,
+    /// External function names callable from Monty code via the handler.
+    external_functions: Vec<String>,
+    /// Async Python callable invoked when Monty calls an external function.
+    external_handler: Option<Py<PyAny>>,
+    external_handler_reentry_depth: Arc<AtomicUsize>,
+    /// Tracking list for `is_async` flag detection (used by session capture).
+    /// Kept in sync with `host_registry` by `add_builtin` / `remove_builtin`.
+    /// Wrapped in `Arc<StdMutex<_>>` so post-construction registration works
+    /// through `&self` like the rest of `PyBash`'s API.
+    custom_builtins: Arc<StdMutex<Vec<PyCustomBuiltinEntry>>>,
+    /// Host mutations applied *after* construction — `set_env()` and `mount()`.
+    ///
+    /// THREAT[TM-ISO-025]: `reset()` must not silently drop host capabilities.
+    /// Constructor options are replayed from the fields above; recording the
+    /// runtime equivalents puts them on the same rebuild path, so a bundle of
+    /// setup installed on a live instance (mount + env + builtins) is whole
+    /// after a reset instead of half-applied. Script-set env is deliberately
+    /// *not* recorded — only what the host asked for survives.
+    runtime_env: RuntimeEnvLog,
+    runtime_mounts: RuntimeMountLog,
+    /// Host-owned live registry of custom builtins. Cloned into the bashkit
+    /// builder and retained here so post-construction registrations take
+    /// effect without rebuilding the interpreter (and without disturbing the
+    /// VFS). Survives `reset()` by being passed to every rebuild.
+    host_registry: BuiltinRegistry,
+    builtin_engine: Arc<PyCallbackEngine>,
+    files: Vec<PyFileMount>,
+    real_mounts: Vec<RealMountConfig>,
+    allowed_mount_paths: Option<Vec<String>>,
+    readonly_filesystem: bool,
+    max_commands: Option<u64>,
+    max_loop_iterations: Option<u64>,
+    max_memory: Option<u64>,
+    timeout_seconds: Option<f64>,
+    /// Outbound network config preserved across `reset()` and snapshots.
+    /// `None` means the interpreter is built without a `NetworkAllowlist`,
+    /// matching the current "network disabled" default.
+    network: Option<PyNetworkConfig>,
+}
+
+// THREAT[TM-PY-030]: see the equivalent Drop on ScriptedTool.
+impl Drop for PyBash {
+    fn drop(&mut self) {
+        if !interpreter_at_exit() {
+            self.builtin_engine.cancel_inflight_callbacks();
+        }
+    }
+}
+
+impl PyBash {
+    fn reject_external_handler_reentry(&self) -> PyResult<()> {
+        reject_external_handler_reentry_depth(Some(&self.external_handler_reentry_depth))
+    }
+
+    fn build_live_builder(&self, py: Python<'_>) -> PyResult<bashkit::BashBuilder> {
+        let profile = self.profile.core();
+        let mut builder = Bash::builder().profile(profile.clone());
+
+        if let Some(ref username) = self.username {
+            builder = builder.username(username);
+        }
+        if let Some(ref hostname) = self.hostname {
+            builder = builder.hostname(hostname);
+        }
+        if let Some(ref cwd) = self.cwd {
+            builder = builder.cwd(cwd.as_str());
+        }
+        if let Some(ref env) = self.env {
+            for (k, v) in env {
+                builder = builder.env(k, v);
+            }
+        }
+
+        let mut limits = profile.execution_limits().clone();
+        if let Some(max_commands) = self.max_commands {
+            limits = limits.max_commands(usize::try_from(max_commands).unwrap_or(usize::MAX));
+        }
+        if let Some(max_loop_iterations) = self.max_loop_iterations {
+            limits = limits
+                .max_loop_iterations(usize::try_from(max_loop_iterations).unwrap_or(usize::MAX));
+        }
+        if let Some(timeout_seconds) = self.timeout_seconds {
+            limits = limits.timeout(parse_timeout_seconds(timeout_seconds)?);
+        }
+        builder = builder.limits(limits);
+
+        if let Some(max_memory) = self.max_memory {
+            builder = builder.max_memory(usize::try_from(max_memory).unwrap_or(usize::MAX));
+        }
+
+        let handler_clone = self.external_handler.as_ref().map(|h| h.clone_ref(py));
+        builder = apply_python_config(
+            builder,
+            self.python,
+            profile.python_limits().clone(),
+            self.external_functions.clone(),
+            handler_clone,
+            self.external_handler_reentry_depth.clone(),
+        );
+        builder = apply_sqlite_config(
+            builder,
+            self.sqlite,
+            profile_sqlite_limits(&profile),
+            self.timeout_seconds,
+            self.max_memory,
+        )?;
+        // network (http_client) and allowed_mount_paths (realfs) are native-only;
+        // both kwargs are rejected at construction on wasm. See knowledge/runtimes/emscripten-wheels.md.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(ref net) = self.network {
+                builder = net.apply(builder);
+            }
+            if let Some(ref paths) = self.allowed_mount_paths {
+                builder =
+                    builder.allowed_mount_paths(paths.iter().map(|p| PathBuf::from(p.as_str())));
+            }
+        }
+        let files = clone_file_mounts(py, &self.files);
+        let mut builder = apply_fs_config(builder, &files, &self.real_mounts)?;
+        builder = builder.readonly_filesystem(self.readonly_filesystem);
+        let _ = py;
+        Ok(builder.builtin_registry(self.host_registry.clone()))
+    }
+}
+
+#[pymethods]
+impl PyBash {
+    #[new]
+    #[pyo3(signature = (
+        username=None,
+        hostname=None,
+        cwd=None,
+        env=None,
+        max_commands=None,
+        max_loop_iterations=None,
+        max_memory=None,
+        timeout_seconds=None,
+        python=false,
+        sqlite=false,
+        external_functions=None,
+        external_handler=None,
+        files=None,
+        mounts=None,
+        allowed_mount_paths=None,
+        readonly_filesystem=false,
+        custom_builtins=None,
+        network=None,
+        profile=PyExecutionProfile::Standard,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        username: Option<String>,
+        hostname: Option<String>,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        max_commands: Option<u64>,
+        max_loop_iterations: Option<u64>,
+        max_memory: Option<u64>,
+        timeout_seconds: Option<f64>,
+        python: bool,
+        sqlite: bool,
+        external_functions: Option<Vec<String>>,
+        external_handler: Option<Py<PyAny>>,
+        files: Option<&Bound<'_, PyDict>>,
+        mounts: Option<&Bound<'_, PyList>>,
+        allowed_mount_paths: Option<Vec<String>>,
+        readonly_filesystem: bool,
+        custom_builtins: Option<&Bound<'_, PyDict>>,
+        network: Option<&Bound<'_, PyDict>>,
+        profile: PyExecutionProfile,
+    ) -> PyResult<Self> {
+        let core_profile = profile.core();
+        let mut builder = Bash::builder().profile(core_profile.clone());
+
+        if let Some(ref u) = username {
+            builder = builder.username(u);
+        }
+        if let Some(ref h) = hostname {
+            builder = builder.hostname(h);
+        }
+        if let Some(ref c) = cwd {
+            builder = builder.cwd(c.as_str());
+        }
+        if let Some(ref env) = env {
+            for (k, v) in env {
+                builder = builder.env(k, v);
+            }
+        }
+
+        let mut limits = core_profile.execution_limits().clone();
+        if let Some(mc) = max_commands {
+            limits = limits.max_commands(usize::try_from(mc).unwrap_or(usize::MAX));
+        }
+        if let Some(mli) = max_loop_iterations {
+            limits = limits.max_loop_iterations(usize::try_from(mli).unwrap_or(usize::MAX));
+        }
+        if let Some(ts) = timeout_seconds {
+            limits = limits.timeout(parse_timeout_seconds(ts)?);
+        }
+        builder = builder.limits(limits);
+
+        if let Some(mm) = max_memory {
+            builder = builder.max_memory(usize::try_from(mm).unwrap_or(usize::MAX));
+        }
+
+        let files = parse_files(files)?;
+        let real_mounts = parse_mounts(mounts)?;
+        let custom_builtins = parse_custom_builtins(py, custom_builtins)?;
+        let network = parse_network_config(network)?;
+
+        let fn_names = external_functions.clone().unwrap_or_default();
+        // external_handler runs an async Python coroutine driven through
+        // pyo3-async-runtimes, which the wasm build omits. Reject it there.
+        #[cfg(target_arch = "wasm32")]
+        if external_handler.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "external_handler is not available in the WebAssembly (Pyodide) build",
+            ));
+        }
+        if !fn_names.is_empty() && external_handler.is_none() {
+            return Err(PyValueError::new_err(
+                "external_functions requires external_handler — the list has no effect without a handler",
+            ));
+        }
+        if external_handler.is_some() && !python {
+            return Err(PyValueError::new_err(
+                "external_handler requires python=True",
+            ));
+        }
+        if external_handler
+            .as_ref()
+            .is_some_and(|h| !h.bind(py).is_callable())
+        {
+            return Err(PyValueError::new_err("external_handler must be callable"));
+        }
+        if let Some(ref handler) = external_handler {
+            let bound = handler.bind(py);
+            if !is_coroutine_callable(py, bound)? {
+                return Err(PyValueError::new_err(
+                    "external_handler must be an async callable (coroutine function)",
+                ));
+            }
+        }
+        let handler_for_build = external_handler.as_ref().map(|h| h.clone_ref(py));
+        let external_handler_reentry_depth = Arc::new(AtomicUsize::new(0));
+        builder = apply_python_config(
+            builder,
+            python,
+            core_profile.python_limits().clone(),
+            fn_names,
+            handler_for_build,
+            external_handler_reentry_depth.clone(),
+        );
+        builder = apply_sqlite_config(
+            builder,
+            sqlite,
+            profile_sqlite_limits(&core_profile),
+            timeout_seconds,
+            max_memory,
+        )?;
+        // network (http_client) and allowed_mount_paths (realfs) are native-only;
+        // both kwargs are rejected at construction on wasm. See knowledge/runtimes/emscripten-wheels.md.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(ref net) = network {
+                builder = net.apply(builder);
+            }
+            if let Some(ref paths) = allowed_mount_paths {
+                builder =
+                    builder.allowed_mount_paths(paths.iter().map(|p| PathBuf::from(p.as_str())));
+            }
+        }
+        builder = apply_fs_config(builder, &files, &real_mounts)?;
+        builder = builder.readonly_filesystem(readonly_filesystem);
+        let builtin_engine = PyCallbackEngine::new(py)?;
+        let host_registry = BuiltinRegistry::new();
+        let rt = make_runtime()?;
+        populate_registry_from_entries(py, &host_registry, &custom_builtins, &rt);
+        builder = builder.builtin_registry(host_registry.clone());
+
+        let bash = builder.build();
+        let cancelled = Arc::new(RwLock::new(bash.cancellation_token()));
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(bash)),
+            rt,
+            cancelled,
+            username,
+            profile,
+            hostname,
+            cwd,
+            env,
+            python,
+            sqlite,
+            external_functions: external_functions.unwrap_or_default(),
+            external_handler,
+            external_handler_reentry_depth,
+            custom_builtins: Arc::new(StdMutex::new(custom_builtins)),
+            runtime_env: Arc::new(StdMutex::new(Vec::new())),
+            runtime_mounts: Arc::new(StdMutex::new(Vec::new())),
+            host_registry,
+            builtin_engine,
+            files,
+            real_mounts,
+            allowed_mount_paths,
+            readonly_filesystem,
+            max_commands,
+            max_loop_iterations,
+            max_memory,
+            timeout_seconds,
+            network,
+        })
+    }
+
+    /// Cancel the currently running execution.
+    ///
+    /// Safe to call from any thread. Execution will abort at the next
+    /// command boundary.
+    fn cancel(&self) {
+        if let Ok(token) = self.cancelled.read() {
+            token.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear the cancellation flag so subsequent executions proceed normally.
+    ///
+    /// Call this after a `cancel()` once the in-flight execution has finished
+    /// and you want to reuse the same `Bash` instance (preserving VFS state).
+    /// Without this, every future `execute()` will immediately fail with
+    /// ``"execution cancelled"``.
+    ///
+    /// **Note:** Calling this while an execution is still in-flight may
+    /// allow that execution to continue past the cancellation point.
+    /// Wait for the cancelled execution to finish before clearing
+    /// (await the async call or let `execute_sync` return).
+    fn clear_cancel(&self) {
+        if let Ok(token) = self.cancelled.read() {
+            token.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Execute commands asynchronously.
+    ///
+    /// Native-only: the async API bridges to a Python asyncio loop via
+    /// pyo3-async-runtimes, which the WebAssembly (Pyodide) build omits. On wasm,
+    /// use `execute_sync()`. See knowledge/runtimes/emscripten-wheels.md.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reject_external_handler_reentry()?;
+        let builtin_session =
+            capture_custom_builtin_session(py, &self.custom_builtins, &self.builtin_engine, true)?;
+        let on_output = prepare_output_handler(py, on_output)?;
+        let inner = self.inner.clone();
+        let cancel_session = builtin_session.clone();
+        let future = future_into_py(py, async move {
+            let mut bash = inner.lock().await;
+            exec_bash_with_optional_output(&mut bash, &commands, on_output, builtin_session).await
+        })?;
+        if let Some(cancel_session) = cancel_session {
+            attach_future_cancellation_callback(py, &future, cancel_session.clone())?;
+            return wrap_future_with_cancel(py, future, cancel_session);
+        }
+        Ok(future)
+    }
+
+    /// Execute commands synchronously (blocking).
+    ///
+    /// Not supported when `external_handler` is configured: the handler is an async
+    /// Python coroutine that requires a running event loop, which is unavailable in
+    /// sync context. Use `execute()` (async) instead.
+    ///
+    /// Releases GIL before blocking on tokio to prevent deadlock with callbacks.
+    ///
+    /// # Thread safety
+    ///
+    /// This method acquires an async mutex with a 30-second timeout to prevent
+    /// deadlocks when multiple threads call `execute_sync()` concurrently on the
+    /// same `Bash` instance. If the lock cannot be acquired within the timeout,
+    /// a `RuntimeError` is raised. For concurrent workloads, use separate `Bash`
+    /// instances per thread or use the async `execute()` method.
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute_sync(
+        &self,
+        py: Python<'_>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<ExecResult> {
+        if self.external_handler.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "execute_sync is not supported when external_handler is configured — use execute() (async) instead, e.g. asyncio.run(bash.execute(...))",
+            ));
+        }
+        let builtin_session =
+            capture_custom_builtin_session(py, &self.custom_builtins, &self.builtin_engine, false)?;
+        let on_output = prepare_output_handler(py, on_output)?;
+        let inner = self.inner.clone();
+
+        py.detach(|| {
+            self.rt.block_on(async move {
+                // THREAT[TM-DOS-FFI]: Use timeout on mutex acquisition to prevent
+                // deadlocks when multiple Python threads call execute_sync concurrently.
+                let mut bash =
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), inner.lock())
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Err(PyRuntimeError::new_err(
+                                "execute_sync: timed out waiting for lock (30s). \
+                             Another thread may be holding the interpreter. \
+                             Use separate Bash instances for concurrent access.",
+                            ));
+                        }
+                    };
+                exec_bash_with_optional_output(&mut bash, &commands, on_output, builtin_session)
+                    .await
+            })
+        })
+    }
+
+    /// Execute commands synchronously. Raises `BashError` on non-zero exit.
+    ///
+    /// Not supported when `external_handler` is configured.
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute_sync_or_throw(
+        &self,
+        py: Python<'_>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<ExecResult> {
+        let result = self.execute_sync(py, commands, on_output)?;
+        if result.exit_code != 0 {
+            return Err(raise_bash_error(&result));
+        }
+        Ok(result)
+    }
+
+    /// Execute commands asynchronously. Raises `BashError` on non-zero exit.
+    ///
+    /// Native-only (see `execute`). Use `execute_sync_or_throw()` on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute_or_throw<'py>(
+        &self,
+        py: Python<'py>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reject_external_handler_reentry()?;
+        let builtin_session =
+            capture_custom_builtin_session(py, &self.custom_builtins, &self.builtin_engine, true)?;
+        let on_output = prepare_output_handler(py, on_output)?;
+        let inner = self.inner.clone();
+        let cancel_session = builtin_session.clone();
+        let future = future_into_py(py, async move {
+            let mut bash = inner.lock().await;
+            let result =
+                exec_bash_with_optional_output(&mut bash, &commands, on_output, builtin_session)
+                    .await?;
+            if result.exit_code != 0 {
+                return Err(raise_bash_error(&result));
+            }
+            Ok(result)
+        })?;
+        if let Some(cancel_session) = cancel_session {
+            attach_future_cancellation_callback(py, &future, cancel_session.clone())?;
+            return wrap_future_with_cancel(py, future, cancel_session);
+        }
+        Ok(future)
+    }
+
+    /// Register a Python callback as a custom bash builtin.
+    ///
+    /// Inserts into the host-owned `BuiltinRegistry` consulted on every
+    /// dispatch, so subsequent `execute*` calls pick up the new builtin
+    /// without rebuilding the interpreter or disturbing the VFS. The
+    /// registration also survives `reset()` because the registry is the live
+    /// source threaded into every rebuild.
+    ///
+    /// Override precedence matches `custom_builtins` at construction time:
+    /// shell function > POSIX special builtin > custom builtin > baked-in
+    /// builtin > `PATH`.
+    fn add_builtin(&self, py: Python<'_>, name: String, callback: Py<PyAny>) -> PyResult<()> {
+        let entry = build_py_custom_builtin_entry(py, name.clone(), callback)?;
+        let adapter = PyCustomBuiltinAdapter::from_entry(py, &entry, &self.rt);
+        {
+            let mut guard = self
+                .custom_builtins
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("custom_builtins lock poisoned"))?;
+            guard.retain(|e| e.name != name);
+            guard.push(entry);
+        }
+        self.host_registry.insert(name, Arc::new(adapter));
+        Ok(())
+    }
+
+    /// Remove a previously registered custom builtin. No-op if not present.
+    fn remove_builtin(&self, name: String) -> PyResult<()> {
+        {
+            let mut guard = self
+                .custom_builtins
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("custom_builtins lock poisoned"))?;
+            guard.retain(|e| e.name != name);
+        }
+        self.host_registry.remove(&name);
+        Ok(())
+    }
+
+    /// Reset interpreter to fresh state, preserving all configuration including
+    /// python mode, external function handler, and custom builtins.
+    /// Releases GIL before blocking on tokio to prevent deadlock.
+    fn reset(&self, py: Python<'_>) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        replace_live_bash_with_builder(
+            py,
+            &self.rt,
+            &self.inner,
+            &self.cancelled,
+            self.build_live_builder(py)?,
+            &self.runtime_env,
+            &self.runtime_mounts,
+        )
+    }
+
+    /// Capture state as a content-addressed commit for session history.
+    ///
+    /// Returns a `PackedCommit` holding the objects to persist and the commit
+    /// id to remember. Pass the ids your store already holds via `have=` to
+    /// keep consecutive commits incremental — unchanged files then cost a hash
+    /// reference instead of a copy.
+    ///
+    /// A fork is a commit whose parent is not the branch tip: pass any earlier
+    /// commit id as `parents`.
+    #[pyo3(signature = (parents=None, meta=None, have=None, exclude_filesystem=false, exclude_functions=false))]
+    fn commit(
+        &self,
+        py: Python<'_>,
+        parents: Option<Vec<String>>,
+        meta: Option<HashMap<String, String>>,
+        have: Option<Vec<String>>,
+        exclude_filesystem: bool,
+        exclude_functions: bool,
+    ) -> PyResult<PyPackedCommit> {
+        self.reject_external_handler_reentry()?;
+        commit_live_bash(
+            py,
+            &self.rt,
+            &self.inner,
+            parents.unwrap_or_default(),
+            meta.unwrap_or_default(),
+            have.unwrap_or_default(),
+            exclude_filesystem,
+            exclude_functions,
+        )
+    }
+
+    /// Restore the state a commit describes, pulling objects from `objects`.
+    ///
+    /// This is how rewinds and forks work: check out any commit, tip or not.
+    /// `policy` is one of `"superset"` (default), `"strict"`, or `"force"` —
+    /// see the snapshotting guide. Nothing is mutated if the checkout fails.
+    #[pyo3(signature = (commit_id, objects, policy="superset"))]
+    fn checkout(
+        &self,
+        py: Python<'_>,
+        commit_id: &str,
+        objects: HashMap<String, Vec<u8>>,
+        policy: &str,
+    ) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        let state = capture_shell_state(py, &self.rt, &self.inner)?;
+        let env_overrides = placeholder_env_overrides(&state, &self.network);
+        checkout_live_bash(
+            py,
+            &self.rt,
+            &self.inner,
+            commit_id,
+            objects,
+            policy,
+            &env_overrides,
+        )
+    }
+
+    /// Fingerprint this instance's environment.
+    ///
+    /// Compare against `SnapshotGraph.capabilities(...)` to tell whether a
+    /// stored commit will pass a given checkout policy before attempting it.
+    fn capabilities(&self, py: Python<'_>) -> PyResult<PyCapabilityFingerprint> {
+        self.reject_external_handler_reentry()?;
+        let rt = self.rt.clone();
+        let inner = self.inner.clone();
+        let caps = py.detach(|| {
+            rt.block_on(async move {
+                let bash = inner.lock().await;
+                RustCapabilityFingerprint::capture(&bash)
+            })
+        });
+        Ok(caps.into())
+    }
+
+    /// Serialize interpreter state to bytes for checkpoint/restore flows.
+    #[pyo3(signature = (exclude_filesystem=false, exclude_functions=false))]
+    fn snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        exclude_filesystem: bool,
+        exclude_functions: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        self.reject_external_handler_reentry()?;
+        let bytes = snapshot_live_bash(
+            py,
+            &self.rt,
+            &self.inner,
+            exclude_filesystem,
+            exclude_functions,
+        )?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Serialize interpreter state to HMAC-protected bytes for untrusted storage.
+    #[pyo3(signature = (key, exclude_filesystem=false, exclude_functions=false))]
+    fn snapshot_keyed<'py>(
+        &self,
+        py: Python<'py>,
+        key: Vec<u8>,
+        exclude_filesystem: bool,
+        exclude_functions: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        self.reject_external_handler_reentry()?;
+        let bytes = snapshot_live_bash_keyed(
+            py,
+            &self.rt,
+            &self.inner,
+            key,
+            exclude_filesystem,
+            exclude_functions,
+        )?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Analyze a script without running it.
+    ///
+    /// Parses `script` with this instance's parser limits and reports the
+    /// commands, redirect targets, and function definitions it statically
+    /// refers to. Nothing is executed and no instance state changes.
+    ///
+    /// Intended for permission prompts and audit logging. **Advisory only** —
+    /// check `is_opaque` before treating an allowlist match as safe. Raises
+    /// `BashError` if the script does not parse; treat that as "deny or
+    /// prompt", never as "no commands".
+    fn analyze(&self, py: Python<'_>, script: &str) -> PyResult<ScriptAnalysis> {
+        self.reject_external_handler_reentry()?;
+        analyze_script(py, &self.rt, &self.inner, script)
+    }
+
+    /// Capture a read-only shell-state snapshot for prompt rendering and inspection.
+    fn shell_state(&self, py: Python<'_>) -> PyResult<ShellState> {
+        self.reject_external_handler_reentry()?;
+        capture_shell_state(py, &self.rt, &self.inner)
+    }
+
+    /// Restore interpreter state from bytes previously produced by `snapshot()`.
+    fn restore_snapshot(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        let state = capture_shell_state(py, &self.rt, &self.inner)?;
+        let env_overrides = placeholder_env_overrides(&state, &self.network);
+        restore_live_bash_with_env_overrides(py, &self.rt, &self.inner, data, &env_overrides)
+    }
+
+    /// Restore interpreter state from HMAC-protected bytes produced by `snapshot_keyed()`.
+    fn restore_snapshot_keyed(&self, py: Python<'_>, data: Vec<u8>, key: Vec<u8>) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        let state = capture_shell_state(py, &self.rt, &self.inner)?;
+        let env_overrides = placeholder_env_overrides(&state, &self.network);
+        restore_live_bash_keyed_with_env_overrides(
+            py,
+            &self.rt,
+            &self.inner,
+            data,
+            key,
+            &env_overrides,
+        )
+    }
+
+    /// Create a new Bash instance from a snapshot and optional constructor kwargs.
+    #[staticmethod]
+    #[pyo3(signature = (
+        data,
+        username=None,
+        hostname=None,
+        cwd=None,
+        env=None,
+        max_commands=None,
+        max_loop_iterations=None,
+        max_memory=None,
+        timeout_seconds=None,
+        python=false,
+        sqlite=false,
+        external_functions=None,
+        external_handler=None,
+        files=None,
+        mounts=None,
+        allowed_mount_paths=None,
+        readonly_filesystem=false,
+        custom_builtins=None,
+        network=None,
+        profile=PyExecutionProfile::Standard,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_snapshot(
+        py: Python<'_>,
+        data: Vec<u8>,
+        username: Option<String>,
+        hostname: Option<String>,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        max_commands: Option<u64>,
+        max_loop_iterations: Option<u64>,
+        max_memory: Option<u64>,
+        timeout_seconds: Option<f64>,
+        python: bool,
+        sqlite: bool,
+        external_functions: Option<Vec<String>>,
+        external_handler: Option<Py<PyAny>>,
+        files: Option<&Bound<'_, PyDict>>,
+        mounts: Option<&Bound<'_, PyList>>,
+        allowed_mount_paths: Option<Vec<String>>,
+        readonly_filesystem: bool,
+        custom_builtins: Option<&Bound<'_, PyDict>>,
+        network: Option<&Bound<'_, PyDict>>,
+        profile: PyExecutionProfile,
+    ) -> PyResult<Self> {
+        let bash = Self::new(
+            py,
+            username,
+            hostname,
+            cwd,
+            env,
+            max_commands,
+            max_loop_iterations,
+            max_memory,
+            timeout_seconds,
+            python,
+            sqlite,
+            external_functions,
+            external_handler,
+            files,
+            mounts,
+            allowed_mount_paths,
+            readonly_filesystem,
+            custom_builtins,
+            network,
+            profile,
+        )?;
+        bash.restore_snapshot(py, data)?;
+        Ok(bash)
+    }
+
+    /// Create a new Bash instance from HMAC-protected snapshot bytes.
+    #[staticmethod]
+    #[pyo3(signature = (
+        data,
+        key,
+        username=None,
+        hostname=None,
+        cwd=None,
+        env=None,
+        max_commands=None,
+        max_loop_iterations=None,
+        max_memory=None,
+        timeout_seconds=None,
+        python=false,
+        sqlite=false,
+        external_functions=None,
+        external_handler=None,
+        files=None,
+        mounts=None,
+        allowed_mount_paths=None,
+        readonly_filesystem=false,
+        custom_builtins=None,
+        network=None,
+        profile=PyExecutionProfile::Standard,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_snapshot_keyed(
+        py: Python<'_>,
+        data: Vec<u8>,
+        key: Vec<u8>,
+        username: Option<String>,
+        hostname: Option<String>,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        max_commands: Option<u64>,
+        max_loop_iterations: Option<u64>,
+        max_memory: Option<u64>,
+        timeout_seconds: Option<f64>,
+        python: bool,
+        sqlite: bool,
+        external_functions: Option<Vec<String>>,
+        external_handler: Option<Py<PyAny>>,
+        files: Option<&Bound<'_, PyDict>>,
+        mounts: Option<&Bound<'_, PyList>>,
+        allowed_mount_paths: Option<Vec<String>>,
+        readonly_filesystem: bool,
+        custom_builtins: Option<&Bound<'_, PyDict>>,
+        network: Option<&Bound<'_, PyDict>>,
+        profile: PyExecutionProfile,
+    ) -> PyResult<Self> {
+        let bash = Self::new(
+            py,
+            username,
+            hostname,
+            cwd,
+            env,
+            max_commands,
+            max_loop_iterations,
+            max_memory,
+            timeout_seconds,
+            python,
+            sqlite,
+            external_functions,
+            external_handler,
+            files,
+            mounts,
+            allowed_mount_paths,
+            readonly_filesystem,
+            custom_builtins,
+            network,
+            profile,
+        )?;
+        bash.restore_snapshot_keyed(py, data, key)?;
+        Ok(bash)
+    }
+
+    fn read_file(&self, py: Python<'_>, path: String) -> PyResult<String> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| read_text_via_live_fs(&self.rt, &self.inner, path))
+    }
+
+    fn write_file(&self, py: Python<'_>, path: String, content: String) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| write_text_via_live_fs(&self.rt, &self.inner, path, content))
+    }
+
+    fn append_file(&self, py: Python<'_>, path: String, content: String) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| append_text_via_live_fs(&self.rt, &self.inner, path, content))
+    }
+
+    #[pyo3(signature = (path, recursive=false))]
+    fn mkdir(&self, py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| mkdir_via_live_fs(&self.rt, &self.inner, path, recursive))
+    }
+
+    fn exists(&self, py: Python<'_>, path: String) -> PyResult<bool> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| exists_via_live_fs(&self.rt, &self.inner, path))
+    }
+
+    #[pyo3(signature = (path, recursive=false))]
+    fn remove(&self, py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| remove_via_live_fs(&self.rt, &self.inner, path, recursive))
+    }
+
+    fn stat(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        self.reject_external_handler_reentry()?;
+        let metadata = py.detach(|| stat_via_live_fs(&self.rt, &self.inner, path))?;
+        metadata_to_pydict(py, &metadata)
+    }
+
+    fn chmod(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| chmod_via_live_fs(&self.rt, &self.inner, path, mode))
+    }
+
+    fn symlink(&self, py: Python<'_>, target: String, link: String) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| symlink_via_live_fs(&self.rt, &self.inner, target, link))
+    }
+
+    fn read_link(&self, py: Python<'_>, path: String) -> PyResult<String> {
+        self.reject_external_handler_reentry()?;
+        py.detach(|| read_link_via_live_fs(&self.rt, &self.inner, path))
+    }
+
+    fn read_dir(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        self.reject_external_handler_reentry()?;
+        let entries = py.detach(|| read_dir_via_live_fs(&self.rt, &self.inner, path))?;
+        let items: Vec<Py<PyAny>> = entries
+            .iter()
+            .map(|entry| dir_entry_to_pydict(py, entry))
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new(py, &items)?.into_any().unbind())
+    }
+
+    #[pyo3(signature = (path=".".to_string()))]
+    fn ls(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        self.reject_external_handler_reentry()?;
+        let names = match py.detach(|| read_dir_via_live_fs(&self.rt, &self.inner, path)) {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        Ok(PyList::new(py, names)?.into_any().unbind())
+    }
+
+    fn glob(&self, py: Python<'_>, pattern: String) -> PyResult<Py<PyAny>> {
+        self.reject_external_handler_reentry()?;
+        let matches = py.detach(|| -> PyResult<Vec<String>> {
+            Ok(glob_via_bash(
+                &self.rt,
+                &self.inner,
+                pattern,
+                glob_timeout(self.timeout_seconds),
+            ))
+        })?;
+        Ok(PyList::new(py, matches)?.into_any().unbind())
+    }
+
+    /// Return a live filesystem handle backed by the current interpreter.
+    ///
+    /// Each operation on the returned handle acquires the interpreter lock,
+    /// so it always reflects the latest state (including post-reset). For
+    /// batch reads where consistency isn't needed, prefer reading files via
+    /// `execute_sync("cat ...")`.
+    fn fs(&self, py: Python<'_>) -> PyResult<Py<PyFileSystem>> {
+        self.reject_external_handler_reentry()?;
+        Py::new(
+            py,
+            PyFileSystem::from_live_with_reentry_guard(
+                self.inner.clone(),
+                self.rt.clone(),
+                self.external_handler_reentry_depth.clone(),
+            ),
+        )
+    }
+
+    /// Mount a filesystem at `vfs_path` without rebuilding the interpreter.
+    ///
+    /// Recorded, so `reset()` replays it — see `runtime_mounts`.
+    fn mount(&self, py: Python<'_>, vfs_path: String, fs: PyRef<'_, PyFileSystem>) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        let inner = self.inner.clone();
+        let source = fs.inner.clone();
+        let runtime_mounts = self.runtime_mounts.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let mounted_fs = source.resolve().await?;
+                let bash = inner.lock().await;
+                bash.mount(Path::new(&vfs_path), Arc::clone(&mounted_fs))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                record_runtime_mount(&runtime_mounts, &vfs_path, mounted_fs)?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Unmount a live filesystem without rebuilding the interpreter.
+    fn unmount(&self, py: Python<'_>, vfs_path: String) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        let inner = self.inner.clone();
+        let runtime_mounts = self.runtime_mounts.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let bash = inner.lock().await;
+                bash.unmount(Path::new(&vfs_path))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                forget_runtime_mount(&runtime_mounts, &vfs_path)?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Set an exported environment variable on the live interpreter.
+    ///
+    /// The env counterpart to runtime `mount()`: usable after construction, so
+    /// a reusable setup bundle can apply mounts, env, and builtins to an
+    /// existing instance instead of only through the constructor. Survives
+    /// `reset()` — like custom builtins, and unlike env a *script* exported.
+    fn set_env(&self, py: Python<'_>, key: String, value: String) -> PyResult<()> {
+        self.reject_external_handler_reentry()?;
+        let inner = self.inner.clone();
+        let runtime_env = self.runtime_env.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let mut bash = inner.lock().await;
+                bash.set_env(&key, &value);
+                record_runtime_env(&runtime_env, &key, &value)?;
+                Ok(())
+            })
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Bash(username={:?}, hostname={:?})",
+            self.username.as_deref().unwrap_or("user"),
+            self.hostname.as_deref().unwrap_or("sandbox")
+        )
+    }
+}
+
+// ============================================================================
+// BashTool — interpreter + tool-contract metadata
+// ============================================================================
+
+/// Bash interpreter with tool-contract metadata (`description`, `help`,
+/// `system_prompt`, schemas).
+///
+/// Extends `Bash` with methods required by LLM tool-use protocols.
+/// Use this when integrating with LangChain, PydanticAI, or similar frameworks.
+///
+/// Example:
+///     ```python
+///     from bashkit import BashTool
+///
+///     tool = BashTool()
+///     print(tool.input_schema())  # JSON schema for LLM
+///     result = await tool.execute("echo 'Hello!'")
+///     ```
+/// with a virtual filesystem. State persists between calls - files created
+/// in one call are available in subsequent calls.
+///
+/// Example:
+///     ```python
+///     from bashkit import BashTool
+///
+///     tool = BashTool()
+///     result = await tool.execute("echo 'Hello, World!'")
+///     print(result.stdout)  # Hello, World!
+///     ```
+#[pyclass]
+#[allow(dead_code)]
+pub struct BashTool {
+    inner: Arc<Mutex<Bash>>,
+    /// Shared tokio runtime — reused across all sync calls to avoid
+    /// per-call OS thread/fd exhaustion (issue #414).
+    rt: PyRuntime,
+    /// Cancellation token. Wrapped in RwLock so reset() can swap it to
+    /// the new interpreter's token without requiring &mut self.
+    cancelled: Arc<RwLock<Arc<AtomicBool>>>,
+    username: Option<String>,
+    profile: PyExecutionProfile,
+    hostname: Option<String>,
+    /// Initial working directory for the shell (mirrors `Bash::builder().cwd()`).
+    cwd: Option<String>,
+    /// Initial environment variables (mirrors `Bash::builder().env()`).
+    env: Option<HashMap<String, String>>,
+    /// Tracking list for `is_async` flag detection (used by session capture).
+    /// Kept in sync with `host_registry` by `add_builtin` / `remove_builtin`.
+    /// Wrapped in `Arc<StdMutex<_>>` so post-construction registration works
+    /// through `&self` like the rest of `BashTool`'s API.
+    custom_builtins: Arc<StdMutex<Vec<PyCustomBuiltinEntry>>>,
+    /// Host mutations applied *after* construction — `set_env()` and `mount()`.
+    ///
+    /// THREAT[TM-ISO-025]: `reset()` must not silently drop host capabilities.
+    /// Constructor options are replayed from the fields above; recording the
+    /// runtime equivalents puts them on the same rebuild path, so a bundle of
+    /// setup installed on a live instance (mount + env + builtins) is whole
+    /// after a reset instead of half-applied. Script-set env is deliberately
+    /// *not* recorded — only what the host asked for survives.
+    runtime_env: RuntimeEnvLog,
+    runtime_mounts: RuntimeMountLog,
+    /// Host-owned live registry of custom builtins; see [`PyBash::host_registry`].
+    host_registry: BuiltinRegistry,
+    builtin_engine: Arc<PyCallbackEngine>,
+    files: Vec<PyFileMount>,
+    real_mounts: Vec<RealMountConfig>,
+    allowed_mount_paths: Option<Vec<String>>,
+    readonly_filesystem: bool,
+    max_commands: Option<u64>,
+    max_loop_iterations: Option<u64>,
+    max_memory: Option<u64>,
+    timeout_seconds: Option<f64>,
+    /// Outbound network config preserved across `reset()` and snapshots.
+    network: Option<PyNetworkConfig>,
+}
+
+// THREAT[TM-PY-030]: see the equivalent Drop on ScriptedTool.
+impl Drop for BashTool {
+    fn drop(&mut self) {
+        if !interpreter_at_exit() {
+            self.builtin_engine.cancel_inflight_callbacks();
+        }
+    }
+}
+
+impl BashTool {
+    fn build_live_builder(&self, py: Python<'_>) -> PyResult<bashkit::BashBuilder> {
+        let profile = self.profile.core();
+        let mut builder = Bash::builder().profile(profile.clone());
+
+        if let Some(ref username) = self.username {
+            builder = builder.username(username);
+        }
+        if let Some(ref hostname) = self.hostname {
+            builder = builder.hostname(hostname);
+        }
+        if let Some(ref cwd) = self.cwd {
+            builder = builder.cwd(cwd.as_str());
+        }
+        if let Some(ref env) = self.env {
+            for (k, v) in env {
+                builder = builder.env(k, v);
+            }
+        }
+
+        let mut limits = profile.execution_limits().clone();
+        if let Some(max_commands) = self.max_commands {
+            limits = limits.max_commands(usize::try_from(max_commands).unwrap_or(usize::MAX));
+        }
+        if let Some(max_loop_iterations) = self.max_loop_iterations {
+            limits = limits
+                .max_loop_iterations(usize::try_from(max_loop_iterations).unwrap_or(usize::MAX));
+        }
+        if let Some(timeout_seconds) = self.timeout_seconds {
+            limits = limits.timeout(parse_timeout_seconds(timeout_seconds)?);
+        }
+        builder = builder.limits(limits);
+
+        if let Some(max_memory) = self.max_memory {
+            builder = builder.max_memory(usize::try_from(max_memory).unwrap_or(usize::MAX));
+        }
+
+        // network (http_client) and allowed_mount_paths (realfs) are native-only;
+        // both kwargs are rejected at construction on wasm. See knowledge/runtimes/emscripten-wheels.md.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(ref net) = self.network {
+                builder = net.apply(builder);
+            }
+            if let Some(ref paths) = self.allowed_mount_paths {
+                builder =
+                    builder.allowed_mount_paths(paths.iter().map(|p| PathBuf::from(p.as_str())));
+            }
+        }
+        let files = clone_file_mounts(py, &self.files);
+        let mut builder = apply_fs_config(builder, &files, &self.real_mounts)?;
+        builder = builder.readonly_filesystem(self.readonly_filesystem);
+        Ok(builder.builtin_registry(self.host_registry.clone()))
+    }
+
+    fn build_rust_tool(&self) -> PyResult<RustBashTool> {
+        let profile = self.profile.core();
+        let mut builder = RustBashTool::builder().profile(profile.clone());
+
+        if let Some(ref username) = self.username {
+            builder = builder.username(username);
+        }
+        if let Some(ref hostname) = self.hostname {
+            builder = builder.hostname(hostname);
+        }
+        if let Some(ref cwd) = self.cwd {
+            builder = builder.cwd(cwd.as_str());
+        }
+        if let Some(ref env) = self.env {
+            for (k, v) in env {
+                builder = builder.env(k, v);
+            }
+        }
+
+        let mut limits = profile.execution_limits().clone();
+        if let Some(mc) = self.max_commands {
+            limits = limits.max_commands(usize::try_from(mc).unwrap_or(usize::MAX));
+        }
+        if let Some(mli) = self.max_loop_iterations {
+            limits = limits.max_loop_iterations(usize::try_from(mli).unwrap_or(usize::MAX));
+        }
+        if let Some(ts) = self.timeout_seconds {
+            limits = limits.timeout(parse_timeout_seconds(ts)?);
+        }
+
+        let builtins = {
+            let guard = self
+                .custom_builtins
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("custom_builtins lock poisoned"))?;
+            if guard.is_empty() {
+                Vec::new()
+            } else {
+                Python::attach(|py| build_runtime_custom_builtin_impls(py, &guard, &self.rt))
+            }
+        };
+        for builtin in builtins {
+            let name = builtin.name.clone();
+            builder = builder.builtin(name, Box::new(builtin));
+        }
+
+        Ok(builder.limits(limits).build())
+    }
+}
+
+#[pymethods]
+impl BashTool {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        username=None,
+        hostname=None,
+        cwd=None,
+        env=None,
+        max_commands=None,
+        max_loop_iterations=None,
+        max_memory=None,
+        timeout_seconds=None,
+        files=None,
+        mounts=None,
+        allowed_mount_paths=None,
+        readonly_filesystem=false,
+        custom_builtins=None,
+        network=None,
+        profile=PyExecutionProfile::Standard,
+    ))]
+    fn new(
+        py: Python<'_>,
+        username: Option<String>,
+        hostname: Option<String>,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        max_commands: Option<u64>,
+        max_loop_iterations: Option<u64>,
+        max_memory: Option<u64>,
+        timeout_seconds: Option<f64>,
+        files: Option<&Bound<'_, PyDict>>,
+        mounts: Option<&Bound<'_, PyList>>,
+        allowed_mount_paths: Option<Vec<String>>,
+        readonly_filesystem: bool,
+        custom_builtins: Option<&Bound<'_, PyDict>>,
+        network: Option<&Bound<'_, PyDict>>,
+        profile: PyExecutionProfile,
+    ) -> PyResult<Self> {
+        let core_profile = profile.core();
+        let mut builder = Bash::builder().profile(core_profile.clone());
+
+        if let Some(ref u) = username {
+            builder = builder.username(u);
+        }
+        if let Some(ref h) = hostname {
+            builder = builder.hostname(h);
+        }
+        if let Some(ref c) = cwd {
+            builder = builder.cwd(c.as_str());
+        }
+        if let Some(ref env) = env {
+            for (k, v) in env {
+                builder = builder.env(k, v);
+            }
+        }
+
+        let mut limits = core_profile.execution_limits().clone();
+        if let Some(mc) = max_commands {
+            limits = limits.max_commands(usize::try_from(mc).unwrap_or(usize::MAX));
+        }
+        if let Some(mli) = max_loop_iterations {
+            limits = limits.max_loop_iterations(usize::try_from(mli).unwrap_or(usize::MAX));
+        }
+        if let Some(ts) = timeout_seconds {
+            limits = limits.timeout(parse_timeout_seconds(ts)?);
+        }
+        builder = builder.limits(limits);
+
+        if let Some(mm) = max_memory {
+            builder = builder.max_memory(usize::try_from(mm).unwrap_or(usize::MAX));
+        }
+
+        let files = parse_files(files)?;
+        let real_mounts = parse_mounts(mounts)?;
+        let custom_builtins = parse_custom_builtins(py, custom_builtins)?;
+        let network = parse_network_config(network)?;
+        // network (http_client) and allowed_mount_paths (realfs) are native-only;
+        // both kwargs are rejected at construction on wasm. See knowledge/runtimes/emscripten-wheels.md.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(ref net) = network {
+                builder = net.apply(builder);
+            }
+            if let Some(ref paths) = allowed_mount_paths {
+                builder =
+                    builder.allowed_mount_paths(paths.iter().map(|p| PathBuf::from(p.as_str())));
+            }
+        }
+        builder = apply_fs_config(builder, &files, &real_mounts)?;
+        builder = builder.readonly_filesystem(readonly_filesystem);
+        let builtin_engine = PyCallbackEngine::new(py)?;
+        let host_registry = BuiltinRegistry::new();
+        let rt = make_runtime()?;
+        populate_registry_from_entries(py, &host_registry, &custom_builtins, &rt);
+        builder = builder.builtin_registry(host_registry.clone());
+
+        let bash = builder.build();
+        let cancelled = Arc::new(RwLock::new(bash.cancellation_token()));
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(bash)),
+            rt,
+            cancelled,
+            username,
+            profile,
+            hostname,
+            cwd,
+            env,
+            custom_builtins: Arc::new(StdMutex::new(custom_builtins)),
+            runtime_env: Arc::new(StdMutex::new(Vec::new())),
+            runtime_mounts: Arc::new(StdMutex::new(Vec::new())),
+            host_registry,
+            builtin_engine,
+            files,
+            real_mounts,
+            allowed_mount_paths,
+            readonly_filesystem,
+            max_commands,
+            max_loop_iterations,
+            max_memory,
+            timeout_seconds,
+            network,
+        })
+    }
+
+    /// Cancel the currently running execution.
+    fn cancel(&self) {
+        if let Ok(token) = self.cancelled.read() {
+            token.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear the cancellation flag so subsequent executions proceed normally.
+    ///
+    /// Call this after a `cancel()` once the in-flight execution has finished
+    /// and you want to reuse the same `BashTool` instance (preserving VFS state).
+    /// Without this, every future `execute()` will immediately fail with
+    /// ``"execution cancelled"``.
+    ///
+    /// **Note:** Calling this while an execution is still in-flight may
+    /// allow that execution to continue past the cancellation point.
+    /// Wait for the cancelled execution to finish before clearing
+    /// (await the async call or let `execute_sync` return).
+    fn clear_cancel(&self) {
+        if let Ok(token) = self.cancelled.read() {
+            token.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Native-only (see `Bash.execute`). Use `execute_sync()` on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let builtin_session =
+            capture_custom_builtin_session(py, &self.custom_builtins, &self.builtin_engine, true)?;
+        let on_output = prepare_output_handler(py, on_output)?;
+        let inner = self.inner.clone();
+        let cancel_session = builtin_session.clone();
+        let future = future_into_py(py, async move {
+            let mut bash = inner.lock().await;
+            exec_bash_with_optional_output(&mut bash, &commands, on_output, builtin_session).await
+        })?;
+        if let Some(cancel_session) = cancel_session {
+            attach_future_cancellation_callback(py, &future, cancel_session.clone())?;
+            return wrap_future_with_cancel(py, future, cancel_session);
+        }
+        Ok(future)
+    }
+
+    /// Releases GIL before blocking on tokio to prevent deadlock with callbacks.
+    ///
+    /// # Thread safety
+    ///
+    /// Acquires async mutex with 30-second timeout. For concurrent workloads,
+    /// use separate `BashTool` instances per thread or the async `execute()`.
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute_sync(
+        &self,
+        py: Python<'_>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<ExecResult> {
+        let builtin_session =
+            capture_custom_builtin_session(py, &self.custom_builtins, &self.builtin_engine, false)?;
+        let on_output = prepare_output_handler(py, on_output)?;
+        let inner = self.inner.clone();
+
+        py.detach(|| {
+            self.rt.block_on(async move {
+                // THREAT[TM-DOS-FFI]: Timeout on mutex to prevent deadlock.
+                let mut bash =
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), inner.lock())
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Err(PyRuntimeError::new_err(
+                                "execute_sync: timed out waiting for lock (30s). \
+                             Another thread may be holding the interpreter. \
+                             Use separate BashTool instances for concurrent access.",
+                            ));
+                        }
+                    };
+                exec_bash_with_optional_output(&mut bash, &commands, on_output, builtin_session)
+                    .await
+            })
+        })
+    }
+
+    /// Execute commands synchronously. Raises `BashError` on non-zero exit.
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute_sync_or_throw(
+        &self,
+        py: Python<'_>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<ExecResult> {
+        let result = self.execute_sync(py, commands, on_output)?;
+        if result.exit_code != 0 {
+            return Err(raise_bash_error(&result));
+        }
+        Ok(result)
+    }
+
+    /// Execute commands asynchronously. Raises `BashError` on non-zero exit.
+    ///
+    /// Native-only (see `Bash.execute`). Use `execute_sync_or_throw()` on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[pyo3(signature = (commands, on_output=None))]
+    fn execute_or_throw<'py>(
+        &self,
+        py: Python<'py>,
+        commands: String,
+        on_output: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let builtin_session =
+            capture_custom_builtin_session(py, &self.custom_builtins, &self.builtin_engine, true)?;
+        let on_output = prepare_output_handler(py, on_output)?;
+        let inner = self.inner.clone();
+        let cancel_session = builtin_session.clone();
+        let future = future_into_py(py, async move {
+            let mut bash = inner.lock().await;
+            let result =
+                exec_bash_with_optional_output(&mut bash, &commands, on_output, builtin_session)
+                    .await?;
+            if result.exit_code != 0 {
+                return Err(raise_bash_error(&result));
+            }
+            Ok(result)
+        })?;
+        if let Some(cancel_session) = cancel_session {
+            attach_future_cancellation_callback(py, &future, cancel_session.clone())?;
+            return wrap_future_with_cancel(py, future, cancel_session);
+        }
+        Ok(future)
+    }
+
+    /// Register a Python callback as a custom bash builtin.
+    /// See [`PyBash::add_builtin`] for semantics.
+    fn add_builtin(&self, py: Python<'_>, name: String, callback: Py<PyAny>) -> PyResult<()> {
+        let entry = build_py_custom_builtin_entry(py, name.clone(), callback)?;
+        let adapter = PyCustomBuiltinAdapter::from_entry(py, &entry, &self.rt);
+        {
+            let mut guard = self
+                .custom_builtins
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("custom_builtins lock poisoned"))?;
+            guard.retain(|e| e.name != name);
+            guard.push(entry);
+        }
+        self.host_registry.insert(name, Arc::new(adapter));
+        Ok(())
+    }
+
+    /// Remove a previously registered custom builtin. No-op if not present.
+    fn remove_builtin(&self, name: String) -> PyResult<()> {
+        {
+            let mut guard = self
+                .custom_builtins
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("custom_builtins lock poisoned"))?;
+            guard.retain(|e| e.name != name);
+        }
+        self.host_registry.remove(&name);
+        Ok(())
+    }
+
+    /// Releases GIL before blocking on tokio to prevent deadlock.
+    /// THREAT[TM-PY-028]: Rebuild with same config to preserve security limits
+    /// and registered custom builtins.
+    fn reset(&self, py: Python<'_>) -> PyResult<()> {
+        replace_live_bash_with_builder(
+            py,
+            &self.rt,
+            &self.inner,
+            &self.cancelled,
+            self.build_live_builder(py)?,
+            &self.runtime_env,
+            &self.runtime_mounts,
+        )
+    }
+
+    /// Serialize interpreter state to bytes for checkpoint/restore flows.
+    #[pyo3(signature = (exclude_filesystem=false, exclude_functions=false))]
+    fn snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        exclude_filesystem: bool,
+        exclude_functions: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = snapshot_live_bash(
+            py,
+            &self.rt,
+            &self.inner,
+            exclude_filesystem,
+            exclude_functions,
+        )?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Serialize interpreter state to HMAC-protected bytes for untrusted storage.
+    #[pyo3(signature = (key, exclude_filesystem=false, exclude_functions=false))]
+    fn snapshot_keyed<'py>(
+        &self,
+        py: Python<'py>,
+        key: Vec<u8>,
+        exclude_filesystem: bool,
+        exclude_functions: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = snapshot_live_bash_keyed(
+            py,
+            &self.rt,
+            &self.inner,
+            key,
+            exclude_filesystem,
+            exclude_functions,
+        )?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Analyze a script without running it.
+    ///
+    /// Parses `script` with this instance's parser limits and reports the
+    /// commands, redirect targets, and function definitions it statically
+    /// refers to. Nothing is executed and no instance state changes.
+    ///
+    /// Intended for permission prompts and audit logging. **Advisory only** —
+    /// check `is_opaque` before treating an allowlist match as safe. Raises
+    /// `BashError` if the script does not parse; treat that as "deny or
+    /// prompt", never as "no commands".
+    fn analyze(&self, py: Python<'_>, script: &str) -> PyResult<ScriptAnalysis> {
+        analyze_script(py, &self.rt, &self.inner, script)
+    }
+
+    /// Capture a read-only shell-state snapshot for prompt rendering and inspection.
+    fn shell_state(&self, py: Python<'_>) -> PyResult<ShellState> {
+        capture_shell_state(py, &self.rt, &self.inner)
+    }
+
+    /// Restore interpreter state from bytes previously produced by `snapshot()`.
+    fn restore_snapshot(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
+        let state = capture_shell_state(py, &self.rt, &self.inner)?;
+        let env_overrides = placeholder_env_overrides(&state, &self.network);
+        restore_live_bash_with_env_overrides(py, &self.rt, &self.inner, data, &env_overrides)
+    }
+
+    /// Restore interpreter state from HMAC-protected bytes produced by `snapshot_keyed()`.
+    fn restore_snapshot_keyed(&self, py: Python<'_>, data: Vec<u8>, key: Vec<u8>) -> PyResult<()> {
+        let state = capture_shell_state(py, &self.rt, &self.inner)?;
+        let env_overrides = placeholder_env_overrides(&state, &self.network);
+        restore_live_bash_keyed_with_env_overrides(
+            py,
+            &self.rt,
+            &self.inner,
+            data,
+            key,
+            &env_overrides,
+        )
+    }
+
+    /// Create a new BashTool instance from a snapshot and optional constructor kwargs.
+    #[staticmethod]
+    #[pyo3(signature = (
+        data,
+        username=None,
+        hostname=None,
+        cwd=None,
+        env=None,
+        max_commands=None,
+        max_loop_iterations=None,
+        max_memory=None,
+        timeout_seconds=None,
+        files=None,
+        mounts=None,
+        allowed_mount_paths=None,
+        readonly_filesystem=false,
+        custom_builtins=None,
+        network=None,
+        profile=PyExecutionProfile::Standard,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_snapshot(
+        py: Python<'_>,
+        data: Vec<u8>,
+        username: Option<String>,
+        hostname: Option<String>,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        max_commands: Option<u64>,
+        max_loop_iterations: Option<u64>,
+        max_memory: Option<u64>,
+        timeout_seconds: Option<f64>,
+        files: Option<&Bound<'_, PyDict>>,
+        mounts: Option<&Bound<'_, PyList>>,
+        allowed_mount_paths: Option<Vec<String>>,
+        readonly_filesystem: bool,
+        custom_builtins: Option<&Bound<'_, PyDict>>,
+        network: Option<&Bound<'_, PyDict>>,
+        profile: PyExecutionProfile,
+    ) -> PyResult<Self> {
+        let tool = Self::new(
+            py,
+            username,
+            hostname,
+            cwd,
+            env,
+            max_commands,
+            max_loop_iterations,
+            max_memory,
+            timeout_seconds,
+            files,
+            mounts,
+            allowed_mount_paths,
+            readonly_filesystem,
+            custom_builtins,
+            network,
+            profile,
+        )?;
+        tool.restore_snapshot(py, data)?;
+        Ok(tool)
+    }
+
+    /// Create a new BashTool instance from HMAC-protected snapshot bytes.
+    #[staticmethod]
+    #[pyo3(signature = (
+        data,
+        key,
+        username=None,
+        hostname=None,
+        cwd=None,
+        env=None,
+        max_commands=None,
+        max_loop_iterations=None,
+        max_memory=None,
+        timeout_seconds=None,
+        files=None,
+        mounts=None,
+        allowed_mount_paths=None,
+        readonly_filesystem=false,
+        custom_builtins=None,
+        network=None,
+        profile=PyExecutionProfile::Standard,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_snapshot_keyed(
+        py: Python<'_>,
+        data: Vec<u8>,
+        key: Vec<u8>,
+        username: Option<String>,
+        hostname: Option<String>,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+        max_commands: Option<u64>,
+        max_loop_iterations: Option<u64>,
+        max_memory: Option<u64>,
+        timeout_seconds: Option<f64>,
+        files: Option<&Bound<'_, PyDict>>,
+        mounts: Option<&Bound<'_, PyList>>,
+        allowed_mount_paths: Option<Vec<String>>,
+        readonly_filesystem: bool,
+        custom_builtins: Option<&Bound<'_, PyDict>>,
+        network: Option<&Bound<'_, PyDict>>,
+        profile: PyExecutionProfile,
+    ) -> PyResult<Self> {
+        let tool = Self::new(
+            py,
+            username,
+            hostname,
+            cwd,
+            env,
+            max_commands,
+            max_loop_iterations,
+            max_memory,
+            timeout_seconds,
+            files,
+            mounts,
+            allowed_mount_paths,
+            readonly_filesystem,
+            custom_builtins,
+            network,
+            profile,
+        )?;
+        tool.restore_snapshot_keyed(py, data, key)?;
+        Ok(tool)
+    }
+
+    fn read_file(&self, py: Python<'_>, path: String) -> PyResult<String> {
+        py.detach(|| read_text_via_live_fs(&self.rt, &self.inner, path))
+    }
+
+    fn write_file(&self, py: Python<'_>, path: String, content: String) -> PyResult<()> {
+        py.detach(|| write_text_via_live_fs(&self.rt, &self.inner, path, content))
+    }
+
+    fn append_file(&self, py: Python<'_>, path: String, content: String) -> PyResult<()> {
+        py.detach(|| append_text_via_live_fs(&self.rt, &self.inner, path, content))
+    }
+
+    #[pyo3(signature = (path, recursive=false))]
+    fn mkdir(&self, py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
+        py.detach(|| mkdir_via_live_fs(&self.rt, &self.inner, path, recursive))
+    }
+
+    fn exists(&self, py: Python<'_>, path: String) -> PyResult<bool> {
+        py.detach(|| exists_via_live_fs(&self.rt, &self.inner, path))
+    }
+
+    #[pyo3(signature = (path, recursive=false))]
+    fn remove(&self, py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
+        py.detach(|| remove_via_live_fs(&self.rt, &self.inner, path, recursive))
+    }
+
+    fn stat(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        let metadata = py.detach(|| stat_via_live_fs(&self.rt, &self.inner, path))?;
+        metadata_to_pydict(py, &metadata)
+    }
+
+    fn chmod(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+        py.detach(|| chmod_via_live_fs(&self.rt, &self.inner, path, mode))
+    }
+
+    fn symlink(&self, py: Python<'_>, target: String, link: String) -> PyResult<()> {
+        py.detach(|| symlink_via_live_fs(&self.rt, &self.inner, target, link))
+    }
+
+    fn read_link(&self, py: Python<'_>, path: String) -> PyResult<String> {
+        py.detach(|| read_link_via_live_fs(&self.rt, &self.inner, path))
+    }
+
+    fn read_dir(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        let entries = py.detach(|| read_dir_via_live_fs(&self.rt, &self.inner, path))?;
+        let items: Vec<Py<PyAny>> = entries
+            .iter()
+            .map(|entry| dir_entry_to_pydict(py, entry))
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new(py, &items)?.into_any().unbind())
+    }
+
+    #[pyo3(signature = (path=".".to_string()))]
+    fn ls(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        let names = match py.detach(|| read_dir_via_live_fs(&self.rt, &self.inner, path)) {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        Ok(PyList::new(py, names)?.into_any().unbind())
+    }
+
+    fn glob(&self, py: Python<'_>, pattern: String) -> PyResult<Py<PyAny>> {
+        let matches = py.detach(|| -> PyResult<Vec<String>> {
+            Ok(glob_via_bash(
+                &self.rt,
+                &self.inner,
+                pattern,
+                glob_timeout(self.timeout_seconds),
+            ))
+        })?;
+        Ok(PyList::new(py, matches)?.into_any().unbind())
+    }
+
+    /// Return a live filesystem handle backed by the current interpreter.
+    ///
+    /// Each operation on the returned handle acquires the interpreter lock,
+    /// so it always reflects the latest state (including post-reset). For
+    /// batch reads where consistency isn't needed, prefer reading files via
+    /// `execute_sync("cat ...")`.
+    fn fs(&self, py: Python<'_>) -> PyResult<Py<PyFileSystem>> {
+        Py::new(
+            py,
+            PyFileSystem::from_live(self.inner.clone(), self.rt.clone()),
+        )
+    }
+
+    /// Mount a filesystem at `vfs_path` without rebuilding the interpreter.
+    ///
+    /// Recorded, so `reset()` replays it — see `runtime_mounts`.
+    fn mount(&self, py: Python<'_>, vfs_path: String, fs: PyRef<'_, PyFileSystem>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let source = fs.inner.clone();
+        let runtime_mounts = self.runtime_mounts.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let mounted_fs = source.resolve().await?;
+                let bash = inner.lock().await;
+                bash.mount(Path::new(&vfs_path), Arc::clone(&mounted_fs))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                record_runtime_mount(&runtime_mounts, &vfs_path, mounted_fs)?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Set an exported environment variable on the live interpreter.
+    ///
+    /// See `Bash.set_env`. Survives `reset()`.
+    fn set_env(&self, py: Python<'_>, key: String, value: String) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime_env = self.runtime_env.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let mut bash = inner.lock().await;
+                bash.set_env(&key, &value);
+                record_runtime_env(&runtime_env, &key, &value)?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Unmount a live filesystem without rebuilding the interpreter.
+    fn unmount(&self, py: Python<'_>, vfs_path: String) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime_mounts = self.runtime_mounts.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let bash = inner.lock().await;
+                bash.unmount(Path::new(&vfs_path))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                forget_runtime_mount(&runtime_mounts, &vfs_path)?;
+                Ok(())
+            })
+        })
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        "bashkit"
+    }
+
+    #[getter]
+    fn short_description(&self) -> &str {
+        "Run bash commands in an isolated virtual filesystem"
+    }
+
+    fn description(&self) -> PyResult<String> {
+        Ok(self.build_rust_tool()?.description().to_string())
+    }
+
+    fn help(&self) -> PyResult<String> {
+        Ok(self.build_rust_tool()?.help())
+    }
+
+    fn system_prompt(&self) -> PyResult<String> {
+        Ok(self.build_rust_tool()?.system_prompt())
+    }
+
+    fn input_schema(&self) -> PyResult<String> {
+        let schema = self.build_rust_tool()?.input_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| PyValueError::new_err(format!("Schema serialization failed: {}", e)))
+    }
+
+    fn output_schema(&self) -> PyResult<String> {
+        let schema = self.build_rust_tool()?.output_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| PyValueError::new_err(format!("Schema serialization failed: {}", e)))
+    }
+
+    #[getter]
+    fn version(&self) -> &str {
+        VERSION
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BashTool(username={:?}, hostname={:?})",
+            self.username.as_deref().unwrap_or("user"),
+            self.hostname.as_deref().unwrap_or("sandbox")
+        )
+    }
+}
+
+// ============================================================================
+// ScriptedTool — multi-tool orchestration via bash scripts
+// ============================================================================
+
+/// Entry for a registered Python tool callback
+struct PyToolEntry {
+    name: String,
+    description: String,
+    schema: serde_json::Value,
+    callback: Py<PyAny>,
+    /// True when callback is `async def` (coroutine function).
+    is_async: bool,
+}
+
+/// Compose Python callbacks as bash builtins for multi-tool orchestration.
+///
+/// Each registered tool becomes a bash builtin command. An LLM (or user) writes
+/// a single bash script that pipes, loops, and branches across all tools.
+///
+/// Python callbacks receive `(params: dict, stdin: str | None)` and return a
+/// string. Raise an exception to signal failure.
+///
+/// Example:
+///     ```python
+///     from bashkit import ScriptedTool
+///
+///     def get_user(params, stdin=None):
+///         return '{"id": 1, "name": "Alice"}'
+///
+///     tool = ScriptedTool("api")
+///     tool.add_tool("get_user", "Fetch user by ID",
+///         callback=get_user,
+///         schema={"type": "object", "properties": {"id": {"type": "integer"}}})
+///
+///     result = tool.execute_sync("get_user --id 1 | jq -r '.name'")
+///     print(result.stdout)  # Alice
+///     ```
+#[pyclass]
+pub struct ScriptedTool {
+    name: String,
+    short_desc: Option<String>,
+    tools: Vec<PyToolEntry>,
+    env_vars: Vec<(String, String)>,
+    /// Shared tokio runtime — reused across all sync calls to avoid
+    /// per-call OS thread/fd exhaustion (issue #414).
+    rt: PyRuntime,
+    callback_engine: Arc<PyCallbackEngine>,
+    max_commands: Option<u64>,
+    max_loop_iterations: Option<u64>,
+    timeout_seconds: Option<f64>,
+}
+
+// THREAT[TM-PY-030]: cancel in-flight (possibly abandoned timed-out)
+// callbacks BEFORE the `rt` field drop joins the tokio blocking pool, so
+// teardown is bounded by cooperative cancellation instead of full callback
+// duration. At interpreter exit the runtime drop degrades to background
+// shutdown on its own, so there is nothing to cancel.
+impl Drop for ScriptedTool {
+    fn drop(&mut self) {
+        if !interpreter_at_exit() {
+            self.callback_engine.cancel_inflight_callbacks();
+        }
+    }
+}
+
+impl ScriptedTool {
+    /// Build a Rust ScriptedTool from stored Python config.
+    ///
+    /// The supplied session captures the caller's `ContextVar` state and, for
+    /// async execute(), the caller's active asyncio loop. Each Python callback
+    /// is invoked via `ctx.run()` to restore those vars.
+    fn build_rust_tool_with_session(
+        &self,
+        py: Python<'_>,
+        session: Arc<PyCallbackSession>,
+    ) -> RustScriptedTool {
+        let mut builder = RustScriptedTool::builder(&self.name);
+
+        if let Some(ref desc) = self.short_desc {
+            builder = builder.short_description(desc);
+        }
+
+        for entry in &self.tools {
+            let py_callback = entry.callback.clone_ref(py);
+            let def =
+                ToolDef::new(&entry.name, &entry.description).with_schema(entry.schema.clone());
+            let tool_name = entry.name.clone();
+
+            if entry.is_async {
+                let session = session.clone();
+                builder = builder.async_tool_fn(def, move |args: ToolArgs| {
+                    let session = session.clone();
+                    let tool_name = tool_name.clone();
+                    let py_callback = Python::attach(|py| py_callback.clone_ref(py));
+                    async move {
+                        let py_args = Python::attach(|py| make_py_tool_callback_args(py, &args))?;
+                        call_python_string_callback_async(
+                            session,
+                            &tool_name,
+                            &py_callback,
+                            py_args,
+                        )
+                        .await
+                    }
+                });
+            } else {
+                let session = session.clone();
+                builder = builder.tool_fn(def, move |args: &ToolArgs| {
+                    Python::attach(|py| {
+                        call_python_string_callback_sync(
+                            py,
+                            session.as_ref(),
+                            &tool_name,
+                            &py_callback,
+                            make_py_tool_callback_args(py, args)?,
+                        )
+                    })
+                });
+            }
+        }
+
+        for (k, v) in &self.env_vars {
+            builder = builder.env(k, v);
+        }
+
+        if self.max_commands.is_some()
+            || self.max_loop_iterations.is_some()
+            || self.timeout_seconds.is_some()
+        {
+            let mut limits = ExecutionLimits::new();
+            if let Some(mc) = self.max_commands {
+                limits = limits.max_commands(usize::try_from(mc).unwrap_or(usize::MAX));
+            }
+            if let Some(mli) = self.max_loop_iterations {
+                limits = limits.max_loop_iterations(usize::try_from(mli).unwrap_or(usize::MAX));
+            }
+            if let Some(ts) = self.timeout_seconds {
+                limits =
+                    limits.timeout(parse_timeout_seconds(ts).expect("validated timeout_seconds"));
+            }
+            builder = builder.limits(limits);
+        }
+
+        builder.build()
+    }
+}
+
+#[pymethods]
+impl ScriptedTool {
+    /// Create a new ScriptedTool.
+    ///
+    /// Args:
+    ///     name: Tool name (used in system prompt and docs)
+    ///     short_description: One-line description
+    ///     max_commands: Max commands per execute call
+    ///     max_loop_iterations: Max loop iterations per execute call
+    ///     timeout_seconds: Max wall-clock seconds per execute call
+    #[new]
+    #[pyo3(signature = (name, short_description=None, max_commands=None, max_loop_iterations=None, timeout_seconds=None))]
+    fn new(
+        name: String,
+        short_description: Option<String>,
+        max_commands: Option<u64>,
+        max_loop_iterations: Option<u64>,
+        timeout_seconds: Option<f64>,
+    ) -> PyResult<Self> {
+        if let Some(ts) = timeout_seconds {
+            parse_timeout_seconds(ts)?;
+        }
+        let rt = make_runtime()?;
+        let callback_engine = Python::attach(PyCallbackEngine::new)?;
+
+        Ok(Self {
+            name,
+            short_desc: short_description,
+            tools: Vec::new(),
+            env_vars: Vec::new(),
+            rt,
+            callback_engine,
+            max_commands,
+            max_loop_iterations,
+            timeout_seconds,
+        })
+    }
+
+    /// Register a tool command.
+    ///
+    /// The callback can be synchronous or ``async def``:
+    ///
+    /// - sync:  ``callback(params: dict, stdin: str | None) -> str``
+    /// - async: ``async def callback(params: dict, stdin: str | None) -> str``
+    ///
+    /// ``contextvars.ContextVar`` values active at ``execute()`` / ``execute_sync()``
+    /// call time are automatically propagated into callbacks.
+    ///
+    /// Args:
+    ///     name: Command name (becomes a bash builtin)
+    ///     description: Human-readable description
+    ///     callback: Python callable ``(params, stdin) -> str``
+    ///     schema: Optional JSON Schema dict for input parameters
+    #[pyo3(signature = (name, description, callback, schema=None))]
+    fn add_tool(
+        &mut self,
+        py: Python<'_>,
+        name: String,
+        description: String,
+        callback: Py<PyAny>,
+        schema: Option<Bound<'_, pyo3::PyAny>>,
+    ) -> PyResult<()> {
+        self.tools.push(build_py_tool_entry(
+            py,
+            name,
+            description,
+            callback,
+            schema,
+        )?);
+        Ok(())
+    }
+
+    /// Add an environment variable visible inside scripts.
+    fn env(&mut self, key: String, value: String) {
+        self.env_vars.push((key, value));
+    }
+
+    /// Execute a bash script asynchronously.
+    ///
+    /// Native-only (see `Bash.execute`). Use `execute_sync()` on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn execute<'py>(&self, py: Python<'py>, commands: String) -> PyResult<Bound<'py, PyAny>> {
+        let session = PyCallbackSession::capture(
+            py,
+            self.callback_engine.clone(),
+            self.tools.iter().any(|entry| entry.is_async),
+            true,
+            PySyncLoopMode::PerSession,
+        )?;
+        let tool = self.build_rust_tool_with_session(py, session.clone());
+        let future = future_into_py(py, async move {
+            let resp = tool
+                .execute(ToolRequest {
+                    commands,
+                    timeout_ms: None,
+                })
+                .await;
+            let stdout_bytes = resp.stdout.as_bytes().to_vec();
+            let stderr_bytes = resp.stderr.as_bytes().to_vec();
+            Ok(ExecResult {
+                stdout: resp.stdout,
+                stdout_bytes,
+                stderr: resp.stderr,
+                stderr_bytes,
+                exit_code: resp.exit_code,
+                error: resp.error,
+                stdout_truncated: resp.stdout_truncated,
+                stderr_truncated: resp.stderr_truncated,
+                final_env: resp.final_env,
+            })
+        })?;
+        attach_future_cancellation_callback(py, &future, session.clone())?;
+        wrap_future_with_cancel(py, future, session)
+    }
+
+    /// Execute a bash script synchronously (blocking).
+    /// Releases GIL before blocking on tokio to prevent deadlock with callbacks.
+    fn execute_sync(&self, py: Python<'_>, commands: String) -> PyResult<ExecResult> {
+        let session = PyCallbackSession::capture(
+            py,
+            self.callback_engine.clone(),
+            self.tools.iter().any(|entry| entry.is_async),
+            false,
+            PySyncLoopMode::PerSession,
+        )?;
+        let tool = self.build_rust_tool_with_session(py, session);
+
+        let resp = py.detach(|| {
+            self.rt.block_on(async move {
+                tool.execute(ToolRequest {
+                    commands,
+                    timeout_ms: None,
+                })
+                .await
+            })
+        });
+        let stdout_bytes = resp.stdout.as_bytes().to_vec();
+        let stderr_bytes = resp.stderr.as_bytes().to_vec();
+        Ok(ExecResult {
+            stdout: resp.stdout,
+            stdout_bytes,
+            stderr: resp.stderr,
+            stderr_bytes,
+            exit_code: resp.exit_code,
+            error: resp.error,
+            stdout_truncated: resp.stdout_truncated,
+            stderr_truncated: resp.stderr_truncated,
+            final_env: resp.final_env,
+        })
+    }
+
+    /// Get the tool name.
+    #[getter(name)]
+    fn name_prop(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the short description.
+    #[getter]
+    fn short_description(&self) -> String {
+        self.short_desc
+            .clone()
+            .unwrap_or_else(|| format!("ScriptedTool: {}", self.name))
+    }
+
+    /// Number of registered tools.
+    fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Get the token-efficient description.
+    fn description(&self) -> String {
+        Python::attach(|py| {
+            let session = PyCallbackSession::capture(
+                py,
+                self.callback_engine.clone(),
+                false,
+                false,
+                PySyncLoopMode::PerSession,
+            )
+            .expect("callback session");
+            self.build_rust_tool_with_session(py, session)
+                .description()
+                .to_string()
+        })
+    }
+
+    /// Get help as a Markdown document.
+    fn help(&self) -> String {
+        Python::attach(|py| {
+            let session = PyCallbackSession::capture(
+                py,
+                self.callback_engine.clone(),
+                false,
+                false,
+                PySyncLoopMode::PerSession,
+            )
+            .expect("callback session");
+            self.build_rust_tool_with_session(py, session).help()
+        })
+    }
+
+    /// Get compact system-prompt text for orchestration.
+    fn system_prompt(&self) -> String {
+        Python::attach(|py| {
+            let session = PyCallbackSession::capture(
+                py,
+                self.callback_engine.clone(),
+                false,
+                false,
+                PySyncLoopMode::PerSession,
+            )
+            .expect("callback session");
+            self.build_rust_tool_with_session(py, session)
+                .system_prompt()
+        })
+    }
+
+    /// Get JSON input schema.
+    fn input_schema(&self, py: Python<'_>) -> PyResult<String> {
+        let session = PyCallbackSession::capture(
+            py,
+            self.callback_engine.clone(),
+            false,
+            false,
+            PySyncLoopMode::PerSession,
+        )?;
+        let tool = self.build_rust_tool_with_session(py, session);
+        let schema = tool.input_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| PyValueError::new_err(format!("Schema serialization failed: {}", e)))
+    }
+
+    /// Get JSON output schema.
+    fn output_schema(&self, py: Python<'_>) -> PyResult<String> {
+        let session = PyCallbackSession::capture(
+            py,
+            self.callback_engine.clone(),
+            false,
+            false,
+            PySyncLoopMode::PerSession,
+        )?;
+        let tool = self.build_rust_tool_with_session(py, session);
+        let schema = tool.output_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| PyValueError::new_err(format!("Schema serialization failed: {}", e)))
+    }
+
+    /// Get tool version.
+    #[getter]
+    fn version(&self) -> &str {
+        VERSION
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ScriptedTool(name={:?}, tools={})",
+            self.name,
+            self.tools.len()
+        )
+    }
+}
+
+// ============================================================================
+// BashError — exception for non-zero exit codes
+// ============================================================================
+
+pyo3::create_exception!(bashkit, BashError, pyo3::exceptions::PyException);
+
+/// Raise a `BashError` from an `ExecResult` with non-zero exit code.
+fn raise_bash_error(result: &ExecResult) -> PyErr {
+    let message = result
+        .error
+        .clone()
+        .unwrap_or_else(|| result.stderr.clone());
+    let msg = if message.is_empty() {
+        format!("Exit code {}", result.exit_code)
+    } else {
+        message
+    };
+    Python::attach(|py| {
+        let err = BashError::new_err(msg);
+        // Attach structured fields to the exception instance.
+        let val = err.value(py);
+        let _ = val.setattr("exit_code", result.exit_code);
+        let _ = val.setattr("stderr", &result.stderr);
+        let _ = val.setattr("stdout", &result.stdout);
+        err
+    })
+}
+
+// ============================================================================
+// Module-level functions
+// ============================================================================
+
+/// Get the bashkit version string.
+#[pyfunction]
+fn get_version() -> &'static str {
+    VERSION
+}
+
+/// Create a LangChain-compatible tool spec from BashTool.
+#[pyfunction]
+fn create_langchain_tool_spec() -> PyResult<pyo3::Py<PyDict>> {
+    let tool = RustBashTool::default();
+
+    Python::attach(|py| {
+        let dict = PyDict::new(py);
+        dict.set_item("name", tool.name())?;
+        dict.set_item("description", tool.description())?;
+
+        let schema = tool.input_schema();
+        let schema_str = serde_json::to_string(&schema)
+            .map_err(|e| PyValueError::new_err(format!("Schema error: {}", e)))?;
+        dict.set_item("args_schema", schema_str)?;
+
+        Ok(dict.into())
+    })
+}
+
+// ============================================================================
+// Python module
+// ============================================================================
+
+#[pymodule]
+fn _bashkit(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyExecutionProfile>()?;
+    m.add_class::<PyBash>()?;
+    m.add_class::<BashTool>()?;
+    m.add_class::<ScriptedTool>()?;
+    m.add_class::<ShellState>()?;
+    m.add_class::<BuiltinResult>()?;
+    m.add_class::<ExecResult>()?;
+    m.add_class::<ScriptAnalysis>()?;
+    m.add_class::<AnalyzedCommand>()?;
+    m.add_class::<AnalyzedRedirect>()?;
+    m.add_class::<PyBuiltinContext>()?;
+    m.add_class::<PyFileSystem>()?;
+    m.add_class::<PyPackedCommit>()?;
+    m.add_class::<PySnapshotDiff>()?;
+    m.add_class::<PyCapabilityFingerprint>()?;
+    m.add_class::<PySnapshotGraph>()?;
+    m.add("BashError", m.py().get_type::<BashError>())?;
+    m.add_function(wrap_pyfunction!(create_langchain_tool_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(get_version, m)?)?;
+    m.add_function(wrap_pyfunction!(_mark_interpreter_at_exit, m)?)?;
+    // THREAT[TM-PY-030]: atexit runs at the very start of Py_FinalizeEx,
+    // strictly before the finalization phase in which native threads may no
+    // longer attach. The flag it sets is the boundary between deterministic
+    // teardown (interpreter alive) and hands-off teardown (process exiting).
+    m.py()
+        .import("atexit")?
+        .call_method1("register", (m.getattr("_mark_interpreter_at_exit")?,))?;
+    Ok(())
+}
+
+// ============================================================================
+// MontyObject <-> Python conversion helpers
+// ============================================================================
+
+fn monty_to_py(py: Python<'_>, obj: &MontyObject) -> PyResult<Py<PyAny>> {
+    monty_to_py_inner(py, obj, 0)
+}
+
+fn monty_to_py_inner(py: Python<'_>, obj: &MontyObject, depth: usize) -> PyResult<Py<PyAny>> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "MontyObject nesting depth exceeds maximum of 64",
+        ));
+    }
+    match obj {
+        MontyObject::None => Ok(py.None()),
+        MontyObject::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
+        MontyObject::Int(i) => Ok(i.into_pyobject(py)?.into_any().unbind()),
+        // BigInt: convert to Python int via its decimal string representation.
+        MontyObject::BigInt(b) => {
+            let int_str = b.to_string();
+            let py_int = py.import("builtins")?.getattr("int")?.call1((int_str,))?;
+            Ok(py_int.into_any().unbind())
+        }
+        MontyObject::Float(f) => Ok(f.into_pyobject(py)?.into_any().unbind()),
+        MontyObject::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+        // Known limitation: Path becomes a plain Python str, not pathlib.Path.
+        MontyObject::Path(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+        MontyObject::Bytes(b) => Ok(b.as_slice().into_pyobject(py)?.into_any().unbind()),
+        MontyObject::Tuple(items) => {
+            let py_items = items
+                .iter()
+                .map(|v| monty_to_py_inner(py, v, depth + 1))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyTuple::new(py, &py_items)?.into_any().unbind())
+        }
+        MontyObject::List(items) => {
+            let py_items = items
+                .iter()
+                .map(|v| monty_to_py_inner(py, v, depth + 1))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyList::new(py, &py_items)?.into_any().unbind())
+        }
+        MontyObject::Set(items) => {
+            let py_items = items
+                .iter()
+                .map(|v| monty_to_py_inner(py, v, depth + 1))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PySet::new(py, &py_items)?.into_any().unbind())
+        }
+        MontyObject::FrozenSet(items) => {
+            let py_items = items
+                .iter()
+                .map(|v| monty_to_py_inner(py, v, depth + 1))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyFrozenSet::new(py, &py_items)?.into_any().unbind())
+        }
+        // NamedTuple: convert to dict mapping field names to values, preserving field names.
+        MontyObject::NamedTuple {
+            field_names,
+            values,
+            ..
+        } => {
+            let dict = PyDict::new(py);
+            for (name, value) in field_names.iter().zip(values.iter()) {
+                dict.set_item(name, monty_to_py_inner(py, value, depth + 1)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+        MontyObject::Dict(dict_pairs) => {
+            let dict = PyDict::new(py);
+            // DictPairs only implements IntoIterator (consuming), so clone is required
+            // to iterate without moving out of the match guard.
+            for (k, v) in dict_pairs.clone() {
+                dict.set_item(
+                    monty_to_py_inner(py, &k, depth + 1)?,
+                    monty_to_py_inner(py, &v, depth + 1)?,
+                )?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+        // All other variants (Exception, Type, Function, etc.) — repr as string.
+        other => Ok(other.py_repr().into_pyobject(py)?.into_any().unbind()),
+    }
+}
+
+fn py_to_monty(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<MontyObject> {
+    py_to_monty_inner(py, obj, 0)
+}
+
+// `py` is used directly in `is_instance_of`, `import`, and `cast` calls — not only
+// forwarded in recursive calls — so clippy's "only used in recursion" is a false positive.
+#[allow(clippy::only_used_in_recursion)]
+fn py_to_monty_inner(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    depth: usize,
+) -> PyResult<MontyObject> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Python object nesting depth exceeds maximum of 64",
+        ));
+    }
+    if obj.is_none() {
+        return Ok(MontyObject::None);
+    }
+    // bool must come before int — bool is a subtype of int in Python
+    if let Ok(b) = obj.extract::<bool>() {
+        return Ok(MontyObject::Bool(b));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(MontyObject::Int(i));
+    }
+    // Large Python int that overflows i64: convert via decimal string → BigInt.
+    if obj.is_instance_of::<PyInt>() {
+        let s = obj.str()?.extract::<String>()?;
+        let b = s.parse::<num_bigint::BigInt>().map_err(|e| {
+            PyValueError::new_err(format!("failed to parse Python int as BigInt: {e}"))
+        })?;
+        return Ok(MontyObject::BigInt(b));
+    }
+    // Guard f64 with an isinstance check so large Python ints (which widen to f64)
+    // are not incorrectly classified as floats.
+    if obj.is_instance_of::<PyFloat>()
+        && let Ok(f) = obj.extract::<f64>()
+    {
+        return Ok(MontyObject::Float(f));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(MontyObject::String(s));
+    }
+    // Guard bytes with isinstance to avoid ambiguity with str-like objects.
+    if obj.is_instance_of::<PyBytes>()
+        && let Ok(b) = obj.extract::<Vec<u8>>()
+    {
+        return Ok(MontyObject::Bytes(b));
+    }
+    if let Ok(tuple) = obj.cast::<PyTuple>() {
+        let items = tuple
+            .iter()
+            .map(|v| py_to_monty_inner(py, &v, depth + 1))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(MontyObject::Tuple(items));
+    }
+    if let Ok(list) = obj.cast::<PyList>() {
+        let items = list
+            .iter()
+            .map(|v| py_to_monty_inner(py, &v, depth + 1))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(MontyObject::List(items));
+    }
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        let pairs: Vec<(MontyObject, MontyObject)> = dict
+            .iter()
+            .map(|(k, v)| {
+                Ok((
+                    py_to_monty_inner(py, &k, depth + 1)?,
+                    py_to_monty_inner(py, &v, depth + 1)?,
+                ))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(MontyObject::dict(pairs));
+    }
+    if let Ok(set) = obj.cast::<PySet>() {
+        let items = set
+            .iter()
+            .map(|v| py_to_monty_inner(py, &v, depth + 1))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(MontyObject::Set(items));
+    }
+    if let Ok(fset) = obj.cast::<PyFrozenSet>() {
+        let items = fset
+            .iter()
+            .map(|v| py_to_monty_inner(py, &v, depth + 1))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(MontyObject::FrozenSet(items));
+    }
+    // Fallback: convert to string via __str__
+    Ok(MontyObject::String(obj.str()?.extract::<String>()?))
+}

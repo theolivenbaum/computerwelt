@@ -1,0 +1,1889 @@
+"""Type stubs for bashkit native module."""
+
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, ClassVar, Literal, Protocol, TypedDict
+
+class ExecutionProfile:
+    """Closed set of named resource-policy baselines."""
+
+    Hardened: ClassVar[ExecutionProfile]
+    Standard: ClassVar[ExecutionProfile]
+    Interactive: ClassVar[ExecutionProfile]
+
+class BearerCredentialInjection(TypedDict):
+    """Inject ``Authorization: Bearer <token>`` for matching URLs."""
+
+    pattern: str
+    kind: Literal["bearer"]
+    token: str
+
+class HeaderCredentialInjection(TypedDict):
+    """Inject a single custom header for matching URLs."""
+
+    pattern: str
+    kind: Literal["header"]
+    name: str
+    value: str
+
+class HeadersCredentialInjection(TypedDict):
+    """Inject multiple custom headers for matching URLs."""
+
+    pattern: str
+    kind: Literal["headers"]
+    headers: list[tuple[str, str]]
+
+CredentialInjection = BearerCredentialInjection | HeaderCredentialInjection | HeadersCredentialInjection
+
+class BearerCredentialPlaceholder(TypedDict):
+    """Placeholder-mode bearer-token injection.
+
+    Sets ``env`` to an opaque placeholder visible to scripts; the placeholder
+    is replaced with the real ``token`` on the wire for requests matching
+    ``pattern``.
+    """
+
+    env: str
+    pattern: str
+    kind: Literal["bearer"]
+    token: str
+
+class HeaderCredentialPlaceholder(TypedDict):
+    """Placeholder-mode single-header injection."""
+
+    env: str
+    pattern: str
+    kind: Literal["header"]
+    name: str
+    value: str
+
+class HeadersCredentialPlaceholder(TypedDict):
+    """Placeholder-mode multi-header injection."""
+
+    env: str
+    pattern: str
+    kind: Literal["headers"]
+    headers: list[tuple[str, str]]
+
+CredentialPlaceholder = BearerCredentialPlaceholder | HeaderCredentialPlaceholder | HeadersCredentialPlaceholder
+
+class NetworkConfig(TypedDict, total=False):
+    """Outbound HTTP / network configuration for ``Bash`` and ``BashTool``.
+
+    Covers phases 1 and 2 of #1348 — allowlist plus credential injection.
+    Provide either ``allow`` (a list of URL patterns) or ``allow_all=True``;
+    passing both raises ``ValueError``. Omitting ``network=`` keeps the
+    network disabled (the existing default).
+
+    ``credentials`` injects headers transparently for matching URLs without
+    the script ever seeing the secret. ``credential_placeholders`` exposes
+    the credential to the script as an opaque placeholder via an env var,
+    and replaces the placeholder with the real value in outbound headers.
+    """
+
+    allow: list[str]
+    allow_all: bool
+    block_private_ips: bool
+    credentials: list[CredentialInjection]
+    credential_placeholders: list[CredentialPlaceholder]
+
+# Synchronous chunk callback for live stdout/stderr streaming.
+OutputHandler = Callable[[str, str], None]
+
+class BuiltinContext:
+    """Invocation context for a custom builtin callback.
+
+    Attributes:
+        name: Builtin command name.
+        argv: Raw argv tokens after shell parsing, excluding the command name.
+        stdin: Pipeline input from the previous command, if any.
+        env: Environment variables visible to the builtin.
+        cwd: Current working directory at invocation time.
+        fs: Live handle to the interpreter's virtual filesystem. Reads see
+            files created by earlier commands and writes are visible to later
+            ones. Same API as ``Bash.fs()`` — e.g. ``ctx.fs.read_file(path)``
+            returns ``bytes``. Operates directly on the interpreter's VFS, so
+            it is safe to use from inside the callback. Ops are synchronous and,
+            while a runtime is active, may run off-thread (relatively expensive
+            per call), so batch filesystem work rather than looping over many
+            tiny ops. May be retained past the callback: a stashed handle keeps
+            the VFS (and its runtime) alive even after the ``Bash`` is dropped.
+    """
+
+    name: str
+    argv: list[str]
+    stdin: str | None
+    env: dict[str, str]
+    cwd: str
+    fs: FileSystem
+
+class BuiltinResult:
+    """Shell-facing result for a custom builtin callback.
+
+    Attributes:
+        stdout: Text written to stdout.
+        stderr: Text written to stderr.
+        exit_code: Shell exit status.
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int
+
+    def __init__(self, stdout: str = "", stderr: str = "", exit_code: int = 0) -> None: ...
+
+BuiltinCallback = Callable[
+    [BuiltinContext],
+    str | BuiltinResult | Awaitable[str | BuiltinResult],
+]
+
+class FileSystem:
+    """Direct access to Bashkit's virtual filesystem or a standalone mountable FS.
+
+    Two ways to create:
+
+    1. In-memory (default) — starts empty::
+
+        >>> fs = FileSystem()
+        >>> fs.write_file("/hello.txt", b"hi")
+        >>> fs.read_file("/hello.txt")
+        b'hi'
+
+    2. Backed by a real host directory::
+
+        >>> fs = FileSystem.real("/tmp/data", writable=False)
+        >>> fs.exists("/some-host-file.txt")
+        True
+    """
+
+    def __init__(self) -> None:
+        """Create a new empty in-memory filesystem.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.exists("/anything")
+            False
+        """
+        ...
+
+    @staticmethod
+    def real(host_path: str, writable: bool = False) -> FileSystem:
+        """Create a filesystem backed by a real host directory.
+
+        Args:
+            host_path: Absolute path on the host to expose.
+            writable: Allow write operations (default read-only).
+
+        Example::
+
+            >>> fs = FileSystem.real("/tmp/project", writable=True)
+            >>> fs.write_file("/tmp/project/out.txt", b"data")
+        """
+        ...
+
+    @staticmethod
+    def from_capsule(capsule: Any) -> FileSystem:
+        """Create a filesystem from a ``PyCapsule`` exported by a native extension.
+
+        The capsule must wrap a ``bashkit.FileSystem.v1`` stable ABI handle.
+        """
+        ...
+
+    def to_capsule(self) -> Any:
+        """Export this filesystem as a stable-ABI ``PyCapsule`` for native extension interop."""
+        ...
+
+    def read_file(self, path: str) -> bytes:
+        """Read the entire contents of a file.
+
+        Args:
+            path: Absolute path in the filesystem.
+
+        Returns:
+            File contents as bytes.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/demo.txt", b"hello")
+            >>> fs.read_file("/demo.txt")
+            b'hello'
+        """
+        ...
+
+    def write_file(self, path: str, content: bytes) -> None:
+        """Write content to a file, creating or overwriting it.
+
+        Args:
+            path: Absolute path in the filesystem.
+            content: Data to write.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/output.txt", b"result data")
+        """
+        ...
+
+    def append_file(self, path: str, content: bytes) -> None:
+        """Append content to an existing file.
+
+        Args:
+            path: Absolute path in the filesystem.
+            content: Data to append.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/log.txt", b"line1\\n")
+            >>> fs.append_file("/log.txt", b"line2\\n")
+            >>> fs.read_file("/log.txt")
+            b'line1\\nline2\\n'
+        """
+        ...
+
+    def mkdir(self, path: str, recursive: bool = False) -> None:
+        """Create a directory.
+
+        Args:
+            path: Absolute path for the new directory.
+            recursive: Create parent directories as needed.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.mkdir("/a/b/c", recursive=True)
+            >>> fs.exists("/a/b/c")
+            True
+        """
+        ...
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        """Remove a file or directory.
+
+        Args:
+            path: Absolute path to remove.
+            recursive: Remove directory contents recursively.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/tmp.txt", b"x")
+            >>> fs.remove("/tmp.txt")
+            >>> fs.exists("/tmp.txt")
+            False
+        """
+        ...
+
+    def stat(self, path: str) -> dict[str, Any]:
+        """Get file metadata.
+
+        Returns:
+            Dict with ``file_type``, ``size``, ``mode``, ``modified``, ``created``.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/f.txt", b"data")
+            >>> info = fs.stat("/f.txt")
+            >>> info["file_type"]
+            'file'
+            >>> info["size"]
+            4
+        """
+        ...
+
+    def read_dir(self, path: str) -> list[dict[str, Any]]:
+        """List directory entries.
+
+        Returns:
+            List of dicts, each with ``name`` and ``metadata`` keys.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/dir/a.txt", b"a")
+            >>> entries = fs.read_dir("/dir")
+            >>> entries[0]["name"]
+            'a.txt'
+        """
+        ...
+
+    def exists(self, path: str) -> bool:
+        """Check whether a path exists.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.exists("/nope")
+            False
+            >>> fs.write_file("/yes.txt", b"")
+            >>> fs.exists("/yes.txt")
+            True
+        """
+        ...
+
+    def rename(self, from_path: str, to_path: str) -> None:
+        """Rename (move) a file or directory.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/old.txt", b"data")
+            >>> fs.rename("/old.txt", "/new.txt")
+            >>> fs.exists("/new.txt")
+            True
+        """
+        ...
+
+    def copy(self, from_path: str, to_path: str) -> None:
+        """Copy a file.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/src.txt", b"data")
+            >>> fs.copy("/src.txt", "/dst.txt")
+            >>> fs.read_file("/dst.txt")
+            b'data'
+        """
+        ...
+
+    def symlink(self, target: str, link: str) -> None:
+        """Create a symbolic link.
+
+        Args:
+            target: Path the symlink points to.
+            link: Path of the symlink itself.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/real.txt", b"data")
+            >>> fs.symlink("/real.txt", "/link.txt")
+            >>> fs.read_file("/link.txt")
+            b'data'
+        """
+        ...
+
+    def chmod(self, path: str, mode: int) -> None:
+        """Change file permissions.
+
+        Args:
+            path: Absolute path.
+            mode: Octal permission bits (e.g. ``0o755``).
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/script.sh", b"#!/bin/bash")
+            >>> fs.chmod("/script.sh", 0o755)
+        """
+        ...
+
+    def read_link(self, path: str) -> str:
+        """Read the target of a symbolic link.
+
+        Example::
+
+            >>> fs = FileSystem()
+            >>> fs.write_file("/target.txt", b"data")
+            >>> fs.symlink("/target.txt", "/link.txt")
+            >>> fs.read_link("/link.txt")
+            '/target.txt'
+        """
+        ...
+
+class ExternalHandler(Protocol):
+    """Protocol for the external function handler passed to Bash.
+
+    Called when Monty Python code invokes a registered external function.
+    Must be an async callable with this exact signature.
+
+    Example::
+
+        >>> async def my_handler(fn_name: str, args: list, kwargs: dict) -> Any:
+        ...     if fn_name == "fetch":
+        ...         return {"status": 200, "body": "ok"}
+        ...     return None
+        >>> bash = Bash(
+        ...     python=True,
+        ...     external_functions=["fetch"],
+        ...     external_handler=my_handler,
+        ... )
+    """
+
+    async def __call__(self, fn_name: str, args: list[Any], kwargs: dict[str, Any]) -> Any: ...
+
+class ShellState:
+    """Read-only snapshot of shell state.
+
+    Returned by ``Bash.shell_state()`` and ``BashTool.shell_state()`` for
+    prompt rendering and state inspection. This is a Python-friendly
+    inspection view, not a full-fidelity Rust ``ShellState`` mirror.
+    Mapping fields are immutable views. Use
+    ``snapshot(exclude_filesystem=True)`` when you need shell-only restore
+    bytes. Transient fields like ``last_exit_code`` and ``traps`` reflect the
+    captured snapshot, but the next top-level ``execute()`` / ``execute_sync()``
+    clears them before running a new command.
+    """
+
+    @property
+    def env(self) -> Mapping[str, str]: ...
+    @property
+    def variables(self) -> Mapping[str, str]: ...
+    @property
+    def arrays(self) -> Mapping[str, Mapping[int, str]]: ...
+    @property
+    def assoc_arrays(self) -> Mapping[str, Mapping[str, str]]: ...
+    @property
+    def cwd(self) -> str: ...
+    @property
+    def last_exit_code(self) -> int: ...
+    @property
+    def aliases(self) -> Mapping[str, str]: ...
+    @property
+    def traps(self) -> Mapping[str, str]: ...
+
+class Bash:
+    """Core bash interpreter with virtual filesystem.
+
+    State persists between calls — files created in one execute() are
+    available in subsequent calls.
+
+    Example (basic):
+        >>> bash = Bash()
+        >>> result = await bash.execute("echo 'Hello!'")
+        >>> print(result.stdout)
+        Hello!
+
+    Example (Python execution with external function handler):
+        >>> async def handler(fn_name: str, args: list, kwargs: dict) -> Any:
+        ...     return await tool_executor.call(fn_name, kwargs)
+        >>> bash = Bash(
+        ...     python=True,
+        ...     external_functions=["api_request"],
+        ...     external_handler=handler,
+        ... )
+        >>> result = await bash.execute("python3 -c 'print(api_request())'")
+    """
+
+    def __init__(
+        self,
+        username: str | None = None,
+        hostname: str | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        max_commands: int | None = None,
+        max_loop_iterations: int | None = None,
+        max_memory: int | None = None,
+        timeout_seconds: float | None = None,
+        python: bool = False,
+        sqlite: bool = False,
+        external_functions: list[str] | None = None,
+        external_handler: ExternalHandler | None = None,
+        files: dict[str, str | Callable[[], str]] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        allowed_mount_paths: list[str] | None = None,
+        readonly_filesystem: bool = False,
+        custom_builtins: Mapping[str, BuiltinCallback] | None = None,
+        network: NetworkConfig | None = None,
+        profile: ExecutionProfile = ExecutionProfile.Standard,
+    ) -> None:
+        """Create a new Bash interpreter.
+
+        Args:
+            username: Custom username (default ``"user"``).
+            hostname: Custom hostname (default ``"bashkit"``).
+            cwd: Initial working directory for the shell. Sets the starting
+                directory directly instead of running a leading ``cd``.
+            env: Initial environment variables applied before execution, so
+                scripts see them without an ``export`` prelude.
+            max_commands: Limit total commands executed.
+            max_loop_iterations: Limit iterations per loop.
+            max_memory: Memory limit in bytes for the VFS.
+            timeout_seconds: Abort execution after this duration.
+            python: Enable embedded Python (``python3`` builtin).
+            sqlite: Enable embedded SQLite (``sqlite``/``sqlite3`` builtin).
+                Defaults to ``False``. When ``True``, the Turso-backed engine
+                is registered and ``BASHKIT_ALLOW_INPROCESS_SQLITE=1`` is
+                injected automatically. Default ``SqliteLimits`` apply: 4 MiB
+                script cap, 256 MiB DB cap, 30 s wall-clock budget,
+                resource-affecting PRAGMAs (`cache_size`, `mmap_size`, …)
+                rejected, ``ATTACH``/``DETACH`` rejected.
+            external_functions: Function names callable from Python code.
+            external_handler: Async callback for external function calls.
+                The callback must not call back into the same ``Bash`` instance
+                via live methods like ``read_file()``, ``fs()``, or
+                ``execute()``; those re-entrant calls are rejected.
+            files: Dict mapping VFS paths to file contents or lazy callables.
+            mounts: List of real host directory mount configs.
+            allowed_mount_paths: Host path prefixes allowed for real filesystem
+                mounts. Required when mounting sensitive host locations such as
+                paths under a user home directory.
+            readonly_filesystem: Deny all filesystem mutations after configured
+                files and mounts are applied.
+            custom_builtins: Constructor-time Python callbacks exposed as
+                bash builtins. Each callback receives a ``BuiltinContext``
+                with raw ``argv`` tokens, optional pipeline ``stdin``, and a
+                live ``fs`` handle to the virtual filesystem, and must return a
+                stdout string, a ``BuiltinResult``, or await either. Async
+                callbacks run on the caller's active asyncio loop for
+                ``await execute()`` and on a private loop for
+                ``execute_sync()``.
+            network: Optional outbound HTTP / network configuration. Pass
+                ``{"allow": [...]}`` for an explicit allowlist or
+                ``{"allow_all": True}`` to allow every URL (mirrors
+                ``NetworkAllowlist::allow_all()`` in the Rust core). Set
+                ``"block_private_ips": False`` to relax the SSRF guard.
+                Add ``"credentials": [...]`` to inject headers transparently
+                for matching URLs and ``"credential_placeholders": [...]``
+                to expose opaque placeholder env vars that are replaced with
+                the real secret on the wire. When omitted, network access
+                is disabled (current default). Preserved across ``reset()``
+                and ``from_snapshot()`` — placeholder env vars are
+                regenerated on each rebuild.
+
+        Example::
+
+            >>> bash = Bash(
+            ...     timeout_seconds=30,
+            ...     files={"/input.txt": "some data"},
+            ...     custom_builtins={"ping": lambda ctx: "pong\\n"},
+            ...     network={
+            ...         "allow": ["https://api.github.com"],
+            ...         "credentials": [
+            ...             {
+            ...                 "pattern": "https://api.github.com",
+            ...                 "kind": "bearer",
+            ...                 "token": "ghp_xxx",
+            ...             }
+            ...         ],
+            ...     },
+            ... )
+        """
+        ...
+
+    async def execute(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute bash commands asynchronously.
+
+        Args:
+            commands: Bash script to run (like ``bash -c "commands"``).
+            on_output: Optional callback receiving chunked ``(stdout, stderr)``
+                pairs during execution. Must be synchronous.
+
+        Async ``custom_builtins`` callbacks run on the caller's active asyncio
+        loop.
+
+        Returns:
+            ExecResult with stdout, stderr, exit_code.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> result = await bash.execute("echo hello && echo world")
+            >>> print(result.stdout)
+            hello
+            world
+        """
+        ...
+
+    def execute_sync(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute bash commands synchronously (blocking).
+
+        Not supported when ``external_handler`` is configured — use
+        ``execute()`` (async) instead. ``on_output`` must be synchronous.
+        Async ``custom_builtins`` callbacks run on a private loop here.
+        When called from inside a running event loop (e.g. Jupyter / IPython),
+        callbacks are dispatched to a background thread with their own loop so
+        that asyncio's "cannot run while another loop is running" restriction
+        is not triggered.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> result = bash.execute_sync("date +%Y")
+            >>> print(result.exit_code)
+            0
+        """
+        ...
+
+    async def execute_or_throw(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute commands asynchronously; raise ``BashError`` on non-zero exit.
+
+        ``on_output`` must be synchronous.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> result = await bash.execute_or_throw("echo ok")
+            >>> # Raises BashError if the command fails:
+            >>> await bash.execute_or_throw("false")  # doctest: +SKIP
+            Traceback (most recent call last):
+                ...
+            BashError: ...
+        """
+        ...
+
+    def execute_sync_or_throw(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute commands synchronously; raise ``BashError`` on non-zero exit.
+
+        ``on_output`` must be synchronous.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> result = bash.execute_sync_or_throw("echo ok")
+            >>> print(result.stdout.strip())
+            ok
+        """
+        ...
+
+    def cancel(self) -> None:
+        """Cancel the currently running execution.
+
+        Safe to call from any thread. Execution aborts at the next
+        command boundary.
+
+        Example::
+
+            >>> import threading
+            >>> bash = Bash()
+            >>> threading.Timer(1.0, bash.cancel).start()
+            >>> # Long-running command will be cancelled after 1 second
+        """
+        ...
+
+    def clear_cancel(self) -> None:
+        """Clear the cancellation flag so subsequent executions proceed normally.
+
+        Call this after a ``cancel()`` once the in-flight execution has
+        finished and you want to reuse the same ``Bash`` instance
+        (preserving VFS state). Without this, every future ``execute()``
+        will immediately fail with ``"execution cancelled"``.
+
+        **Note:** Calling this while an execution is still in-flight may
+        allow that execution to continue past the cancellation point.
+        Wait for the cancelled execution to finish before clearing
+        (await the async call or let ``execute_sync`` return).
+
+        Example::
+
+            >>> bash = Bash()
+            >>> bash.cancel()
+            >>> bash.clear_cancel()
+            >>> result = bash.execute_sync("echo ok")
+            >>> result.exit_code
+            0
+        """
+        ...
+
+    def reset(self) -> None:
+        """Reset interpreter to initial state.
+
+        Clears all VFS contents, environment variables, and shell state.
+        Re-applies the original ``files``, ``mounts``, and
+        ``custom_builtins`` configuration.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> bash.execute_sync("echo hi > /tmp/file.txt")
+            >>> bash.reset()
+            >>> result = bash.execute_sync("cat /tmp/file.txt")
+            >>> result.exit_code  # file is gone after reset
+            1
+        """
+        ...
+
+    def commit(
+        self,
+        parents: list[str] | None = None,
+        meta: dict[str, str] | None = None,
+        have: list[str] | None = None,
+        exclude_filesystem: bool = False,
+        exclude_functions: bool = False,
+    ) -> PackedCommit:
+        """Capture state as a content-addressed commit for session history.
+
+        Pass ``have`` (ids your store already holds) to keep commits
+        incremental. A fork is a commit whose parent is not the branch tip.
+        """
+        ...
+
+    def checkout(
+        self,
+        commit_id: str,
+        objects: dict[str, bytes],
+        policy: str = "superset",
+    ) -> None:
+        """Restore the state a commit describes, pulling objects from a store.
+
+        ``policy`` is ``"superset"`` (default), ``"strict"``, or ``"force"``.
+        Nothing is mutated if the checkout fails.
+        """
+        ...
+
+    def capabilities(self) -> CapabilityFingerprint:
+        """Fingerprint this instance's environment."""
+        ...
+
+    def snapshot(
+        self,
+        exclude_filesystem: bool = False,
+        exclude_functions: bool = False,
+    ) -> bytes:
+        """Serialize interpreter state to bytes."""
+        ...
+
+    def snapshot_keyed(
+        self,
+        key: bytes,
+        exclude_filesystem: bool = False,
+        exclude_functions: bool = False,
+    ) -> bytes:
+        """Serialize interpreter state to HMAC-protected bytes."""
+        ...
+
+    def analyze(self, script: str) -> ScriptAnalysis:
+        """Analyze a script without running it.
+
+        Parses ``script`` with this instance's parser limits and reports the
+        commands, redirect targets, and function definitions it statically
+        refers to. Nothing is executed and no instance state changes.
+
+        Intended for permission prompts and audit logging. **Advisory only** —
+        check :attr:`ScriptAnalysis.is_opaque` before treating an allowlist
+        match as safe.
+
+        Raises:
+            BashError: if the script does not parse. Treat that as "deny or
+                prompt", never as "no commands".
+
+        Example::
+
+            >>> analysis = Bash().analyze("cat notes.txt | grep -i todo")
+            >>> analysis.command_names
+            ['cat', 'grep']
+            >>> analysis.is_opaque
+            False
+        """
+        ...
+
+    def shell_state(self) -> ShellState:
+        """Capture a read-only shell-state snapshot."""
+        ...
+
+    def restore_snapshot(self, data: bytes) -> None:
+        """Restore interpreter state from bytes produced by ``snapshot()``."""
+        ...
+
+    def restore_snapshot_keyed(self, data: bytes, key: bytes) -> None:
+        """Restore interpreter state from bytes produced by ``snapshot_keyed()``."""
+        ...
+
+    @staticmethod
+    def from_snapshot(
+        data: bytes,
+        username: str | None = None,
+        hostname: str | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        max_commands: int | None = None,
+        max_loop_iterations: int | None = None,
+        max_memory: int | None = None,
+        timeout_seconds: float | None = None,
+        python: bool = False,
+        sqlite: bool = False,
+        external_functions: list[str] | None = None,
+        external_handler: ExternalHandler | None = None,
+        files: dict[str, str] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        allowed_mount_paths: list[str] | None = None,
+        readonly_filesystem: bool = False,
+        custom_builtins: Mapping[str, BuiltinCallback] | None = None,
+        network: NetworkConfig | None = None,
+        profile: ExecutionProfile = ExecutionProfile.Standard,
+    ) -> Bash:
+        """Create a new ``Bash`` from snapshot bytes and optional constructor kwargs."""
+        ...
+
+    @staticmethod
+    def from_snapshot_keyed(
+        data: bytes,
+        key: bytes,
+        username: str | None = None,
+        hostname: str | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        max_commands: int | None = None,
+        max_loop_iterations: int | None = None,
+        max_memory: int | None = None,
+        timeout_seconds: float | None = None,
+        python: bool = False,
+        sqlite: bool = False,
+        external_functions: list[str] | None = None,
+        external_handler: ExternalHandler | None = None,
+        files: dict[str, str] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        allowed_mount_paths: list[str] | None = None,
+        readonly_filesystem: bool = False,
+        custom_builtins: Mapping[str, BuiltinCallback] | None = None,
+        network: NetworkConfig | None = None,
+        profile: ExecutionProfile = ExecutionProfile.Standard,
+    ) -> Bash:
+        """Create a new ``Bash`` from HMAC-protected snapshot bytes."""
+        ...
+
+    def read_file(self, path: str) -> str:
+        """Read a VFS file as UTF-8 text."""
+        ...
+
+    def write_file(self, path: str, content: str) -> None:
+        """Write UTF-8 text into the VFS."""
+        ...
+
+    def append_file(self, path: str, content: str) -> None:
+        """Append UTF-8 text to a VFS file."""
+        ...
+
+    def mkdir(self, path: str, recursive: bool = False) -> None:
+        """Create a directory in the VFS."""
+        ...
+
+    def exists(self, path: str) -> bool:
+        """Return whether a VFS path exists."""
+        ...
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        """Remove a VFS file or directory."""
+        ...
+
+    def stat(self, path: str) -> dict[str, Any]:
+        """Return metadata for a VFS path."""
+        ...
+
+    def chmod(self, path: str, mode: int) -> None:
+        """Change VFS permissions for a path."""
+        ...
+
+    def symlink(self, target: str, link: str) -> None:
+        """Create a symlink in the VFS."""
+        ...
+
+    def read_link(self, path: str) -> str:
+        """Return the symlink target for a VFS path."""
+        ...
+
+    def read_dir(self, path: str) -> list[dict[str, Any]]:
+        """Return directory entries with metadata."""
+        ...
+
+    def ls(self, path: str = ".") -> list[str]:
+        """Return entry names for a directory, or an empty list if it is missing."""
+        ...
+
+    def glob(self, pattern: str) -> list[str]:
+        """Return file paths matching a safe glob pattern."""
+        ...
+
+    def fs(self) -> FileSystem:
+        """Return a live filesystem handle.
+
+        Each operation acquires the interpreter lock, so the handle always
+        reflects the latest state (including after ``reset()``).
+
+        Example::
+
+            >>> bash = Bash()
+            >>> bash.execute_sync("echo hello > /greeting.txt")
+            >>> fs = bash.fs()
+            >>> fs.read_file("/greeting.txt")
+            b'hello\\n'
+        """
+        ...
+
+    def mount(self, vfs_path: str, fs: FileSystem) -> None:
+        """Mount an external filesystem at the given VFS path.
+
+        Args:
+            vfs_path: Mount point inside the VFS.
+            fs: FileSystem instance to mount.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> overlay = FileSystem()
+            >>> overlay.write_file("/data.csv", b"a,b,c")
+            >>> bash.mount("/mnt/data", overlay)
+            >>> result = bash.execute_sync("cat /mnt/data/data.csv")
+            >>> print(result.stdout)
+            a,b,c
+        """
+        ...
+
+    def unmount(self, vfs_path: str) -> None:
+        """Unmount a previously mounted filesystem.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> overlay = FileSystem()
+            >>> bash.mount("/mnt/ext", overlay)
+            >>> bash.unmount("/mnt/ext")
+        """
+        ...
+
+    def set_env(self, key: str, value: str) -> None:
+        """Set an exported environment variable on the live interpreter.
+
+        The env counterpart to :meth:`mount` — usable after construction, so a
+        reusable setup bundle (mount + env + builtins) can be applied to an
+        existing instance instead of only through the constructor. Scripts see
+        it as ``$NAME``; child contexts see it in ``env``. A later script
+        assignment wins.
+
+        Survives :meth:`reset`, like custom builtins and unlike env a *script*
+        exported: only host-set values are replayed on rebuild.
+
+        Args:
+            key: Variable name.
+            value: Variable value.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> bash.set_env("SKILL_PATH", "/skills/my-skill")
+            >>> bash.execute_sync("echo $SKILL_PATH").stdout
+            '/skills/my-skill\\n'
+        """
+        ...
+
+class AnalyzedCommand:
+    """One simple command found by :meth:`Bash.analyze`.
+
+    ``name`` and each entry of ``args`` are ``None`` when the word is not fully
+    literal — a computed name or argument is reported as unknown, never as safe.
+    """
+
+    name: str | None
+    args: list[str | None]
+    context: str
+    """``"direct"``, ``"substitution"``, or ``"function_body"``."""
+    assignments: list[str]
+    is_assignment_only: bool
+    """True for a bare assignment (``FOO=1``), which names no command."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the command as a plain dictionary."""
+        ...
+
+class AnalyzedRedirect:
+    """One file redirect found by :meth:`Bash.analyze`."""
+
+    path: str | None
+    mode: str
+    """``"read"``, ``"write"``, or ``"append"``."""
+    is_write: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the redirect as a plain dictionary."""
+        ...
+
+class ScriptAnalysis:
+    """Result of :meth:`Bash.analyze` — what a script statically refers to.
+
+    **Advisory only.** Static analysis cannot see through dynamic dispatch,
+    ``eval``, functions, or aliases; those set :attr:`is_opaque`. Enforcement
+    stays with the builtin registry, the network allowlist, and the mount
+    policy.
+
+    Example::
+
+        >>> analysis = Bash().analyze("echo $(rm -rf /data)")
+        >>> analysis.command_names
+        ['rm', 'echo']
+        >>> analysis.commands[0].context
+        'substitution'
+    """
+
+    commands: list[AnalyzedCommand]
+    redirects: list[AnalyzedRedirect]
+    functions: list[str]
+    command_names: list[str]
+    has_dynamic_commands: bool
+    has_command_substitution: bool
+    has_interpreter_reentry: bool
+    truncated: bool
+    is_opaque: bool
+    """The script hides work: dynamic command, ``eval``/``source``, or
+    truncated. Allowlist checks must treat this as "ask the user"."""
+
+    def commands_named(self, name: str) -> list[AnalyzedCommand]:
+        """Commands invoking ``name``, in source order."""
+        ...
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the analysis as a plain dictionary."""
+        ...
+
+class ExecResult:
+    """Result from executing bash commands.
+
+    Example::
+
+        >>> bash = Bash()
+        >>> result = bash.execute_sync("echo hello")
+        >>> result.success
+        True
+        >>> result.stdout
+        'hello\\n'
+        >>> result.exit_code
+        0
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int
+    error: str | None
+    success: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert result to a plain dictionary.
+
+        Returns:
+            Dict with ``stdout``, ``stderr``, ``exit_code``, ``error``,
+            ``stdout_truncated``, ``stderr_truncated``, ``final_env``.
+
+        Example::
+
+            >>> bash = Bash()
+            >>> result = bash.execute_sync("echo hi")
+            >>> d = result.to_dict()
+            >>> d["stdout"]
+            'hi\\n'
+            >>> d["exit_code"]
+            0
+        """
+        ...
+
+class BashTool:
+    """Sandboxed bash interpreter for AI agents.
+
+    BashTool provides a safe execution environment for running bash commands
+    with a virtual filesystem. All file operations are contained within the
+    sandbox - no access to the real filesystem.
+
+    Adds LLM-facing contract metadata (``description``, ``system_prompt``,
+    ``input_schema``, ``output_schema``) on top of the core interpreter.
+
+    Example:
+        >>> tool = BashTool()
+        >>> result = await tool.execute("echo 'Hello!'")
+        >>> print(result.stdout)
+        Hello!
+    """
+
+    name: str
+    short_description: str
+    version: str
+
+    def __init__(
+        self,
+        username: str | None = None,
+        hostname: str | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        max_commands: int | None = None,
+        max_loop_iterations: int | None = None,
+        max_memory: int | None = None,
+        timeout_seconds: float | None = None,
+        files: dict[str, str | Callable[[], str]] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        allowed_mount_paths: list[str] | None = None,
+        readonly_filesystem: bool = False,
+        custom_builtins: Mapping[str, BuiltinCallback] | None = None,
+        network: NetworkConfig | None = None,
+        profile: ExecutionProfile = ExecutionProfile.Standard,
+    ) -> None:
+        """Create a new BashTool.
+
+        Args:
+            username: Custom username (default ``"user"``).
+            hostname: Custom hostname (default ``"bashkit"``).
+            cwd: Initial working directory for the shell. Sets the starting
+                directory directly instead of running a leading ``cd``.
+            env: Initial environment variables applied before execution, so
+                scripts see them without an ``export`` prelude.
+            max_commands: Limit total commands executed.
+            max_loop_iterations: Limit iterations per loop.
+            max_memory: Memory limit in bytes for the VFS.
+            timeout_seconds: Abort execution after this duration.
+            files: Dict mapping VFS paths to file contents or lazy callables.
+            mounts: List of real host directory mount configs.
+            allowed_mount_paths: Host path prefixes allowed for real filesystem
+                mounts. Required when mounting sensitive host locations such as
+                paths under a user home directory.
+            readonly_filesystem: Deny all filesystem mutations after configured
+                files and mounts are applied.
+            custom_builtins: Constructor-time Python callbacks exposed as
+                bash builtins. Each callback receives a ``BuiltinContext``
+                (including a live ``fs`` handle to the virtual filesystem) and
+                must return a stdout string, a ``BuiltinResult``, or await
+                either. Async callbacks run on the caller's active asyncio
+                loop for ``await execute()`` and on a private loop for
+                ``execute_sync()``.
+            network: Optional outbound HTTP / network configuration. See
+                ``Bash.__init__`` for accepted keys. Preserved across
+                ``reset()`` and ``from_snapshot()``.
+
+        Example::
+
+            >>> tool = BashTool(
+            ...     timeout_seconds=30,
+            ...     custom_builtins={"ping": lambda ctx: "pong\\n"},
+            ...     network={"allow_all": True},
+            ... )
+            >>> print(tool.name)
+            bash
+        """
+        ...
+
+    async def execute(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute bash commands asynchronously.
+
+        Async ``custom_builtins`` callbacks run on the caller's active asyncio
+        loop.
+
+        ``on_output`` must be synchronous.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> result = await tool.execute("ls /")
+            >>> result.success
+            True
+        """
+        ...
+
+    def execute_sync(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute bash commands synchronously (blocking).
+
+        Async ``custom_builtins`` callbacks run on a private loop here.
+        When called from inside a running event loop (e.g. Jupyter / IPython),
+        callbacks are dispatched to a background thread with their own loop so
+        that asyncio's "cannot run while another loop is running" restriction
+        is not triggered.
+
+        ``on_output`` must be synchronous.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> result = tool.execute_sync("echo 42")
+            >>> result.stdout.strip()
+            '42'
+        """
+        ...
+
+    async def execute_or_throw(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute commands asynchronously; raise ``BashError`` on non-zero exit.
+
+        ``on_output`` must be synchronous.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> result = await tool.execute_or_throw("echo ok")
+            >>> result.success
+            True
+        """
+        ...
+
+    def execute_sync_or_throw(self, commands: str, on_output: OutputHandler | None = None) -> ExecResult:
+        """Execute commands synchronously; raise ``BashError`` on non-zero exit.
+
+        ``on_output`` must be synchronous.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> result = tool.execute_sync_or_throw("echo ok")
+            >>> result.stdout.strip()
+            'ok'
+        """
+        ...
+
+    def cancel(self) -> None:
+        """Cancel the currently running execution.
+
+        Safe to call from any thread.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> tool.cancel()  # no-op if nothing is running
+        """
+        ...
+
+    def clear_cancel(self) -> None:
+        """Clear the cancellation flag so subsequent executions proceed normally.
+
+        Call this after a ``cancel()`` once the in-flight execution has
+        finished and you want to reuse the same ``BashTool`` instance
+        (preserving VFS state). Without this, every future ``execute()``
+        will immediately fail with ``"execution cancelled"``.
+
+        **Note:** Calling this while an execution is still in-flight may
+        allow that execution to continue past the cancellation point.
+        Wait for the cancelled execution to finish before clearing
+        (await the async call or let ``execute_sync`` return).
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> tool.cancel()
+            >>> tool.clear_cancel()
+            >>> result = tool.execute_sync("echo ok")
+            >>> result.exit_code
+            0
+        """
+        ...
+
+    def description(self) -> str:
+        """Return the tool description for LLM consumption.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> desc = tool.description()
+            >>> "bash" in desc.lower()
+            True
+        """
+        ...
+
+    def help(self) -> str:
+        """Return extended help text.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> help_text = tool.help()
+            >>> len(help_text) > 0
+            True
+        """
+        ...
+
+    def system_prompt(self) -> str:
+        """Return the system prompt for LLM agents.
+
+        Includes tool description, usage guidelines, and capabilities.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> prompt = tool.system_prompt()
+            >>> "sandbox" in prompt.lower() or "bash" in prompt.lower()
+            True
+        """
+        ...
+
+    def input_schema(self) -> str:
+        """Return the JSON Schema for tool input.
+
+        Example::
+
+            >>> import json
+            >>> tool = BashTool()
+            >>> schema = json.loads(tool.input_schema())
+            >>> "commands" in str(schema)
+            True
+        """
+        ...
+
+    def output_schema(self) -> str:
+        """Return the JSON Schema for tool output.
+
+        Example::
+
+            >>> import json
+            >>> tool = BashTool()
+            >>> schema = json.loads(tool.output_schema())
+            >>> isinstance(schema, dict)
+            True
+        """
+        ...
+
+    def reset(self) -> None:
+        """Reset the tool to initial state.
+
+        Clears VFS, environment, and shell state while re-applying
+        constructor-time ``custom_builtins``.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> tool.execute_sync("touch /tmp/file")
+            >>> tool.reset()
+            >>> result = tool.execute_sync("test -f /tmp/file")
+            >>> result.exit_code  # file is gone
+            1
+        """
+        ...
+
+    def snapshot(
+        self,
+        exclude_filesystem: bool = False,
+        exclude_functions: bool = False,
+    ) -> bytes:
+        """Serialize interpreter state to bytes."""
+        ...
+
+    def snapshot_keyed(
+        self,
+        key: bytes,
+        exclude_filesystem: bool = False,
+        exclude_functions: bool = False,
+    ) -> bytes:
+        """Serialize interpreter state to HMAC-protected bytes."""
+        ...
+
+    def analyze(self, script: str) -> ScriptAnalysis:
+        """Analyze a script without running it.
+
+        Parses ``script`` with this instance's parser limits and reports the
+        commands, redirect targets, and function definitions it statically
+        refers to. Nothing is executed and no instance state changes.
+
+        Intended for permission prompts and audit logging. **Advisory only** —
+        check :attr:`ScriptAnalysis.is_opaque` before treating an allowlist
+        match as safe.
+
+        Raises:
+            BashError: if the script does not parse. Treat that as "deny or
+                prompt", never as "no commands".
+
+        Example::
+
+            >>> analysis = Bash().analyze("cat notes.txt | grep -i todo")
+            >>> analysis.command_names
+            ['cat', 'grep']
+            >>> analysis.is_opaque
+            False
+        """
+        ...
+
+    def shell_state(self) -> ShellState:
+        """Capture a read-only shell-state snapshot."""
+        ...
+
+    def restore_snapshot(self, data: bytes) -> None:
+        """Restore interpreter state from bytes produced by ``snapshot()``."""
+        ...
+
+    def restore_snapshot_keyed(self, data: bytes, key: bytes) -> None:
+        """Restore interpreter state from bytes produced by ``snapshot_keyed()``."""
+        ...
+
+    @staticmethod
+    def from_snapshot(
+        data: bytes,
+        username: str | None = None,
+        hostname: str | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        max_commands: int | None = None,
+        max_loop_iterations: int | None = None,
+        max_memory: int | None = None,
+        timeout_seconds: float | None = None,
+        files: dict[str, str] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        allowed_mount_paths: list[str] | None = None,
+        readonly_filesystem: bool = False,
+        custom_builtins: Mapping[str, BuiltinCallback] | None = None,
+        network: NetworkConfig | None = None,
+        profile: ExecutionProfile = ExecutionProfile.Standard,
+    ) -> BashTool:
+        """Create a new ``BashTool`` from snapshot bytes and optional constructor kwargs."""
+        ...
+
+    @staticmethod
+    def from_snapshot_keyed(
+        data: bytes,
+        key: bytes,
+        username: str | None = None,
+        hostname: str | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        max_commands: int | None = None,
+        max_loop_iterations: int | None = None,
+        max_memory: int | None = None,
+        timeout_seconds: float | None = None,
+        files: dict[str, str] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        allowed_mount_paths: list[str] | None = None,
+        readonly_filesystem: bool = False,
+        custom_builtins: Mapping[str, BuiltinCallback] | None = None,
+        network: NetworkConfig | None = None,
+        profile: ExecutionProfile = ExecutionProfile.Standard,
+    ) -> BashTool:
+        """Create a new ``BashTool`` from HMAC-protected snapshot bytes."""
+        ...
+
+    def read_file(self, path: str) -> str:
+        """Read a VFS file as UTF-8 text."""
+        ...
+
+    def write_file(self, path: str, content: str) -> None:
+        """Write UTF-8 text into the VFS."""
+        ...
+
+    def append_file(self, path: str, content: str) -> None:
+        """Append UTF-8 text to a VFS file."""
+        ...
+
+    def mkdir(self, path: str, recursive: bool = False) -> None:
+        """Create a directory in the VFS."""
+        ...
+
+    def exists(self, path: str) -> bool:
+        """Return whether a VFS path exists."""
+        ...
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        """Remove a VFS file or directory."""
+        ...
+
+    def stat(self, path: str) -> dict[str, Any]:
+        """Return metadata for a VFS path."""
+        ...
+
+    def chmod(self, path: str, mode: int) -> None:
+        """Change VFS permissions for a path."""
+        ...
+
+    def symlink(self, target: str, link: str) -> None:
+        """Create a symlink in the VFS."""
+        ...
+
+    def read_link(self, path: str) -> str:
+        """Return the symlink target for a VFS path."""
+        ...
+
+    def read_dir(self, path: str) -> list[dict[str, Any]]:
+        """Return directory entries with metadata."""
+        ...
+
+    def ls(self, path: str = ".") -> list[str]:
+        """Return entry names for a directory, or an empty list if it is missing."""
+        ...
+
+    def glob(self, pattern: str) -> list[str]:
+        """Return file paths matching a safe glob pattern."""
+        ...
+
+    def fs(self) -> FileSystem:
+        """Return a live filesystem handle.
+
+        Each operation acquires the interpreter lock, so the handle always
+        reflects the latest state (including after ``reset()``).
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> tool.execute_sync("echo data > /out.txt")
+            >>> fs = tool.fs()
+            >>> fs.read_file("/out.txt")
+            b'data\\n'
+        """
+        ...
+
+    def mount(self, vfs_path: str, fs: FileSystem) -> None:
+        """Mount an external filesystem at the given VFS path.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> ext = FileSystem()
+            >>> ext.write_file("/info.txt", b"external")
+            >>> tool.mount("/mnt/ext", ext)
+            >>> result = tool.execute_sync("cat /mnt/ext/info.txt")
+            >>> result.stdout.strip()
+            'external'
+        """
+        ...
+
+    def unmount(self, vfs_path: str) -> None:
+        """Unmount a previously mounted filesystem.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> ext = FileSystem()
+            >>> tool.mount("/mnt/ext", ext)
+            >>> tool.unmount("/mnt/ext")
+        """
+        ...
+
+    def set_env(self, key: str, value: str) -> None:
+        """Set an exported environment variable. See :meth:`Bash.set_env`.
+
+        Survives :meth:`reset`.
+
+        Example::
+
+            >>> tool = BashTool()
+            >>> tool.set_env("SKILL_PATH", "/skills/my-skill")
+            >>> tool.execute_sync("echo $SKILL_PATH").stdout
+            '/skills/my-skill\\n'
+        """
+        ...
+
+class ScriptedTool:
+    """Compose Python callbacks as bash builtins for multi-tool orchestration.
+
+    Each registered tool becomes a bash builtin command. An LLM (or user)
+    writes a single bash script that pipes, loops, and branches across tools.
+
+    Example:
+        >>> tool = ScriptedTool("api")
+        >>> tool.add_tool("greet", "Greet user",
+        ...     callback=lambda p, s=None: f"hello {p.get('name', 'world')}\\n",
+        ...     schema={"type": "object", "properties": {"name": {"type": "string"}}})
+        >>> result = tool.execute_sync("greet --name Alice")
+        >>> print(result.stdout.strip())
+        hello Alice
+    """
+
+    name: str
+    short_description: str
+    version: str
+
+    def __init__(
+        self,
+        name: str,
+        short_description: str | None = None,
+        max_commands: int | None = None,
+        max_loop_iterations: int | None = None,
+    ) -> None:
+        """Create a new ScriptedTool.
+
+        Args:
+            name: Tool name (used as the LLM tool identifier).
+            short_description: One-line description of the tool.
+            max_commands: Limit total commands per execution.
+            max_loop_iterations: Limit iterations per loop.
+
+        Example::
+
+            >>> tool = ScriptedTool("data_pipeline", short_description="ETL tools")
+            >>> print(tool.name)
+            data_pipeline
+        """
+        ...
+
+    def add_tool(
+        self,
+        name: str,
+        description: str,
+        callback: Callable[[dict[str, Any], str | None], str],
+        schema: dict[str, Any] | None = None,
+    ) -> None:
+        """Register a Python callback as a bash builtin command.
+
+        Args:
+            name: Command name (becomes a bash builtin).
+            description: Human-readable description of the sub-tool.
+            callback: ``(params_dict, stdin_or_none) -> output_string`` or
+                an async callback that resolves to one. Async callbacks run on
+                the caller's active asyncio loop for ``await execute()`` and on
+                a private loop for ``execute_sync()``.
+            schema: Optional JSON Schema for the tool's parameters.
+
+        Example::
+
+            >>> tool = ScriptedTool("math")
+            >>> tool.add_tool(
+            ...     "add", "Add two numbers",
+            ...     callback=lambda p, s=None: str(int(p["a"]) + int(p["b"])) + "\\n",
+            ...     schema={
+            ...         "type": "object",
+            ...         "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            ...     },
+            ... )
+            >>> result = tool.execute_sync("add --a 2 --b 3")
+            >>> result.stdout.strip()
+            '5'
+        """
+        ...
+
+    def env(self, key: str, value: str) -> None:
+        """Set an environment variable for subsequent executions.
+
+        Example::
+
+            >>> tool = ScriptedTool("demo")
+            >>> tool.env("API_KEY", "secret-123")
+            >>> result = tool.execute_sync("echo $API_KEY")
+            >>> result.stdout.strip()
+            'secret-123'
+        """
+        ...
+
+    async def execute(self, commands: str) -> ExecResult:
+        """Execute commands asynchronously.
+
+        Async callbacks run on the caller's active asyncio loop.
+
+        Example::
+
+            >>> tool = ScriptedTool("demo")
+            >>> tool.add_tool("hi", "Say hi", callback=lambda p, s=None: "hi\\n")
+            >>> result = await tool.execute("hi")
+            >>> result.stdout.strip()
+            'hi'
+        """
+        ...
+
+    def execute_sync(self, commands: str) -> ExecResult:
+        """Execute commands synchronously (blocking).
+
+        Async callbacks run on a private loop here.
+
+        Example::
+
+            >>> tool = ScriptedTool("demo")
+            >>> tool.add_tool("ping", "Ping", callback=lambda p, s=None: "pong\\n")
+            >>> result = tool.execute_sync("ping")
+            >>> result.stdout.strip()
+            'pong'
+        """
+        ...
+
+    def tool_count(self) -> int:
+        """Return the number of registered sub-tools.
+
+        Example::
+
+            >>> tool = ScriptedTool("demo")
+            >>> tool.tool_count()
+            0
+            >>> tool.add_tool("a", "A", callback=lambda p, s=None: "")
+            >>> tool.tool_count()
+            1
+        """
+        ...
+
+    def description(self) -> str:
+        """Return the tool description for LLM consumption.
+
+        Example::
+
+            >>> tool = ScriptedTool("api", short_description="API tools")
+            >>> desc = tool.description()
+            >>> len(desc) > 0
+            True
+        """
+        ...
+
+    def help(self) -> str:
+        """Return extended help text listing all registered sub-tools.
+
+        Example::
+
+            >>> tool = ScriptedTool("api")
+            >>> tool.add_tool("fetch", "Fetch URL", callback=lambda p, s=None: "")
+            >>> "fetch" in tool.help()
+            True
+        """
+        ...
+
+    def system_prompt(self) -> str:
+        """Return the system prompt for LLM agents.
+
+        Includes descriptions of all registered sub-tools and usage examples.
+
+        Example::
+
+            >>> tool = ScriptedTool("api")
+            >>> tool.add_tool("fetch", "Fetch URL", callback=lambda p, s=None: "")
+            >>> prompt = tool.system_prompt()
+            >>> "fetch" in prompt.lower()
+            True
+        """
+        ...
+
+    def input_schema(self) -> str:
+        """Return the JSON Schema for tool input.
+
+        Example::
+
+            >>> import json
+            >>> tool = ScriptedTool("api")
+            >>> schema = json.loads(tool.input_schema())
+            >>> "commands" in str(schema)
+            True
+        """
+        ...
+
+    def output_schema(self) -> str:
+        """Return the JSON Schema for tool output.
+
+        Example::
+
+            >>> import json
+            >>> tool = ScriptedTool("api")
+            >>> schema = json.loads(tool.output_schema())
+            >>> isinstance(schema, dict)
+            True
+        """
+        ...
+
+class BashError(Exception):
+    """Exception raised when a bash command exits with non-zero status.
+
+    Example::
+
+        >>> bash = Bash()
+        >>> try:
+        ...     bash.execute_sync_or_throw("exit 42")
+        ... except BashError as e:
+        ...     print(e.exit_code)
+        42
+    """
+
+    exit_code: int
+    stderr: str
+    stdout: str
+
+def create_langchain_tool_spec() -> dict[str, Any]:
+    """Create a LangChain-compatible tool specification.
+
+    Returns:
+        Dict with name, description, and args_schema.
+
+    Example::
+
+        >>> spec = create_langchain_tool_spec()
+        >>> spec["name"]
+        'bash'
+    """
+    ...
+
+def get_version() -> str:
+    """Get the bashkit version string.
+
+    Example::
+
+        >>> version = get_version()
+        >>> isinstance(version, str)
+        True
+    """
+    ...
+
+class PackedCommit:
+    """A commit plus the objects a host needs to persist."""
+
+    @property
+    def id(self) -> str:
+        """Content address of this commit — store it per message."""
+        ...
+
+    @property
+    def objects(self) -> dict[str, bytes]:
+        """Objects to persist, keyed by hex object id."""
+        ...
+
+    @property
+    def object_count(self) -> int:
+        """Number of new objects this commit emitted."""
+        ...
+
+    @property
+    def stored_bytes(self) -> int:
+        """Total encoded size of the new objects."""
+        ...
+
+    @property
+    def is_self_contained(self) -> bool:
+        """Whether this commit carries every object needed to restore it."""
+        ...
+
+    def to_bytes(self) -> bytes:
+        """Serialize into one self-contained blob, like ``snapshot()``.
+
+        Raises ``BashError`` for an incremental commit, which omits objects.
+        """
+        ...
+
+class SnapshotDiff:
+    """What changed between two commits."""
+
+    @property
+    def files_added(self) -> list[str]: ...
+    @property
+    def files_modified(self) -> list[str]: ...
+    @property
+    def files_removed(self) -> list[str]: ...
+    @property
+    def shell_changed(self) -> bool: ...
+    def is_empty(self) -> bool:
+        """True when nothing changed."""
+        ...
+
+class CapabilityFingerprint:
+    """The environment that produced a commit."""
+
+    @property
+    def bashkit_version(self) -> str: ...
+    @property
+    def builtins(self) -> list[str]: ...
+    @property
+    def features(self) -> list[str]: ...
+    @property
+    def fs_backend(self) -> str: ...
+
+class SnapshotGraph:
+    """Read-only operations over a snapshot object graph.
+
+    Every method takes the objects it needs — bashkit never reaches into host
+    storage — and walks only as far as the supplied store reaches.
+    """
+
+    @staticmethod
+    def parents(commit_id: str, objects: dict[str, bytes]) -> list[str]:
+        """Commits this one descends from."""
+        ...
+
+    @staticmethod
+    def meta(commit_id: str, objects: dict[str, bytes]) -> dict[str, str]:
+        """Host metadata attached when the commit was made."""
+        ...
+
+    @staticmethod
+    def capabilities(commit_id: str, objects: dict[str, bytes]) -> CapabilityFingerprint:
+        """Capability fingerprint of the producing instance."""
+        ...
+
+    @staticmethod
+    def ancestry(commit_id: str, objects: dict[str, bytes], limit: int = 100) -> list[str]:
+        """Walk ancestry newest-first, stopping at ``limit`` or a missing commit."""
+        ...
+
+    @staticmethod
+    def plan_checkout(commit_id: str, objects: dict[str, bytes]) -> list[str]:
+        """Object ids needed to check out this commit that ``objects`` lacks.
+
+        Call repeatedly — each wave reveals the next — until it returns ``[]``.
+        """
+        ...
+
+    @staticmethod
+    def reachable(commit_id: str, objects: dict[str, bytes]) -> list[str]:
+        """Every object this commit reaches, for host-side garbage collection."""
+        ...
+
+    @staticmethod
+    def diff(commit_a: str, commit_b: str, objects: dict[str, bytes]) -> SnapshotDiff:
+        """Compare two commits."""
+        ...

@@ -1,0 +1,377 @@
+// Hand-curated metadata for each doc so the /docs index can group and
+// summarise pages without requiring frontmatter in the canonical markdown.
+// Order here drives navigation order (index cards, prev/next).
+
+export type DocMeta = {
+  slug: string;
+  title: string;
+  summary: string;
+  section: string;
+  seoTitle?: string;
+  seoDescription?: string;
+  collection?: "docs" | "rustdocs";
+  sourceId?: string;
+  editPath?: string;
+};
+
+// Single source of truth for section display order, shared by the /docs index
+// (index.astro) and its Markdown twin (docs.md.ts). DOC_META is ordered to match
+// so the per-page prev/next flow follows the same grouping.
+export const SECTION_ORDER = [
+  "Getting started",
+  "LLM tools",
+  "Concepts",
+  "Networking",
+  "Runtimes",
+  "Reference",
+  "Extending",
+  "Operations",
+];
+
+export const DOC_META: DocMeta[] = [
+  {
+    slug: "start",
+    title: "Get started",
+    summary: "Choose your target — Rust, Python, Node, browser, or Pyodide — and run a first script.",
+    seoTitle: "Get started with Bashkit: choose your target",
+    seoDescription:
+      "Pick the Bashkit package for your runtime — Rust, Python, Node, browser/edge WASM, or Pyodide — then follow its quickstart to a first sandboxed script.",
+    section: "Getting started",
+    editPath: "docs/start.md",
+  },
+  {
+    slug: "start-rust",
+    title: "Rust",
+    summary: "Embed the sandbox in a Rust app: install, first script, examples.",
+    seoTitle: "Get started with Bashkit in Rust",
+    seoDescription:
+      "Embed the Bashkit sandbox in Rust: cargo add, run a first script, persist shell state across calls, configure limits and the filesystem, and runnable examples.",
+    section: "Getting started",
+    editPath: "docs/start-rust.md",
+  },
+  {
+    slug: "start-python",
+    title: "Python",
+    summary: "Embed the sandbox in Python: pip install, first script, examples.",
+    seoTitle: "Get started with Bashkit in Python",
+    seoDescription:
+      "Embed the Bashkit sandbox in Python: pip install the PyPI wheel, run a first script, persist shell state, sync vs async execution, and runnable examples.",
+    section: "Getting started",
+    editPath: "docs/start-python.md",
+  },
+  {
+    slug: "c-api",
+    title: "C API",
+    summary: "Embed Bashkit through its versioned native ABI and opaque handles.",
+    seoTitle: "Embed Bashkit with the native C API",
+    seoDescription:
+      "Embed the Bashkit sandbox through its versioned C ABI with explicit ownership, binary-safe output, virtual filesystem access, and runnable C examples.",
+    section: "Getting started",
+    editPath: "docs/c-api.md",
+  },
+  {
+    slug: "start-node",
+    title: "Node, Bun & Deno",
+    summary: "Embed the sandbox in server-side JavaScript: npm i, first script, examples.",
+    seoTitle: "Get started with Bashkit in Node, Bun & Deno",
+    seoDescription:
+      "Embed the Bashkit sandbox in Node, Bun, or Deno with the @everruns/bashkit NAPI addon: install, run a first script, persist state, and set sandbox options.",
+    section: "Getting started",
+    editPath: "docs/start-node.md",
+  },
+  {
+    slug: "start-browser",
+    title: "Browser (WASM)",
+    summary: "Run the sandbox in the browser or at the edge — with a live terminal to try.",
+    seoTitle: "Get started with Bashkit in the browser (WebAssembly)",
+    seoDescription:
+      "Run the Bashkit sandbox in the browser or edge runtimes with @everruns/bashkit-wasm: single-threaded, no COOP/COEP headers, plus a live in-page terminal.",
+    section: "Getting started",
+    editPath: "docs/start-browser.md",
+  },
+  {
+    slug: "start-pyodide",
+    title: "Pyodide & JupyterLite",
+    summary: "Run the sandbox in Python-in-the-browser via the Emscripten wheel.",
+    seoTitle: "Get started with Bashkit in Pyodide & JupyterLite",
+    seoDescription:
+      "Run the Bashkit sandbox in Pyodide and JupyterLite via the Emscripten wheel: micropip install, a first script, and the reduced WASM feature surface.",
+    section: "Getting started",
+    editPath: "docs/start-pyodide.md",
+  },
+  {
+    slug: "cli",
+    title: "CLI",
+    summary: "Run scripts with bashkit-cli: flags, exit codes, opt-in runtimes.",
+    seoTitle: "bashkit-cli docs: run sandboxed shell scripts",
+    seoDescription:
+      "Learn bashkit-cli modes, install options, limits, host filesystem mounts, interactive shell usage, and sandboxed script examples.",
+    section: "Getting started",
+  },
+  {
+    slug: "llm-tools",
+    title: "LLM tools",
+    summary: "Expose Bashkit as a sandboxed tool for agent frameworks.",
+    seoTitle: "Use Bashkit as an LLM tool for agent frameworks",
+    seoDescription:
+      "Expose Bashkit as an LLM tool with BashTool: discovery metadata, system prompts, streaming output, and sandboxed execution for Rust, Python, and JS agents.",
+    section: "LLM tools",
+    editPath: "docs/llm-tools.md",
+  },
+  {
+    slug: "script-analysis",
+    title: "Script analysis",
+    summary: "Inspect a script before running it to drive permission prompts and audit logs.",
+    seoTitle: "Analyze a bash script before running it with Bashkit",
+    seoDescription:
+      "See which commands, arguments, and file writes a script refers to before it runs — permission prompts and audit logs in Rust, Node, and Python.",
+    section: "LLM tools",
+    editPath: "docs/script-analysis.md",
+  },
+  {
+    slug: "scripted-tools",
+    title: "Scripted tool orchestration",
+    summary: "Compose many tools into one bash-scriptable tool the LLM calls once.",
+    seoTitle: "Bashkit scripted tool orchestration for LLM agents",
+    seoDescription:
+      "Compose ToolDef and callback pairs into one ScriptedTool so an LLM orchestrates many tools in a single bash script with pipes, loops, and jq.",
+    section: "LLM tools",
+    editPath: "docs/scripted-tools.md",
+  },
+  {
+    slug: "configuration",
+    title: "Sandbox configuration & limits",
+    summary: "Resource limits, filesystem backends, identity, and the network allowlist.",
+    seoTitle: "Bashkit sandbox configuration and resource limits",
+    seoDescription:
+      "Configure the Bashkit sandbox: resource limits, filesystem backends, identity and working directory, and the network allowlist — shared across every binding.",
+    section: "Concepts",
+    editPath: "docs/configuration.md",
+  },
+  {
+    slug: "filesystem",
+    title: "Virtual filesystem",
+    summary: "The in-memory VFS, its layering stack, and host-mount opt-ins.",
+    seoTitle: "Bashkit virtual filesystem and sandbox layering",
+    seoDescription:
+      "Understand Bashkit's in-memory virtual filesystem: the FsBackend and FileSystem traits, layering stack, InMemoryFs, RealFs, device files, and host mounts.",
+    section: "Concepts",
+    editPath: "docs/filesystem.md",
+  },
+  {
+    slug: "security",
+    title: "Security",
+    summary: "Sandbox boundaries, threat model, and what scripts cannot do.",
+    seoTitle: "Bashkit security model and sandbox boundaries",
+    seoDescription:
+      "Review Bashkit's virtual filesystem, resource limits, network allowlists, POSIX security deviations, and threat model guidance.",
+    section: "Concepts",
+  },
+  {
+    slug: "networking",
+    title: "Networking & HTTP",
+    summary: "Default-deny HTTP, the network allowlist, and SSRF protection.",
+    seoTitle: "Bashkit networking, HTTP allowlist, and SSRF protection",
+    seoDescription:
+      "Configure Bashkit outbound HTTP with curl, wget, and http: the default-deny NetworkAllowlist, pattern matching, and private-IP and SSRF blocking.",
+    section: "Networking",
+    editPath: "docs/networking.md",
+  },
+  {
+    slug: "credential-injection",
+    title: "Credential injection",
+    summary: "Inject outbound HTTP credentials without exposing secrets to scripts.",
+    seoTitle: "Bashkit credential injection for sandboxed HTTP",
+    seoDescription:
+      "Inject bearer tokens and headers into Bashkit outbound HTTP requests without exposing real secrets to sandboxed shell scripts.",
+    section: "Networking",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/credential-injection.md",
+  },
+  {
+    slug: "request-signing",
+    title: "Request signing",
+    summary: "Transparent Ed25519 bot identity (RFC 9421) on every HTTP request.",
+    seoTitle: "Bashkit request signing: cryptographic identity for AI agents",
+    seoDescription:
+      "Sign every outbound Bashkit HTTP request with Ed25519 per RFC 9421 (web-bot-auth): transparent bot identity and verifiable agent traffic.",
+    section: "Networking",
+    editPath: "docs/request-signing.md",
+  },
+  {
+    slug: "python",
+    title: "Python builtin",
+    summary: "Embedded Monty Python runtime, VFS bridging, limits, and caveats.",
+    seoTitle: "Bashkit Python builtin with Monty runtime",
+    seoDescription:
+      "Run embedded Python in Bashkit with Monty, virtual filesystem bridging, pipelines, command substitution, resource limits, and safety caveats.",
+    section: "Runtimes",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/python.md",
+  },
+  {
+    slug: "builtin_typescript",
+    title: "TypeScript builtin",
+    summary: "Embedded ZapCode TypeScript runtime shared with bash in-memory.",
+    seoTitle: "Bashkit TypeScript builtin with ZapCode runtime",
+    seoDescription:
+      "Run TypeScript inside Bashkit with ZapCode, VFS file sharing, pipelines, resource limits, and Node.js-compatible command aliases.",
+    section: "Runtimes",
+  },
+  {
+    slug: "sqlite",
+    title: "SQLite builtin",
+    summary: "Embedded Turso SQLite runtime, backends, output modes, and limits.",
+    seoTitle: "Bashkit SQLite builtin with Turso",
+    seoDescription:
+      "Use Bashkit's embedded SQLite builtin with Turso, VFS-backed databases, output modes, dot-commands, resource limits, and security notes.",
+    section: "Runtimes",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/sqlite.md",
+  },
+  {
+    slug: "ssh",
+    title: "SSH support",
+    summary: "Sandboxed ssh, scp, and sftp builtins with host allowlists.",
+    seoTitle: "Bashkit SSH, SCP, and SFTP builtin support",
+    seoDescription:
+      "Configure Bashkit ssh, scp, and sftp builtins with host allowlists, VFS-only keys, remote command execution, and transfer limits.",
+    section: "Runtimes",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/ssh.md",
+  },
+  {
+    slug: "git",
+    title: "Git",
+    summary: "Sandboxed git on the virtual filesystem with a configurable identity.",
+    seoTitle: "Bashkit sandboxed git on the virtual filesystem",
+    seoDescription:
+      "Run git inside Bashkit on the virtual filesystem: init, add, commit, branch, log, and allowlisted remotes with a configurable identity and no host access.",
+    section: "Runtimes",
+    editPath: "docs/git.md",
+  },
+  {
+    slug: "compatibility",
+    title: "Compatibility",
+    summary: "Bash and builtin feature coverage, security exclusions, and known gaps.",
+    seoTitle: "Bashkit compatibility scorecard for bash and builtins",
+    seoDescription:
+      "Check Bashkit POSIX shell support, implemented builtins, syntax coverage, expansions, resource limits, and known compatibility gaps.",
+    section: "Reference",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/compatibility.md",
+  },
+  {
+    slug: "jq",
+    title: "jq builtin",
+    summary: "Supported jq flags, filters, variables, exit codes, and compatibility notes.",
+    seoTitle: "Bashkit jq builtin compatibility guide",
+    seoDescription:
+      "See which jq flags, filters, variables, exit statuses, errors, and compatibility gaps Bashkit supports through its embedded jq builtin.",
+    section: "Reference",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/jq.md",
+  },
+  {
+    slug: "yq",
+    title: "yq builtin",
+    summary: "jq-style YAML and JSON processing, conversion, and safe in-place updates.",
+    seoTitle: "Bashkit yq builtin compatibility guide",
+    seoDescription:
+      "Process YAML and JSON with Bashkit's shared jq expression engine, multi-document support, format conversion, and atomic in-place updates.",
+    section: "Reference",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/yq.md",
+  },
+  {
+    slug: "structured-data",
+    title: "Structured data",
+    summary: "jq/yq transforms and narrower CSV, JSON, and TOML helpers.",
+    seoTitle: "Bashkit jq, yq, CSV, JSON, and TOML builtins",
+    seoDescription:
+      "Query and transform structured data in Bashkit with jq, yq, csv, json, and tomlq.",
+    section: "Reference",
+    editPath: "docs/structured-data.md",
+  },
+  {
+    slug: "custom-builtins",
+    title: "Custom builtins",
+    summary: "Implement Rust commands that run inside the Bashkit shell.",
+    seoTitle: "Build custom Bashkit builtins in Rust",
+    seoDescription:
+      "Create custom Bashkit commands in Rust with Builtin, BuiltinContext, virtual filesystem access, execution extensions, and tested examples.",
+    section: "Extending",
+    collection: "rustdocs",
+    sourceId: "custom_builtins",
+    editPath: "crates/bashkit/docs/custom_builtins.md",
+  },
+  {
+    slug: "custom-builtins-js",
+    title: "Custom builtins (JavaScript)",
+    summary: "Register JS callbacks as persistent bash builtins from Node, Deno, or Bun.",
+    seoTitle: "Add custom Bashkit builtins from JavaScript",
+    seoDescription:
+      "Use customBuiltins and addBuiltin in @everruns/bashkit to register JS callbacks as persistent bash commands with virtual filesystem access and async support.",
+    section: "Extending",
+    sourceId: "custom_builtins_js",
+    editPath: "docs/custom_builtins_js.md",
+  },
+  {
+    slug: "clap-builtins",
+    title: "Clap builtins",
+    summary: "Use clap parser structs to build typed custom commands.",
+    seoTitle: "Build typed Bashkit builtins with clap",
+    seoDescription:
+      "Use ClapBuiltin and clap Parser derives to add typed Bashkit commands with help output, parse errors, subcommands, and pipeline stdin.",
+    section: "Extending",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/clap-builtins.md",
+  },
+  {
+    slug: "hooks",
+    title: "Hooks",
+    summary: "Observe, modify, or cancel execution, builtin, lifecycle, and HTTP events.",
+    seoTitle: "Bashkit hooks for execution, tools, and HTTP events",
+    seoDescription:
+      "Use Bashkit hooks to observe, rewrite, or cancel script execution, builtins, shell lifecycle events, and allowlisted HTTP requests.",
+    section: "Extending",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/hooks.md",
+  },
+  {
+    slug: "live-mounts",
+    title: "Live mounts",
+    summary: "Attach, detach, and hot-swap filesystems on a running interpreter.",
+    seoTitle: "Bashkit live mounts for virtual filesystems",
+    seoDescription:
+      "Attach, detach, and hot-swap Bashkit virtual filesystems on a running interpreter while preserving shell state and mounted data.",
+    section: "Extending",
+    collection: "rustdocs",
+    sourceId: "live_mounts",
+    editPath: "crates/bashkit/docs/live_mounts.md",
+  },
+  {
+    slug: "snapshotting",
+    title: "Snapshotting",
+    summary: "Serialize interpreter state and restore it for checkpoint/resume flows.",
+    seoTitle: "Bashkit snapshotting for checkpoint and resume workflows",
+    seoDescription:
+      "Use Bashkit snapshots to serialize and restore virtual shell state across Rust, Python, and Node.js checkpoint/resume workflows.",
+    section: "Operations",
+  },
+  {
+    slug: "logging",
+    title: "Logging",
+    summary: "Structured tracing setup, log targets, and redaction behavior.",
+    seoTitle: "Bashkit structured logging and tracing guide",
+    seoDescription:
+      "Enable Bashkit structured logging with tracing, configure log targets and levels, and redact sensitive script, URL, and environment data.",
+    section: "Operations",
+    collection: "rustdocs",
+    editPath: "crates/bashkit/docs/logging.md",
+  },
+];
+
+export const DOC_META_BY_SLUG: Record<string, DocMeta> = Object.fromEntries(
+  DOC_META.map((doc) => [doc.slug, doc]),
+);

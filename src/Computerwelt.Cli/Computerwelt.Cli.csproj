@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Computerwelt.Cli</RootNamespace>
+    <AssemblyName>Computerwelt.Cli</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Computerwelt/Computerwelt.csproj" />
+  </ItemGroup>
+
+</Project>

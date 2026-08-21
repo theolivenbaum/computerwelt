@@ -1,0 +1,140 @@
+# Subshell tests
+# Inspired by Oils spec/subshell.test.sh
+# https://github.com/oilshell/oil/blob/master/spec/subshell.test.sh
+
+### subshell_exit_code
+# Subshell exit code
+( false; )
+echo $?
+### expect
+1
+### end
+
+### subshell_with_redirects
+# Subshell with redirects
+mkdir -p bashkit_subshell_redirects
+( echo 1 ) > bashkit_subshell_redirects/a.txt
+( echo 2 ) > bashkit_subshell_redirects/b.txt
+( echo 3; ) > bashkit_subshell_redirects/c.txt
+( echo 4; echo 5 ) > bashkit_subshell_redirects/d.txt
+echo status=$?
+cat bashkit_subshell_redirects/a.txt bashkit_subshell_redirects/b.txt bashkit_subshell_redirects/c.txt bashkit_subshell_redirects/d.txt
+rm -rf bashkit_subshell_redirects
+### expect
+status=0
+1
+2
+3
+4
+5
+### end
+
+### subshell_var_isolation
+# Variables set in subshell don't leak
+X=original
+( X=modified )
+echo $X
+### expect
+original
+### end
+
+### subshell_function_isolation
+# Functions defined in subshell don't leak
+( f() { echo inside; }; f )
+f 2>/dev/null
+echo status=$?
+### expect
+inside
+status=127
+### end
+
+### subshell_nested
+# Nested subshells
+echo $(echo $(echo deep))
+### expect
+deep
+### end
+
+### subshell_exit_propagation
+# Exit in subshell doesn't exit parent
+( exit 42 )
+echo "still running, status=$?"
+### expect
+still running, status=42
+### end
+
+### subshell_pipeline
+# Subshell in pipeline
+( echo hello; echo world ) | sort
+### expect
+hello
+world
+### end
+
+### subshell_cd_isolation
+# cd in subshell doesn't affect parent
+original=$(pwd)
+( cd / )
+test "$(pwd)" = "$original" && echo isolated
+### expect
+isolated
+### end
+
+### subshell_traps_isolated
+# Traps in subshell don't leak to parent
+trap 'echo parent' EXIT
+( trap 'echo child' EXIT )
+trap - EXIT
+echo done
+### expect
+child
+done
+### end
+
+### subshell_brace_group
+# Brace group is NOT a subshell
+X=original
+{ X=modified; }
+echo $X
+### expect
+modified
+### end
+
+### subshell_command_sub_exit
+# Command substitution exit code
+result=$(exit 3)
+echo "status=$?"
+### expect
+status=3
+### end
+
+### subshell_multiple_statements
+# Multiple statements in subshell
+(
+  echo first
+  echo second
+  echo third
+)
+### expect
+first
+second
+third
+### end
+
+### subshell_preserves_positional
+# Positional params in subshell don't leak
+set -- a b c
+( set -- x y; echo "$@" )
+echo "$@"
+### expect
+x y
+a b c
+### end
+
+### parameter_error_in_subshell_contained
+# ${var:?msg} error in subshell should not kill parent
+(unset NOSUCHVAR; echo "${NOSUCHVAR:?gone}" 2>/dev/null)
+echo "survived: $?"
+### expect
+survived: 1
+### end

@@ -1,0 +1,68 @@
+# cargo-deny configuration for license checking
+# Run: cargo deny check
+
+[licenses]
+# Allow these license types
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",  # LLVM exception (target-lexicon via pyo3)
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "bzip2-1.0.6",           # Permissive bzip2/libbzip2 license (libbz2-rs-sys)
+    "MPL-2.0",                # Mozilla Public License 2.0 (colored crate)
+    "Unicode-3.0",            # Unicode License v3 (icu_* crates)
+    "CDLA-Permissive-2.0",    # Community Data License Agreement (webpki-root-certs)
+    "Unicode-DFS-2016",       # Unicode Data Files and Software License (unicode_names2 via monty/ruff, --all-features only)
+    "BSL-1.0",                # Boost Software License (error-code via clipboard-win via rustyline, Windows-only)
+]
+
+# Review unclear/dual licenses
+confidence-threshold = 0.8
+
+# Allow specific exceptions
+exceptions = []
+
+# No license clarifications currently needed. All dependencies have
+# clear license metadata. Add [[licenses.clarify]] entries here if
+# cargo-deny reports ambiguous licenses for any dependency.
+
+[advisories]
+# Every entry needs a rationale and a removal condition; the same list is
+# mirrored in knowledge/security/threat-model.md ("Suppressed advisories") and,
+# for cargo-audit, in the `--ignore` flags in .github/workflows/ci.yml.
+ignore = [
+    # rsa: transitive via russh -> ssh-key, behind the optional `ssh` feature.
+    # Marvin Attack timing sidechannel (TM-CRY-002). Every published version of
+    # `rsa` is affected and no patched release exists, so this cannot be fixed
+    # by upgrading. Remove once `rsa` ships a constant-time implementation.
+    "RUSTSEC-2023-0071",
+    # atomic-polyfill: transitive via monty -> postcard -> heapless
+    # Unmaintained but no security vulnerability; upstream dep we can't control
+    "RUSTSEC-2023-0089",
+    # proc-macro-error2: transitive via bashkit-bench -> tabled -> tabled_derive
+    # Unmaintained build-time proc-macro in the bench harness only (not shipped
+    # library code); no upgrade available (tabled 0.21 is latest)
+    "RUSTSEC-2026-0173",
+]
+
+[bans]
+# Warn on multiple versions of the same crate
+multiple-versions = "warn"
+# Deny specific crates (security or legal issues)
+deny = []
+
+[sources]
+# Ensure all dependencies come from crates.io or known Git repos
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Monty and its ruff deps now come from crates.io (since monty 0.0.19), so the
+# only remaining git source is jiter: pinned to upstream main via
+# [patch.crates-io] in the root Cargo.toml so the workspace can run pyo3 0.29
+# (security fix); see the patch comment there.
+allow-git = [
+    "https://github.com/pydantic/jiter",
+]

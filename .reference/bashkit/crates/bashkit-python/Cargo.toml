@@ -1,0 +1,53 @@
+# Bashkit Python package
+# Exposes Bashkit as a Python module via PyO3
+
+[package]
+name = "bashkit-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A sandboxed bash interpreter for AI agents"
+
+[lib]
+crate-type = ["cdylib"]
+name = "bashkit"
+doc = false  # Python extension, no Rust docs needed
+
+[dependencies]
+# PyO3 native extension
+pyo3 = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+
+# Big-integer support for py_to_monty BigInt extraction.
+# Pinned to 0.4.x: py_to_monty parses Python ints into `num_bigint::BigInt` and
+# hands them to `MontyObject::BigInt`, and monty (0.0.19) depends on
+# num-bigint 0.4. Bumping to 0.5 makes the two BigInt types mismatch and fails
+# to compile, so this must track whatever major version bashkit core / monty use.
+num-bigint = "^0.4.6"
+
+# Native (non-wasm) targets: full feature set.
+# realfs: always-on so Python callers can use mount_real_* APIs.
+# http_client/sqlite/interop pull mio/tokio-net/rt-multi-thread/tokio::fs,
+# none of which compile on wasm32-unknown-emscripten — see the wasm block
+# below and knowledge/runtimes/emscripten-wheels.md.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bashkit = { path = "../bashkit", features = ["scripted_tool", "python", "realfs", "jq", "interop", "http_client", "sqlite"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+# pyo3-async-runtimes hard-pulls tokio `rt-multi-thread` + `net` (mio), which
+# `compile_error!`s on wasm. Native-only; the wasm build exposes `execute_sync`
+# (current-thread runtime) and omits the async `execute()` coroutine bridge.
+pyo3-async-runtimes = { workspace = true }
+
+# wasm32 (Pyodide/Emscripten) target: reduced feature set.
+# Drops http_client, sqlite, realfs, interop — each requires threads, sockets,
+# or host filesystem access that Pyodide does not provide. Keeps the in-VFS
+# shell plus the embedded jq and Monty Python interpreters. tokio stays on its
+# wasm-safe base features (sync, macros, io-util, rt, time) — current-thread
+# runtime only. See knowledge/runtimes/emscripten-wheels.md.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bashkit = { path = "../bashkit", features = ["scripted_tool", "python", "jq"] }
+tokio = { workspace = true }

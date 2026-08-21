@@ -1,0 +1,910 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { Code } from "astro:components";
+import {
+  agentSteps,
+  apiSnippet,
+  benchesHref,
+  builtinCount,
+  builtinPreview,
+  defense,
+  evalSnapshot,
+  evals,
+  heroQuickLinks,
+  heroSnippet,
+  heroStats,
+  homeHero,
+  languages,
+  quickStarts,
+  resources,
+  signals,
+  skillRepoUrl,
+  surfaces,
+} from "../content/home";
+
+// Decision: keep quick-start samples in a single vertical rail and wrap code
+// lines inside highlighted blocks so the homepage never depends on horizontal
+// scrolling to stay readable.
+// Decision: bias the homepage toward product proof, source-backed claims, and
+// concrete next steps instead of generic positioning copy.
+// Decision: render the hero runtime snippet with the shared `<Code>` component
+// (github-dark syntax highlighting, wrap=true) so it stays readable without a
+// horizontal scrollbar and matches the code blocks lower on the page.
+---
+
+<BaseLayout>
+  <section class="atlas-hero section">
+    <div class="container atlas-hero__grid">
+      <div class="atlas-hero__copy">
+        <span class="atlas-eyebrow">{homeHero.eyebrow}</span>
+        <h1>{homeHero.title}</h1>
+        <p class="atlas-lede">
+          {homeHero.description}
+        </p>
+
+        <div class="atlas-quickstarts">
+          <span class="atlas-actions__label">Quick starts</span>
+          {
+            quickStarts.map((item) => (
+              <a href={item.href} class="btn btn-secondary atlas-quickstart-link">
+                {item.label}
+              </a>
+            ))
+          }
+        </div>
+
+        <div class="atlas-hero-guide">
+          <article class="atlas-hero-guide__card">
+            <span class="atlas-proof-strip__label">Start in Rust</span>
+            <p>Install the crate.</p>
+            <pre class="atlas-hero-command"><code>cargo add bashkit</code></pre>
+          </article>
+          <article class="atlas-hero-guide__card atlas-hero-guide__card--links">
+            <span class="atlas-proof-strip__label">Go deeper</span>
+            <div class="atlas-hero-links">
+              {
+                heroQuickLinks.map((link) => (
+                  <a
+                    href={link.href}
+                    class="atlas-hero-link"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <span>{link.title}</span>
+                    <small>{link.detail}</small>
+                  </a>
+                ))
+              }
+            </div>
+          </article>
+        </div>
+      </div>
+
+      <aside class="atlas-panel atlas-signal-panel" aria-label="Runtime example">
+        <div class="atlas-signal-panel__intro">
+          <p>
+            The core API is just `Bash`, plus virtual FS and limits. No sidecar
+            process, no container bootstrap.
+          </p>
+        </div>
+        <div class="atlas-proof-code">
+          <div class="atlas-proof-code__header">
+            <span>Rust</span>
+            <span>In-process execution</span>
+          </div>
+          <Code code={heroSnippet} lang="rust" theme="github-dark" wrap={true} />
+        </div>
+        <div class="atlas-signal-list">
+          {
+            signals.map((item) => (
+              <article class="atlas-signal-list__item">
+                <h3>{item.title}</h3>
+                <p>{item.detail}</p>
+              </article>
+            ))
+          }
+        </div>
+      </aside>
+
+      <div class="atlas-hero-runtime">
+        <div class="atlas-stats">
+          {
+            heroStats.map((stat) => (
+              <a
+                href={stat.href}
+                class="atlas-stat atlas-stat--link"
+                target={stat.external ? "_blank" : undefined}
+                rel={stat.external ? "noopener noreferrer" : undefined}
+              >
+                <span class="atlas-stat__label">{stat.label}</span>
+                <strong>{stat.value}</strong>
+              </a>
+            ))
+          }
+        </div>
+
+        <article class="atlas-panel atlas-builtins-panel">
+          <div class="atlas-builtins-panel__copy">
+            <span class="atlas-eyebrow">Runtime surface</span>
+            <h3>Browse the builtins that make the sandbox usable.</h3>
+            <p>
+              Text processing, files, archives, network, Python, TypeScript,
+              and shell control all live in-process.
+            </p>
+          </div>
+          <div class="atlas-chip-list">
+            {
+              builtinPreview.map((name) => (
+                <span class="atlas-chip">{name}</span>
+              ))
+            }
+          </div>
+          <a href="/builtins" class="atlas-inline-link">See all {builtinCount} builtins</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="agent-development" class="atlas-agent-dev section">
+    <div class="container">
+      <article class="atlas-panel atlas-agent-island">
+        <div class="atlas-agent-island__copy">
+          <span class="atlas-eyebrow">Agent development</span>
+          <h2>Start with the skill, then embed the runtime.</h2>
+          <p>
+            The Bashkit skill gives coding agents the right local context:
+            sandbox model, package APIs, builtins, examples, and agent-tool
+            patterns. Install it first, then add Bashkit to the host project.
+          </p>
+          <a href={skillRepoUrl} class="atlas-inline-link" target="_blank" rel="noopener noreferrer">View skill contents</a>
+        </div>
+
+        <div class="atlas-agent-steps">
+          {
+            agentSteps.map((step, index) => (
+              <article class="atlas-agent-step">
+                <span class="atlas-agent-step__index">{index + 1}</span>
+                <div>
+                  <h3>{step.title}</h3>
+                  <p>{step.detail}</p>
+                  {
+                    step.command && (
+                      <pre class="atlas-agent-command"><code>{step.command}</code></pre>
+                    )
+                  }
+                </div>
+              </article>
+            ))
+          }
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <section id="features" class="atlas-surfaces section section-alt">
+    <div class="container">
+      <div class="atlas-section-heading">
+        <div>
+          <span class="atlas-eyebrow">Product surface</span>
+          <h2>What bashkit gives you</h2>
+        </div>
+        <p>
+          A single runtime you can embed in agents, CLIs, editors, and
+          evaluation harnesses. No sidecar process, no container overhead, no
+          external dependencies at runtime.
+        </p>
+      </div>
+
+      <div class="atlas-card-grid atlas-card-grid--surfaces">
+        {
+          surfaces.map((item) => (
+            <article class="atlas-panel atlas-card">
+              <h3>{item.title}</h3>
+              <p>{item.detail}</p>
+            </article>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <section id="install" class="atlas-local section">
+    <div class="container">
+      <div class="atlas-section-heading">
+        <div>
+          <span class="atlas-eyebrow">Quick start</span>
+          <h2>Three languages, one runtime</h2>
+        </div>
+        <p>
+          Start with the core Rust crate, or drop the same runtime into Python
+          and TypeScript when you need it inside an existing stack.
+        </p>
+      </div>
+
+      <div class="atlas-language-list">
+        {
+          languages.map((lang) => (
+            <article id={`quickstart-${lang.slug}`} class="atlas-panel atlas-lang-row">
+              <div class="atlas-lang-row__meta">
+                <span class="atlas-eyebrow">{lang.eyebrow}</span>
+                <h3>{lang.title}</h3>
+                <div class="atlas-install-group">
+                  <span class="atlas-install-group__label">Install</span>
+                  <pre class="atlas-install"><code>{lang.install}</code></pre>
+                </div>
+              </div>
+              <div class="atlas-lang-row__code">
+                <Code
+                  code={lang.code}
+                  lang={lang.lang}
+                  theme="github-dark"
+                  wrap={true}
+                />
+              </div>
+            </article>
+          ))
+        }
+      </div>
+
+      <article class="atlas-code-panel">
+        <div class="atlas-code-panel__header">
+          <span class="atlas-eyebrow">End-to-end</span>
+          <p>
+            A tiny Rust program that uses bashkit as an in-process shell. No
+            container, no subprocess — just a crate.
+          </p>
+        </div>
+        <Code code={apiSnippet} lang="rust" theme="github-dark" wrap={true} />
+      </article>
+    </div>
+  </section>
+
+  <section id="security" class="atlas-reliability section section-alt">
+    <div class="container">
+      <div class="atlas-section-heading">
+        <div>
+          <span class="atlas-eyebrow">Security</span>
+          <h2>Hostile input is the default assumption</h2>
+        </div>
+        <p>
+          Defense in depth across every layer — process, filesystem, network,
+          parser, and runtime. See the
+          <a
+            href="https://github.com/everruns/bashkit/blob/main/knowledge/security/threat-model.md"
+            target="_blank"
+            rel="noopener noreferrer">full threat model</a
+          > for 250+ mitigations.
+        </p>
+      </div>
+
+      <div class="atlas-card-grid atlas-card-grid--reliability">
+        {
+          defense.map((item) => (
+            <article class="atlas-panel atlas-card">
+              <h3>{item.title}</h3>
+              <p>{item.detail}</p>
+            </article>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <section class="atlas-evals section">
+    <div class="container">
+      <div class="atlas-section-heading">
+        <div>
+          <span class="atlas-eyebrow">LLM evals</span>
+          <h2>How well do LLMs use bashkit?</h2>
+        </div>
+        <p>
+          Bashkit ships with a 58-task LLM eval harness across 15 agentic
+          categories. Results below are from the
+          <a href={evalSnapshot.href} target="_blank" rel="noopener noreferrer">
+            {evalSnapshot.date}
+          </a>{" "}
+          run:
+        </p>
+        <a href={benchesHref} class="atlas-inline-link">
+          Explore historical trends
+        </a>
+      </div>
+
+      <article class="atlas-panel atlas-table-panel">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>Score</th><th>Tasks passed</th></tr>
+          </thead>
+          <tbody>
+            {
+              evals.map((row) => (
+                <tr>
+                  <td>{row.model}</td>
+                  <td class="score">{row.score}</td>
+                  <td class="dim">{row.passed}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+
+  <section class="atlas-open-source section section-alt">
+    <div class="container">
+      <div class="atlas-section-heading">
+        <div>
+          <span class="atlas-eyebrow">Open source</span>
+          <h2>Pick a path and go deeper.</h2>
+        </div>
+        <p>
+          The crate is MIT-licensed. These are the links that actually help you
+          evaluate, integrate, and operate it.
+        </p>
+      </div>
+
+      <div class="atlas-card-grid atlas-card-grid--resources">
+        {
+          resources.map((item) => (
+            <a
+              href={item.href}
+              class="atlas-panel atlas-card atlas-resource-card"
+              target={item.href.startsWith("http") ? "_blank" : undefined}
+              rel={item.href.startsWith("http") ? "noopener noreferrer" : undefined}
+            >
+              <span class="atlas-eyebrow">{item.cta}</span>
+              <h3>{item.title}</h3>
+              <p>{item.detail}</p>
+            </a>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .atlas-hero {
+    position: relative;
+    overflow: hidden;
+    padding-top: 4rem;
+    padding-bottom: 2rem;
+    background: linear-gradient(
+      180deg,
+      #f8f6ef 0%,
+      #f1eee7 38%,
+      var(--color-white) 100%
+    );
+  }
+  .atlas-hero::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: radial-gradient(
+      circle at center,
+      rgb(10 22 54 / 0.08) 1px,
+      transparent 1px
+    );
+    background-size: 22px 22px;
+    pointer-events: none;
+  }
+  .atlas-hero__grid,
+  .atlas-local__grid {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.85fr);
+    gap: 1.5rem;
+    align-items: start;
+  }
+  .atlas-hero__grid {
+    grid-template-columns: minmax(0, 1.2fr) minmax(380px, 1fr);
+  }
+  .atlas-hero__copy {
+    display: grid;
+    gap: 1.1rem;
+    max-width: 53rem;
+  }
+  .atlas-eyebrow,
+  .atlas-stat__label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-navy);
+  }
+  .atlas-hero h1 {
+    font-size: clamp(2.6rem, 6vw, 5rem);
+    line-height: 0.98;
+    letter-spacing: -0.03em;
+    color: var(--color-obsidian);
+  }
+  .atlas-section-heading h2,
+  .atlas-open-source__panel h2 {
+    font-size: clamp(2rem, 4.4vw, 3.2rem);
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    color: var(--color-obsidian);
+  }
+  .atlas-lede,
+  .atlas-section-heading p,
+  .atlas-open-source__panel p,
+  .atlas-signal-panel__intro p {
+    font-size: 1.08rem;
+    color: rgb(64 64 64 / 0.92);
+  }
+  .atlas-quickstarts {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.85rem;
+    padding-top: 0.2rem;
+  }
+  .atlas-actions__label {
+    font-size: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-slate);
+  }
+  .atlas-quickstart-link {
+    min-height: 2.9rem;
+    background: rgb(255 255 255 / 0.76);
+    transition:
+      transform 0.12s ease,
+      border-color 0.12s ease,
+      background 0.12s ease;
+  }
+  .atlas-quickstart-link:hover {
+    text-decoration: none;
+    transform: translateY(-1px);
+    border-color: rgb(10 22 54 / 0.32);
+    background: rgb(255 255 255 / 0.92);
+  }
+  .atlas-hero-guide {
+    display: grid;
+    grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+    gap: 0.8rem;
+  }
+  .atlas-hero-guide__card {
+    display: grid;
+    gap: 0.55rem;
+    padding: 1rem;
+    border: 1px solid rgb(10 22 54 / 0.12);
+    background: rgb(255 255 255 / 0.72);
+  }
+  .atlas-hero-guide__card p {
+    font-size: 0.95rem;
+    color: rgb(64 64 64 / 0.92);
+  }
+  .atlas-proof-strip__label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-slate);
+  }
+  .atlas-hero-command {
+    margin: 0;
+    padding: 0.8rem 0.9rem;
+    border: 1px solid rgb(255 255 255 / 0.08);
+    background: #10151f;
+    color: #edf2fb;
+    overflow-x: auto;
+  }
+  .atlas-hero-command code,
+  .atlas-proof-code code {
+    display: block;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-family: var(--font-mono);
+  }
+  .atlas-hero-command code {
+    font-size: 0.95rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .atlas-hero-links {
+    display: grid;
+    gap: 0.55rem;
+  }
+  .atlas-hero-link {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 1px solid rgb(10 22 54 / 0.12);
+    color: var(--color-obsidian);
+  }
+  .atlas-hero-link:last-child {
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+  .atlas-hero-link:hover {
+    text-decoration: none;
+  }
+  .atlas-hero-link small {
+    color: var(--color-slate);
+    font-size: 0.82rem;
+    text-align: right;
+  }
+  .atlas-hero-runtime {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(220px, 17rem) minmax(0, 1fr);
+    gap: 1rem;
+    align-items: stretch;
+  }
+  .atlas-stats {
+    display: grid;
+    grid-template-columns: 1fr;
+    grid-auto-rows: 1fr;
+    gap: 1rem;
+  }
+  .atlas-stat,
+  .atlas-panel {
+    border: 1px solid rgb(10 22 54 / 0.12);
+    background: rgb(255 255 255 / 0.78);
+    box-shadow: 0 16px 40px rgb(10 22 54 / 0.04);
+  }
+  .atlas-stat {
+    display: grid;
+    gap: 0.45rem;
+    padding: 1rem;
+  }
+  .atlas-stat--link {
+    color: inherit;
+    text-decoration: none;
+    transition:
+      transform 0.12s ease,
+      border-color 0.12s ease,
+      box-shadow 0.12s ease;
+  }
+  .atlas-stat--link:hover {
+    text-decoration: none;
+    transform: translateY(-1px);
+    border-color: rgb(10 22 54 / 0.24);
+    box-shadow: 0 20px 44px rgb(10 22 54 / 0.08);
+  }
+  .atlas-stat strong {
+    font-size: 1.4rem;
+    line-height: 1.2;
+    font-family: var(--font-mono);
+    color: var(--color-obsidian);
+  }
+  .atlas-builtins-panel {
+    display: grid;
+    gap: 1rem;
+    padding: 1.15rem;
+  }
+  .atlas-builtins-panel__copy {
+    display: grid;
+    gap: 0.55rem;
+  }
+  .atlas-builtins-panel__copy h3 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    line-height: 1.15;
+  }
+  .atlas-builtins-panel__copy p {
+    color: rgb(64 64 64 / 0.92);
+  }
+  .atlas-chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+  }
+  .atlas-chip {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2rem;
+    padding: 0.35rem 0.7rem;
+    background: #10151f;
+    color: #edf2fb;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    letter-spacing: 0.01em;
+  }
+  .atlas-inline-link {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    color: var(--color-navy);
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .atlas-inline-link:hover {
+    text-decoration: underline;
+  }
+  .atlas-agent-dev {
+    background: var(--color-white);
+  }
+  .atlas-agent-island {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    gap: 1.4rem;
+    align-items: start;
+    padding: 1.35rem;
+    background: linear-gradient(135deg, #fffaf0 0%, #ffffff 56%, #eef4ff 100%);
+  }
+  .atlas-agent-island__copy {
+    display: grid;
+    gap: 0.75rem;
+  }
+  .atlas-agent-island__copy h2 {
+    max-width: 12ch;
+    font-size: clamp(1.9rem, 3.4vw, 3rem);
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+  }
+  .atlas-agent-island__copy p,
+  .atlas-agent-step p {
+    color: rgb(64 64 64 / 0.92);
+  }
+  .atlas-agent-steps {
+    display: grid;
+    gap: 0.8rem;
+  }
+  .atlas-agent-step {
+    display: grid;
+    grid-template-columns: 2.1rem minmax(0, 1fr);
+    gap: 0.85rem;
+    padding: 0.9rem;
+    border: 1px solid rgb(10 22 54 / 0.1);
+    background: rgb(255 255 255 / 0.78);
+  }
+  .atlas-agent-step__index {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.1rem;
+    height: 2.1rem;
+    background: #10151f;
+    color: #edf2fb;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .atlas-agent-step h3 {
+    font-size: 1.1rem;
+    font-weight: 600;
+  }
+  .atlas-agent-command {
+    margin-top: 0.55rem;
+    padding: 0.65rem 0.75rem;
+    background: #10151f;
+    color: #edf2fb;
+    overflow-x: auto;
+  }
+  .atlas-agent-command code {
+    display: block;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.86rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .atlas-signal-panel {
+    display: grid;
+    gap: 1.15rem;
+    padding: 1.35rem;
+  }
+  .atlas-signal-panel__intro { display: grid; gap: 0.7rem; }
+  .atlas-proof-code {
+    display: grid;
+    gap: 0;
+    border: 1px solid rgb(10 22 54 / 0.12);
+    background: linear-gradient(180deg, #111726 0%, #0b1020 100%);
+    color: #edf2fb;
+    overflow: hidden;
+  }
+  .atlas-proof-code__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.8rem 1rem;
+    border-bottom: 1px solid rgb(255 255 255 / 0.08);
+    background: rgb(255 255 255 / 0.03);
+    font-size: 0.76rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgb(237 242 251 / 0.72);
+  }
+  .atlas-signal-list { display: grid; gap: 0.9rem; }
+  .atlas-signal-list__item {
+    display: grid;
+    gap: 0.35rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid rgb(10 22 54 / 0.12);
+  }
+  .atlas-signal-list__item:first-child {
+    padding-top: 0;
+    border-top: none;
+  }
+  .atlas-signal-list__item h3,
+  .atlas-card h3 {
+    font-size: 1.25rem;
+    font-weight: 600;
+  }
+  .atlas-signal-list__item p,
+  .atlas-card p,
+  .atlas-resource-card {
+    color: rgb(64 64 64 / 0.92);
+  }
+  .atlas-section-heading {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    gap: 1.25rem;
+    align-items: end;
+    margin-bottom: 1.5rem;
+  }
+  .atlas-section-heading > div {
+    display: grid;
+    gap: 0.7rem;
+  }
+
+  .atlas-card-grid { display: grid; gap: 1rem; }
+  .atlas-card-grid--surfaces,
+  .atlas-card-grid--reliability {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .atlas-card-grid--resources { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .atlas-language-list { display: grid; gap: 1rem; margin-bottom: 1.25rem; }
+  .atlas-card { padding: 1.15rem; display: grid; gap: 0.45rem; }
+  .atlas-resource-card {
+    text-decoration: none;
+    transition: transform 0.12s ease, border-color 0.12s ease;
+  }
+  .atlas-resource-card:hover {
+    text-decoration: none;
+    transform: translateY(-1px);
+    border-color: rgb(10 22 54 / 0.24);
+  }
+
+  .atlas-lang-row {
+    padding: 1.25rem;
+    display: grid;
+    grid-template-columns: minmax(0, 20rem) minmax(0, 1fr);
+    gap: 1rem;
+    align-content: start;
+  }
+  .atlas-lang-row__meta,
+  .atlas-lang-row__code,
+  .atlas-install-group {
+    display: grid;
+  }
+  .atlas-lang-row__meta { gap: 0.75rem; align-content: start; }
+  .atlas-install-group { gap: 0.35rem; }
+  .atlas-install-group__label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-slate);
+  }
+  .atlas-install {
+    margin: 0;
+    padding: 0.6rem 0.8rem;
+    background: var(--color-smoke);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+  .atlas-lang-row :global(.astro-code),
+  .atlas-code-panel :global(.astro-code),
+  .atlas-proof-code :global(.astro-code) {
+    margin: 0;
+    padding: 1rem;
+    border: 1px solid rgb(255 255 255 / 0.08);
+    background: #10151f !important;
+    font-family: var(--font-mono);
+    font-size: 0.84rem;
+    line-height: 1.65;
+    overflow: hidden;
+  }
+  .atlas-lang-row :global(.astro-code code),
+  .atlas-code-panel :global(.astro-code code),
+  .atlas-proof-code :global(.astro-code code) {
+    display: block;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    background: transparent;
+    padding: 0;
+  }
+
+  .atlas-code-panel {
+    display: grid;
+    gap: 0.85rem;
+    padding: 1.1rem;
+    background: #10151f;
+    color: #edf2fb;
+    border: 1px solid rgb(10 22 54 / 0.6);
+    box-shadow: 0 24px 50px rgb(10 22 54 / 0.14);
+  }
+  .atlas-code-panel__header { display: grid; gap: 0.45rem; }
+  .atlas-code-panel .atlas-eyebrow { color: rgb(212 164 58 / 0.92); }
+  .atlas-code-panel__header p { color: rgb(237 242 251 / 0.82); }
+
+  .atlas-table-panel { padding: 0.5rem 0.6rem; overflow-x: auto; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.95rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid rgb(10 22 54 / 0.1);
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  th {
+    font-weight: 600;
+    color: var(--color-slate);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  td.score {
+    font-family: var(--font-mono);
+    color: var(--color-gold);
+    font-weight: 600;
+  }
+  td.dim { color: var(--color-slate); }
+
+  @media (max-width: 980px) {
+    .atlas-hero__grid,
+    .atlas-local__grid,
+    .atlas-section-heading {
+      grid-template-columns: 1fr;
+    }
+    .atlas-card-grid--surfaces,
+    .atlas-card-grid--reliability,
+    .atlas-card-grid--resources {
+      grid-template-columns: 1fr;
+    }
+    .atlas-agent-island {
+      grid-template-columns: 1fr;
+    }
+    .atlas-agent-island__copy h2 {
+      max-width: 18ch;
+    }
+    .atlas-hero-guide { grid-template-columns: 1fr; }
+    .atlas-hero-runtime { grid-template-columns: 1fr; }
+    .atlas-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .atlas-lang-row { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .atlas-stats { grid-template-columns: 1fr; }
+    .atlas-quickstarts {
+      align-items: stretch;
+    }
+    .atlas-actions__label {
+      width: 100%;
+    }
+    .atlas-quickstart-link {
+      justify-content: center;
+      flex: 1 1 auto;
+    }
+    .atlas-hero-link {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .atlas-hero-link small { text-align: left; }
+    .atlas-proof-code__header {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+  }
+</style>

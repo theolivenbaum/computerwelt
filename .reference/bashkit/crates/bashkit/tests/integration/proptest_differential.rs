@@ -1,0 +1,685 @@
+//! Grammar-based differential fuzzing for Bashkit
+//!
+//! These tests generate random valid bash scripts using proptest strategies
+//! and compare Bashkit output against real bash to find compatibility issues.
+//!
+//! Run with: cargo test --test proptest_differential -- --nocapture
+//! Run more iterations: PROPTEST_CASES=1000 cargo test --test proptest_differential
+
+use bashkit::Bash;
+use proptest::prelude::*;
+use std::process::Command;
+
+/// Run script in real bash and capture output
+fn run_real_bash(script: &str) -> (String, i32) {
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("Failed to run bash");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let exit_code = output.status.code().unwrap_or(1);
+
+    (stdout, exit_code)
+}
+
+/// Run script in Bashkit and capture output
+async fn run_bashkit(script: &str) -> (String, i32) {
+    let mut bash = Bash::new();
+    match bash.exec(script).await {
+        Ok(result) => (result.stdout.to_string(), result.exit_code),
+        Err(e) => {
+            // Parse errors should return exit code 2 (like bash)
+            let exit_code = if matches!(e, bashkit::Error::Parse { .. }) {
+                2
+            } else {
+                1
+            };
+            (String::new(), exit_code)
+        }
+    }
+}
+
+// === Grammar-based script generators ===
+
+/// Bash special, readonly, and dynamic variables whose value is tied to the
+/// host user/process (UID/EUID/PPID/RANDOM/...) or the ambient environment
+/// (PATH/HOME/...). The differential fuzzer must never use these as generated
+/// variable names: bashkit reports fixed sandbox defaults (e.g. UID=1000) while
+/// real bash reflects the runner, so comparing them is host-dependent and
+/// flaky. Counterexample that motivated this filter (fails only when the
+/// runner uid != 1000): `UID=a echo done; echo ${UID:-unset}`.
+const HOST_DEPENDENT_VARS: &[&str] = &[
+    "BASH", "BASHOPTS", "BASHPID", "CDPATH", "COLUMNS", "DIRSTACK", "EDITOR", "ENV", "EUID",
+    "FCEDIT", "FIGNORE", "FUNCNAME", "GROUPS", "HISTCMD", "HISTFILE", "HISTSIZE", "HOME",
+    "HOSTFILE", "HOSTNAME", "HOSTTYPE", "IFS", "INPUTRC", "LANG", "LINENO", "LINES", "LOGNAME",
+    "MACHTYPE", "MAIL", "MAILPATH", "OLDPWD", "OPTARG", "OPTERR", "OPTIND", "OSTYPE", "PAGER",
+    "PATH", "PPID", "PWD", "RANDOM", "REPLY", "SECONDS", "SHELL", "SHLVL", "SRANDOM", "TERM",
+    "TMOUT", "TMPDIR", "TZ", "UID", "USER", "VISUAL",
+];
+
+/// True when `name` must not be generated as a fresh user variable: it is a
+/// known bash special/host-dependent variable, or it is already present in the
+/// process environment inherited by the comparison `bash` (so its value would
+/// diverge from bashkit's sandbox defaults). Catches host-exported variables
+/// generically, independent of the runner.
+fn is_host_dependent_var(name: &str) -> bool {
+    HOST_DEPENDENT_VARS.contains(&name) || std::env::var_os(name).is_some()
+}
+
+/// Generate a simple variable name. Uppercased to avoid bash reserved words
+/// (which are lowercase), and filtered to avoid bash special/host-dependent
+/// variables so differential comparisons stay deterministic across runners.
+fn var_name_strategy() -> impl Strategy<Value = String> {
+    "[a-z]{1,8}"
+        .prop_map(|s| s.to_uppercase())
+        .prop_filter("avoid host-dependent bash variables", |name| {
+            !is_host_dependent_var(name)
+        })
+}
+
+/// Generate a safe literal value (no special chars that could cause issues)
+/// Note: at least 1 char to avoid empty strings which cause syntax issues
+fn safe_value_strategy() -> impl Strategy<Value = String> {
+    "[a-zA-Z0-9_]{1,20}"
+}
+
+/// Generate a simple echo command
+fn echo_command_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // echo literal
+        safe_value_strategy().prop_map(|v| format!("echo {}", v)),
+        // echo quoted
+        safe_value_strategy().prop_map(|v| format!("echo \"{}\"", v)),
+        // echo single quoted
+        safe_value_strategy().prop_map(|v| format!("echo '{}'", v)),
+        // echo -n (no newline)
+        safe_value_strategy().prop_map(|v| format!("echo -n {}", v)),
+        // echo multiple args
+        (safe_value_strategy(), safe_value_strategy())
+            .prop_map(|(a, b)| format!("echo {} {}", a, b)),
+    ]
+}
+
+/// Generate a variable assignment
+fn assignment_strategy() -> impl Strategy<Value = String> {
+    (var_name_strategy(), safe_value_strategy())
+        .prop_map(|(name, value)| format!("{}={}", name, value))
+}
+
+/// Generate an arithmetic expression
+fn arithmetic_strategy() -> impl Strategy<Value = String> {
+    let num = 0i32..100;
+    prop_oneof![
+        // Simple number
+        num.clone().prop_map(|n| format!("echo $(({}))", n)),
+        // Addition
+        (num.clone(), num.clone()).prop_map(|(a, b)| format!("echo $(({} + {}))", a, b)),
+        // Subtraction
+        (num.clone(), num.clone()).prop_map(|(a, b)| format!("echo $(({} - {}))", a, b)),
+        // Multiplication
+        (num.clone(), num.clone()).prop_map(|(a, b)| format!("echo $(({} * {}))", a, b)),
+        // Division (avoid div by zero)
+        (num.clone(), 1i32..100).prop_map(|(a, b)| format!("echo $(({} / {}))", a, b)),
+        // Modulo (avoid mod by zero)
+        (num.clone(), 1i32..100).prop_map(|(a, b)| format!("echo $(({} % {}))", a, b)),
+    ]
+}
+
+/// Generate an if statement
+fn if_statement_strategy() -> impl Strategy<Value = String> {
+    let condition = prop_oneof![
+        Just("true".to_string()),
+        Just("false".to_string()),
+        (0i32..10, 0i32..10).prop_map(|(a, b)| format!("[ {} -eq {} ]", a, b)),
+        (0i32..10, 0i32..10).prop_map(|(a, b)| format!("[ {} -lt {} ]", a, b)),
+        (0i32..10, 0i32..10).prop_map(|(a, b)| format!("[ {} -gt {} ]", a, b)),
+    ];
+
+    (condition, safe_value_strategy(), safe_value_strategy()).prop_map(
+        |(cond, then_val, else_val)| {
+            format!(
+                "if {}; then echo {}; else echo {}; fi",
+                cond, then_val, else_val
+            )
+        },
+    )
+}
+
+/// Generate a for loop
+fn for_loop_strategy() -> impl Strategy<Value = String> {
+    let items = proptest::collection::vec(safe_value_strategy(), 1..5);
+    (var_name_strategy(), items).prop_map(|(var, items)| {
+        format!(
+            "for {} in {}; do echo ${}; done",
+            var.to_lowercase(),
+            items.join(" "),
+            var.to_lowercase()
+        )
+    })
+}
+
+/// Generate a while loop (with limited iterations)
+fn while_loop_strategy() -> impl Strategy<Value = String> {
+    (1i32..5, safe_value_strategy()).prop_map(|(count, val)| {
+        format!(
+            "i=0; while [ $i -lt {} ]; do echo {}; i=$((i + 1)); done",
+            count, val
+        )
+    })
+}
+
+/// Generate a case statement
+fn case_statement_strategy() -> impl Strategy<Value = String> {
+    (
+        safe_value_strategy(),
+        safe_value_strategy(),
+        safe_value_strategy(),
+    )
+        .prop_map(|(input, pattern, result)| {
+            format!(
+                "case {} in {}) echo {};; *) echo default;; esac",
+                input, pattern, result
+            )
+        })
+}
+
+/// Generate a pipeline
+fn pipeline_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // echo | cat
+        safe_value_strategy().prop_map(|v| format!("echo {} | cat", v)),
+        // echo | head (skip wc - has known formatting differences)
+        safe_value_strategy().prop_map(|v| format!("echo {} | head -n 1", v)),
+        // printf | cat
+        safe_value_strategy().prop_map(|v| format!("printf '{}\\n' | cat", v)),
+        // Multiple pipes
+        safe_value_strategy().prop_map(|v| format!("echo {} | cat | cat", v)),
+    ]
+}
+
+/// Generate a command substitution
+fn command_subst_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        safe_value_strategy().prop_map(|v| format!("echo $(echo {})", v)),
+        Just("echo $(pwd)".to_string()),
+        Just("X=$(echo hello); echo $X".to_string()),
+    ]
+}
+
+/// Generate logical operators
+fn logical_ops_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // && (and)
+        (safe_value_strategy(), safe_value_strategy())
+            .prop_map(|(a, b)| format!("echo {} && echo {}", a, b)),
+        // || (or)
+        safe_value_strategy().prop_map(|v| format!("false || echo {}", v)),
+        // Combined
+        (safe_value_strategy(), safe_value_strategy())
+            .prop_map(|(a, b)| format!("true && echo {} || echo {}", a, b)),
+    ]
+}
+
+/// Bash reserved words that cannot be used as function names
+const RESERVED_WORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do",
+    "done", "in", "function", "time", "coproc",
+];
+
+/// Generate a function definition and call
+fn function_strategy() -> impl Strategy<Value = String> {
+    (var_name_strategy(), safe_value_strategy()).prop_filter_map(
+        "avoid reserved words",
+        |(name, body)| {
+            let lower_name = name.to_lowercase();
+            if RESERVED_WORDS.contains(&lower_name.as_str()) {
+                None
+            } else {
+                Some(format!(
+                    "{}() {{ echo {}; }}; {}",
+                    lower_name, body, lower_name
+                ))
+            }
+        },
+    )
+}
+
+/// Generate a prefix assignment command (VAR=value command)
+fn prefix_assignment_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // Single prefix assignment with printenv
+        (var_name_strategy(), safe_value_strategy())
+            .prop_map(|(name, value)| format!("{}={} printenv {}", name, value, name)),
+        // Single prefix assignment with echo (variable visible via $VAR)
+        (var_name_strategy(), safe_value_strategy())
+            .prop_map(|(name, value)| format!("{}={} echo done", name, value)),
+        // Prefix assignment then check it doesn't persist
+        (var_name_strategy(), safe_value_strategy()).prop_map(|(name, value)| {
+            format!("{}={} echo done; echo ${{{}:-unset}}", name, value, name)
+        }),
+    ]
+}
+
+/// Generate a complete valid bash script
+fn valid_script_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        10 => echo_command_strategy(),
+        5 => assignment_strategy().prop_map(|a| format!("{}; echo done", a)),
+        5 => arithmetic_strategy(),
+        3 => if_statement_strategy(),
+        3 => for_loop_strategy(),
+        2 => while_loop_strategy(),
+        2 => case_statement_strategy(),
+        3 => pipeline_strategy(),
+        3 => command_subst_strategy(),
+        3 => logical_ops_strategy(),
+        2 => function_strategy(),
+        3 => prefix_assignment_strategy(),
+    ]
+}
+
+/// Generate multi-statement scripts
+fn multi_statement_strategy() -> impl Strategy<Value = String> {
+    proptest::collection::vec(valid_script_strategy(), 1..4).prop_map(|scripts| scripts.join("; "))
+}
+
+// === Property tests ===
+
+proptest! {
+    // Default to 50 cases, can override with PROPTEST_CASES env var
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Echo commands should produce identical output
+    #[test]
+    fn echo_matches_bash(script in echo_command_strategy()) {
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}\nBashkit: {}\nBash: {}",
+            script, bashkit_exit, bash_exit
+        );
+    }
+
+    /// Arithmetic expressions should produce identical output
+    #[test]
+    fn arithmetic_matches_bash(script in arithmetic_strategy()) {
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Control flow should produce identical output
+    #[test]
+    fn control_flow_matches_bash(script in prop_oneof![
+        if_statement_strategy(),
+        for_loop_strategy(),
+        while_loop_strategy(),
+        case_statement_strategy(),
+    ]) {
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Pipelines should produce identical output
+    #[test]
+    fn pipelines_match_bash(script in pipeline_strategy()) {
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Logical operators should produce identical output
+    #[test]
+    fn logical_ops_match_bash(script in logical_ops_strategy()) {
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Command substitutions should produce identical output
+    #[test]
+    fn command_subst_matches_bash(script in command_subst_strategy()) {
+        // Skip pwd-related tests as paths differ between Bashkit VFS and real fs
+        prop_assume!(!script.contains("pwd"));
+
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Functions should produce identical output
+    #[test]
+    fn functions_match_bash(script in function_strategy()) {
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Valid scripts should produce identical output
+    #[test]
+    fn valid_scripts_match_bash(script in valid_script_strategy()) {
+        // Skip tests with pwd as paths differ
+        prop_assume!(!script.contains("pwd"));
+
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Prefix assignments should produce identical output
+    #[test]
+    fn prefix_assignments_match_bash(script in prefix_assignment_strategy()) {
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+
+    /// Multi-statement scripts should produce identical output
+    #[test]
+    fn multi_statement_matches_bash(script in multi_statement_strategy()) {
+        // Skip tests with pwd as paths differ
+        prop_assume!(!script.contains("pwd"));
+
+        let (bash_out, bash_exit) = run_real_bash(&script);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (bashkit_out, bashkit_exit) = rt.block_on(run_bashkit(&script));
+
+        prop_assert_eq!(
+            &bashkit_out, &bash_out,
+            "Output mismatch for script: {}\nBashkit: {:?}\nBash: {:?}",
+            script, bashkit_out, bash_out
+        );
+        prop_assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for script: {}",
+            script
+        );
+    }
+}
+
+// === Targeted differential tests ===
+
+/// Test specific edge cases that have caused issues
+#[tokio::test]
+async fn differential_edge_cases() {
+    let test_cases = [
+        // Basic echo variations
+        ("echo", "echo"),
+        ("echo hello", "echo hello"),
+        ("echo hello world", "echo hello world"),
+        ("echo -n hello", "echo -n hello"),
+        // Quoting
+        ("echo \"hello world\"", "echo \"hello world\""),
+        ("echo 'hello world'", "echo 'hello world'"),
+        // Variables
+        ("X=hello; echo $X", "X=hello; echo $X"),
+        (
+            "X=hello; Y=world; echo $X $Y",
+            "X=hello; Y=world; echo $X $Y",
+        ),
+        // Prefix environment assignments
+        ("prefix assign visible", "X=hello printenv X"),
+        (
+            "prefix assign temporary",
+            "X=hello printenv X; echo ${X:-unset}",
+        ),
+        (
+            "prefix assign no clobber",
+            "X=original; X=temp echo done; echo $X",
+        ),
+        ("prefix assign empty", "X= printenv X"),
+        ("multiple prefix assigns", "A=1 B=2 printenv A"),
+        ("assignment only persists", "X=persist; echo $X"),
+        // Arithmetic
+        ("echo $((1 + 2))", "echo $((1 + 2))"),
+        ("echo $((10 - 3))", "echo $((10 - 3))"),
+        ("echo $((4 * 5))", "echo $((4 * 5))"),
+        ("echo $((10 / 2))", "echo $((10 / 2))"),
+        // Control flow
+        ("if true; then echo yes; fi", "if true; then echo yes; fi"),
+        (
+            "if false; then echo yes; else echo no; fi",
+            "if false; then echo yes; else echo no; fi",
+        ),
+        (
+            "for i in a b c; do echo $i; done",
+            "for i in a b c; do echo $i; done",
+        ),
+        // Logical operators
+        ("true && echo yes", "true && echo yes"),
+        ("false || echo no", "false || echo no"),
+        // Pipelines
+        ("echo hello | cat", "echo hello | cat"),
+        // Command substitution
+        ("echo $(echo hello)", "echo $(echo hello)"),
+        // Reserved words as function names (syntax errors)
+        (
+            "if() { echo 0; }; if",
+            "reserved word 'if' as function name",
+        ),
+        (
+            "do() { echo a; }; do",
+            "reserved word 'do' as function name",
+        ),
+    ];
+
+    for (name, script) in test_cases {
+        let (bash_out, bash_exit) = run_real_bash(script);
+        let (bashkit_out, bashkit_exit) = run_bashkit(script).await;
+
+        assert_eq!(
+            bashkit_out, bash_out,
+            "Output mismatch for '{}'\nScript: {}\nBashkit: {:?}\nBash: {:?}",
+            name, script, bashkit_out, bash_out
+        );
+        assert_eq!(
+            bashkit_exit, bash_exit,
+            "Exit code mismatch for '{}'\nScript: {}",
+            name, script
+        );
+    }
+}
+
+/// The generated variable-name filter must reject bash special/host-dependent
+/// variables while still allowing ordinary user names. Regression guard for the
+/// flaky `UID=a echo done; echo ${UID:-unset}` differential (bashkit reports the
+/// sandbox UID=1000 while real bash reports the runner's uid).
+#[test]
+fn host_dependent_vars_are_excluded() {
+    for name in [
+        "UID", "EUID", "PPID", "RANDOM", "PATH", "HOME", "IFS", "PWD", "SECONDS", "HOSTNAME",
+    ] {
+        assert!(
+            is_host_dependent_var(name),
+            "{name} must be treated as host-dependent and excluded from the fuzzer"
+        );
+    }
+    // Ordinary user variable names are allowed only when absent from the host
+    // environment; the helper intentionally rejects any inherited variable.
+    let ordinary_name = (0..1000)
+        .map(|i| format!("BASHKIT_FUZZ_SAFE_{}_{}", std::process::id(), i))
+        .find(|name| std::env::var_os(name).is_none())
+        .expect("fresh process-scoped variable name should be absent");
+    assert!(
+        !is_host_dependent_var(&ordinary_name),
+        "{ordinary_name} is absent from the host environment and must remain generatable"
+    );
+}
+
+/// A `$(...)` whose body is a syntax error aborts the whole script in bash:
+/// nothing runs, nothing reaches stdout. Bashkit must agree, because the
+/// alternative — dropping the substitution and splicing the literals around it
+/// — fabricates a command (`a$(|)b` -> `ab`) that the source never named, and
+/// `analyze()` would report that name to a host permission gate.
+///
+/// Parity is asserted on what is observable and stable: no stdout, non-zero
+/// exit. The exact code is deliberately not compared — bash returns 127 here,
+/// bashkit reports a parse error (2), and neither is load-bearing.
+#[tokio::test]
+async fn malformed_command_substitution_aborts_like_bash() {
+    for script in [
+        "a$(|)b",
+        "echo a$(|)b",
+        "echo a$(&&)b",
+        "echo x$(;)y",
+        r#"echo "pre-$(|)-post""#,
+        "echo $(for)",
+    ] {
+        let (bash_stdout, bash_exit) = run_real_bash(script);
+        assert_eq!(bash_stdout, "", "real bash printed output for `{script}`");
+        assert_ne!(bash_exit, 0, "real bash accepted `{script}`");
+
+        let (bk_stdout, bk_exit) = run_bashkit(script).await;
+        assert_eq!(bk_stdout, "", "bashkit printed output for `{script}`");
+        assert_ne!(bk_exit, 0, "bashkit accepted `{script}`");
+    }
+}

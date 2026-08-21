@@ -1,0 +1,1484 @@
+// Interactive shell mode using rustyline for line editing.
+// Decision: rustyline over reedline — lighter deps, no SQLite/crossterm.
+// Decision: feature-gated behind "interactive" — no deps in library mode.
+// Decision: Ctrl-C during execution via signal-hook + cancellation_token.
+// Decision: tab completion from builtins + VFS paths + functions + variables.
+// Decision: PS1 prompt with bash-compatible escapes (\u, \h, \w, \$).
+// Decision: exit via ExitSignal event fired by the interpreter — REPL polls
+//   the signal after each exec() call.
+// See knowledge/integrations/interactive-shell.md
+
+use anyhow::Result;
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::{Hint, Hinter};
+use rustyline::validate::Validator;
+use rustyline::{Config, Context, Editor, Helper};
+use std::borrow::Cow;
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const DEFAULT_PS1: &str = "\\u@bashkit:\\w\\$ ";
+const DEFAULT_PS2: &str = "> ";
+const RC_FILE: &str = "/home/user/.bashkitrc";
+const SOURCE_RC_ENV: &str = "BASHKIT_SOURCE_RC";
+const MAX_HISTORY: usize = 1000;
+
+// --- Incomplete input detection ---
+
+fn is_incomplete_input(err_msg: &str) -> bool {
+    let lower = err_msg.to_lowercase();
+    lower.contains("unterminated")
+        || lower.contains("unexpected end of input")
+        || lower.contains("unexpected eof")
+        || lower.contains("syntax error: empty")
+        || lower.contains("expected 'fi'")
+        || lower.contains("expected 'done'")
+        || lower.contains("expected 'esac'")
+        || lower.contains("expected '}' to close brace group")
+}
+
+fn error_result(exit_code: i32) -> bashkit::ExecResult {
+    bashkit::ExecResult {
+        exit_code,
+        ..Default::default()
+    }
+}
+
+// --- PS1 prompt expansion ---
+
+fn expand_ps1(ps1: &str, state: &bashkit::ShellStateView) -> String {
+    let mut out = String::with_capacity(ps1.len());
+    let mut chars = ps1.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('u') => {
+                    out.push_str(state.env.get("USER").map(|s| s.as_str()).unwrap_or("user"));
+                }
+                Some('h') => {
+                    let host = state
+                        .env
+                        .get("HOSTNAME")
+                        .map(|s| s.as_str())
+                        .unwrap_or("bashkit");
+                    // \h = short hostname (up to first '.')
+                    if let Some(dot) = host.find('.') {
+                        out.push_str(&host[..dot]);
+                    } else {
+                        out.push_str(host);
+                    }
+                }
+                Some('H') => {
+                    out.push_str(
+                        state
+                            .env
+                            .get("HOSTNAME")
+                            .map(|s| s.as_str())
+                            .unwrap_or("bashkit"),
+                    );
+                }
+                Some('w') => {
+                    let cwd = state.cwd.display().to_string();
+                    let home = state.env.get("HOME").map(|s| s.as_str()).unwrap_or("");
+                    if !home.is_empty() && cwd.starts_with(home) {
+                        out.push('~');
+                        out.push_str(&cwd[home.len()..]);
+                    } else {
+                        out.push_str(&cwd);
+                    }
+                }
+                Some('W') => {
+                    let cwd = state.cwd.display().to_string();
+                    if cwd == "/" {
+                        out.push('/');
+                    } else {
+                        out.push_str(
+                            Path::new(&cwd)
+                                .file_name()
+                                .map(|s| s.to_string_lossy())
+                                .unwrap_or(Cow::Borrowed("/"))
+                                .as_ref(),
+                        );
+                    }
+                }
+                Some('$') => {
+                    let uid = state
+                        .env
+                        .get("EUID")
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(1000);
+                    out.push(if uid == 0 { '#' } else { '$' });
+                }
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('a') => out.push('\x07'),
+                Some('e') => out.push('\x1b'),
+                Some('[') => {
+                    // \[ ... \] — non-printing sequence (for ANSI codes)
+                    // Pass through to terminal but don't count for width
+                    out.push('\x01'); // RL_PROMPT_START_IGNORE
+                }
+                Some(']') => {
+                    out.push('\x02'); // RL_PROMPT_END_IGNORE
+                }
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// --- Tab completion ---
+
+struct BashkitHelper {
+    fs: Arc<dyn bashkit::FileSystem>,
+    state_fn: Box<dyn Fn() -> bashkit::ShellStateView + Send + Sync>,
+    /// Registered builtin names, snapshotted at startup from
+    /// `Bash::builtin_names()` — same live-registry source as `compgen -b`,
+    /// never a hardcoded list (the old one drifted to 109 of 156 names).
+    builtin_names: Vec<String>,
+}
+
+impl BashkitHelper {
+    fn complete_path(&self, partial: &str) -> Vec<String> {
+        let state = (self.state_fn)();
+        let (dir_path, prefix) = if let Some(slash) = partial.rfind('/') {
+            let dir = &partial[..=slash];
+            let pfx = &partial[slash + 1..];
+            // Resolve relative paths against cwd
+            let resolved = if dir.starts_with('/') {
+                dir.to_string()
+            } else {
+                format!("{}/{}", state.cwd.display(), dir)
+            };
+            (resolved, pfx.to_string())
+        } else {
+            (state.cwd.display().to_string(), partial.to_string())
+        };
+
+        let dir = std::path::PathBuf::from(&dir_path);
+        // We're inside a single-thread tokio runtime (rustyline calls Completer
+        // synchronously).  handle.block_on() would panic with "Cannot start a
+        // runtime from within a runtime", so spawn a helper thread with its own
+        // runtime to drive the async VFS call.
+        let entries = match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let fs = Arc::clone(&self.fs);
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()
+                        .and_then(|rt| rt.block_on(fs.read_dir(&dir)).ok())
+                        .unwrap_or_default()
+                })
+                .join()
+                .unwrap_or_default()
+            }
+            Err(_) => return Vec::new(),
+        };
+
+        let mut results = Vec::new();
+        for entry in &entries {
+            if entry.name.starts_with(&prefix) {
+                let mut candidate = if partial.contains('/') {
+                    let base = &partial[..=partial.rfind('/').unwrap()];
+                    format!("{}{}", base, entry.name)
+                } else {
+                    entry.name.clone()
+                };
+                if entry.metadata.file_type.is_dir() {
+                    candidate.push('/');
+                }
+                results.push(candidate);
+            }
+        }
+        results.sort();
+        results
+    }
+}
+
+impl Completer for BashkitHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let line_to_cursor = &line[..pos];
+        // Find the word being completed (go back to last space/;/|/&/`)
+        let word_start = line_to_cursor
+            .rfind(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '`' | '(' | '$'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let partial = &line_to_cursor[word_start..];
+
+        if partial.is_empty() {
+            return Ok((pos, Vec::new()));
+        }
+
+        let is_command_position = {
+            let before = line_to_cursor[..word_start].trim_end();
+            before.is_empty()
+                || before.ends_with(';')
+                || before.ends_with('|')
+                || before.ends_with("&&")
+                || before.ends_with("||")
+                || before.ends_with('`')
+                || before.ends_with('(')
+        };
+
+        let mut candidates: Vec<String> = Vec::new();
+
+        // Variable completion: $VAR
+        if let Some(var_prefix) = partial.strip_prefix('$') {
+            let state = (self.state_fn)();
+            for key in state.env.keys().chain(state.variables.keys()) {
+                if key.starts_with(var_prefix) {
+                    candidates.push(format!("${key}"));
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            return Ok((word_start, candidates));
+        }
+
+        // Path completion if contains / or is an argument position
+        if partial.contains('/') || partial.starts_with('.') || partial.starts_with('~') {
+            candidates.extend(self.complete_path(partial));
+        }
+
+        if is_command_position {
+            // Complete builtins
+            for cmd in &self.builtin_names {
+                if cmd.starts_with(partial) {
+                    candidates.push(cmd.clone());
+                }
+            }
+            // Complete functions and aliases
+            let state = (self.state_fn)();
+            // Functions are visible via compgen but the lightweight
+            // ShellStateView intentionally omits function names. We do have aliases.
+            for name in state.aliases.keys() {
+                if name.starts_with(partial) {
+                    candidates.push(name.clone());
+                }
+            }
+        }
+
+        if !is_command_position && !partial.contains('/') && !partial.starts_with('.') {
+            // File/dir completion for arguments
+            candidates.extend(self.complete_path(partial));
+        }
+
+        candidates.sort();
+        candidates.dedup();
+        Ok((word_start, candidates))
+    }
+}
+
+// --- History hints ---
+
+impl Hinter for BashkitHelper {
+    type Hint = ShellHint;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<ShellHint> {
+        if line.is_empty() || pos < line.len() {
+            return None;
+        }
+        // Search history for most recent match
+        let history = ctx.history();
+        for i in (0..history.len()).rev() {
+            if let Ok(Some(entry)) = history.get(i, rustyline::history::SearchDirection::Reverse) {
+                let text = entry.entry.as_ref();
+                if text.starts_with(line) && text.len() > line.len() {
+                    return Some(ShellHint {
+                        suffix: text[line.len()..].to_string(),
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+struct ShellHint {
+    suffix: String,
+}
+
+impl Hint for ShellHint {
+    fn display(&self) -> &str {
+        &self.suffix
+    }
+
+    fn completion(&self) -> Option<&str> {
+        if self.suffix.is_empty() {
+            None
+        } else {
+            Some(&self.suffix)
+        }
+    }
+}
+
+// --- Syntax highlighting ---
+
+impl Highlighter for BashkitHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        // Dim gray for hints
+        Cow::Owned(format!("\x1b[38;5;240m{hint}\x1b[0m"))
+    }
+
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        // Always re-highlight — enables hint coloring
+        true
+    }
+}
+
+// --- Multiline validator ---
+
+// Validator is a no-op — multiline is handled in the REPL loop via
+// is_incomplete_input() after exec fails with a parse error. We can't
+// use Validator for this because it runs synchronously and the parser
+// requires async (tokio block_on deadlocks on a single-thread runtime).
+impl Validator for BashkitHelper {}
+
+impl Helper for BashkitHelper {}
+
+// --- Terminal size ---
+
+fn terminal_columns() -> u16 {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0)
+        .unwrap_or(80)
+}
+
+// --- Main REPL ---
+
+async fn set_interactive_env(bash: &mut bashkit::Bash) {
+    let cols = terminal_columns();
+    let rows = terminal_size::terminal_size()
+        .map(|(_, h)| h.0)
+        .unwrap_or(24);
+    let env_script = format!(
+        "export COLUMNS={cols} LINES={rows} SHLVL=${{SHLVL:-0}}; export SHLVL=$((SHLVL + 1))"
+    );
+    let _ = bash.exec(&env_script).await;
+}
+
+async fn source_rc_file(bash: &mut bashkit::Bash) {
+    if !should_source_rc(&bash.shell_state_view()) {
+        return;
+    }
+
+    // Check if ~/.bashkitrc exists in the VFS
+    let fs = bash.fs();
+    let rc_path = std::path::PathBuf::from(RC_FILE);
+    if let Ok(true) = fs.exists(&rc_path).await
+        && let Ok(content) = fs.read_file(&rc_path).await
+        && let Ok(script) = String::from_utf8(content)
+    {
+        let _ = bash.exec(&script).await;
+    }
+}
+
+fn should_source_rc(state: &bashkit::ShellStateView) -> bool {
+    state
+        .variables
+        .get(SOURCE_RC_ENV)
+        .or_else(|| state.env.get(SOURCE_RC_ENV))
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn test_bash() -> bashkit::Bash {
+    bashkit::Bash::builder()
+        .tty(0, true)
+        .tty(1, true)
+        .tty(2, true)
+        .profile(bashkit::ExecutionProfile::named(
+            bashkit::ExecutionProfileName::Interactive,
+        ))
+        .build()
+}
+
+/// Shared exit state passed from the builder's `on_exit` hook to the REPL.
+pub struct ExitState {
+    pub requested: AtomicBool,
+    pub code: std::sync::atomic::AtomicI32,
+}
+
+impl ExitState {
+    pub fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            code: std::sync::atomic::AtomicI32::new(0),
+        }
+    }
+}
+
+pub async fn run(mut bash: bashkit::Bash, exit_state: Arc<ExitState>) -> Result<i32> {
+    // Set up interactive environment
+    set_interactive_env(&mut bash).await;
+
+    // Source startup file
+    source_rc_file(&mut bash).await;
+
+    // Set up Ctrl-C handler for command interruption
+    let cancel_token = bash.cancellation_token();
+    let sigint_flag = Arc::new(AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint_flag));
+
+    // Build editor with custom helper
+    let config = Config::builder()
+        .auto_add_history(true)
+        .max_history_size(MAX_HISTORY)?
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+
+    let fs = bash.fs();
+    // Shared state snapshot for the helper (completion, hints).
+    // Updated before each readline call.
+    let state_ref = Arc::new(std::sync::Mutex::new(bash.shell_state_view()));
+    let state_for_helper = Arc::clone(&state_ref);
+    let helper = BashkitHelper {
+        fs,
+        state_fn: Box::new(move || state_for_helper.lock().unwrap().clone()),
+        builtin_names: bash.builtin_names(),
+    };
+
+    let mut editor = Editor::with_config(config)?;
+    editor.set_helper(Some(helper));
+
+    let mut last_exit_code: i32 = 0;
+
+    loop {
+        // Update shared state for helper (completion, hints)
+        *state_ref.lock().unwrap() = bash.shell_state_view();
+
+        // Build prompt from PS1
+        let state = bash.shell_state_view();
+        let ps1 = state
+            .variables
+            .get("PS1")
+            .or_else(|| state.env.get("PS1"))
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_PS1.to_string());
+        let prompt = expand_ps1(&ps1, &state);
+
+        // Clear any stale SIGINT from previous iteration
+        sigint_flag.store(false, Ordering::Relaxed);
+        cancel_token.store(false, Ordering::Relaxed);
+
+        let line = match editor.readline(&prompt) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("bashkit: readline error: {e}");
+                last_exit_code = 1;
+                break;
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Multiline: accumulate lines when input is incomplete.
+        let mut input = line;
+        let result = loop {
+            // Enable Ctrl-C cancellation during execution
+            cancel_token.store(false, Ordering::Relaxed);
+            sigint_flag.store(false, Ordering::Relaxed);
+
+            let cancel = Arc::clone(&cancel_token);
+            let sigint = Arc::clone(&sigint_flag);
+            let cancel_watcher = tokio::spawn(async move {
+                loop {
+                    if sigint.load(Ordering::Relaxed) {
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+
+            let exec_result = bash
+                .exec_streaming(
+                    &input,
+                    Box::new(|stdout, stderr| {
+                        if !stdout.is_empty() {
+                            print!("{stdout}");
+                            let _ = std::io::stdout().flush();
+                        }
+                        if !stderr.is_empty() {
+                            eprint!("{stderr}");
+                            let _ = std::io::stderr().flush();
+                        }
+                    }),
+                )
+                .await;
+
+            cancel_watcher.abort();
+            cancel_token.store(false, Ordering::Relaxed);
+
+            match exec_result {
+                Ok(r) => break r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("cancelled") {
+                        eprintln!();
+                        break error_result(130);
+                    }
+                    if !is_incomplete_input(&msg) {
+                        eprintln!("bashkit: {msg}");
+                        break error_result(2);
+                    }
+                    // Read continuation line for incomplete input
+                    let ps2 = bash
+                        .shell_state_view()
+                        .variables
+                        .get("PS2")
+                        .cloned()
+                        .unwrap_or_else(|| DEFAULT_PS2.to_string());
+                    match editor.readline(&ps2) {
+                        Ok(cont) => {
+                            input.push('\n');
+                            input.push_str(&cont);
+                        }
+                        Err(ReadlineError::Interrupted) => break error_result(130),
+                        Err(ReadlineError::Eof) => {
+                            eprintln!("bashkit: unexpected end of file");
+                            break error_result(2);
+                        }
+                        Err(e) => {
+                            eprintln!("bashkit: readline error: {e}");
+                            break error_result(1);
+                        }
+                    }
+                }
+            }
+        };
+
+        last_exit_code = result.exit_code;
+
+        // The on_exit hook (registered via builder) fires when `exit` runs.
+        if exit_state.requested.load(Ordering::Acquire) {
+            last_exit_code = exit_state.code.load(std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
+    }
+
+    Ok(last_exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_unterminated_single_quote() {
+        assert!(is_incomplete_input("unterminated single quote"));
+    }
+
+    #[test]
+    fn incomplete_unterminated_double_quote() {
+        assert!(is_incomplete_input("unterminated double quote"));
+    }
+
+    #[test]
+    fn incomplete_unexpected_end_of_input() {
+        assert!(is_incomplete_input(
+            "parse error at line 1, column 15: unexpected end of input in for loop"
+        ));
+    }
+
+    #[test]
+    fn incomplete_empty_body() {
+        assert!(is_incomplete_input("syntax error: empty for loop body"));
+        assert!(is_incomplete_input("syntax error: empty then clause"));
+        assert!(is_incomplete_input("syntax error: empty else clause"));
+        assert!(is_incomplete_input("syntax error: empty while loop body"));
+        assert!(is_incomplete_input("syntax error: empty brace group"));
+    }
+
+    #[test]
+    fn incomplete_missing_closing_keyword() {
+        assert!(is_incomplete_input("expected 'fi'"));
+        assert!(is_incomplete_input("expected 'done'"));
+        assert!(is_incomplete_input("expected 'esac'"));
+        assert!(is_incomplete_input("expected '}' to close brace group"));
+    }
+
+    #[test]
+    fn complete_input_not_detected_as_incomplete() {
+        assert!(!is_incomplete_input("command not found: foo"));
+        assert!(!is_incomplete_input("syntax error near unexpected token"));
+        assert!(!is_incomplete_input("execution error: division by zero"));
+    }
+
+    // --- PS1 tests ---
+
+    fn empty_state() -> bashkit::ShellStateView {
+        bashkit::ShellStateView {
+            env: std::collections::HashMap::new(),
+            variables: std::collections::HashMap::new(),
+            arrays: std::collections::HashMap::new(),
+            assoc_arrays: std::collections::HashMap::new(),
+            cwd: std::path::PathBuf::from("/"),
+            last_exit_code: 0,
+            aliases: std::collections::HashMap::new(),
+            traps: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn ps1_user_and_host() {
+        let mut state = empty_state();
+        state.env.insert("USER".into(), "mike".into());
+        state.env.insert("HOSTNAME".into(), "dev.local".into());
+        let result = expand_ps1("\\u@\\h$ ", &state);
+        assert_eq!(result, "mike@dev$ ");
+    }
+
+    #[test]
+    fn ps1_full_hostname() {
+        let mut state = empty_state();
+        state.env.insert("HOSTNAME".into(), "dev.local".into());
+        let result = expand_ps1("\\H$ ", &state);
+        assert_eq!(result, "dev.local$ ");
+    }
+
+    #[test]
+    fn ps1_working_dir_with_tilde() {
+        let mut state = empty_state();
+        state.env.insert("HOME".into(), "/home/mike".into());
+        state.cwd = "/home/mike/projects".into();
+        let result = expand_ps1("\\w$ ", &state);
+        assert_eq!(result, "~/projects$ ");
+    }
+
+    #[test]
+    fn ps1_working_dir_basename() {
+        let mut state = empty_state();
+        state.cwd = "/home/mike/projects".into();
+        let result = expand_ps1("\\W$ ", &state);
+        assert_eq!(result, "projects$ ");
+    }
+
+    #[test]
+    fn ps1_dollar_sign_non_root() {
+        let mut state = empty_state();
+        state.env.insert("EUID".into(), "1000".into());
+        let result = expand_ps1("\\$ ", &state);
+        assert_eq!(result, "$ ");
+    }
+
+    #[test]
+    fn ps1_hash_sign_root() {
+        let mut state = empty_state();
+        state.env.insert("EUID".into(), "0".into());
+        let result = expand_ps1("\\$ ", &state);
+        assert_eq!(result, "# ");
+    }
+
+    #[test]
+    fn ps1_default_prompt_format() {
+        let mut state = empty_state();
+        state.env.insert("USER".into(), "user".into());
+        state.env.insert("HOME".into(), "/home/user".into());
+        state.env.insert("EUID".into(), "1000".into());
+        state.cwd = "/home/user".into();
+        let result = expand_ps1(DEFAULT_PS1, &state);
+        assert_eq!(result, "user@bashkit:~$ ");
+    }
+
+    #[test]
+    fn ps1_newline_and_escape() {
+        let state = empty_state();
+        let result = expand_ps1("line1\\nline2", &state);
+        assert_eq!(result, "line1\nline2");
+    }
+
+    // --- Prompt integration ---
+
+    #[test]
+    fn default_prompt_shows_cwd() {
+        let bash = test_bash();
+        let state = bash.shell_state_view();
+        let prompt = expand_ps1(DEFAULT_PS1, &state);
+        assert!(prompt.contains("user"));
+        assert!(prompt.ends_with("$ "));
+    }
+
+    // --- Exec tests ---
+
+    #[tokio::test]
+    async fn piped_input_executes_and_exits() {
+        let mut bash = test_bash();
+        let result = bash.exec("echo hello").await.unwrap();
+        assert_eq!(result.stdout, "hello\n");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn state_persists_across_exec_calls() {
+        let mut bash = test_bash();
+        bash.exec("X=42").await.unwrap();
+        let result = bash.exec("echo $X").await.unwrap();
+        assert_eq!(result.stdout, "42\n");
+    }
+
+    #[tokio::test]
+    async fn cwd_changes_persist() {
+        let mut bash = test_bash();
+        bash.exec("mkdir -p /tmp/testdir").await.unwrap();
+        bash.exec("cd /tmp/testdir").await.unwrap();
+        let state = bash.shell_state_view();
+        let prompt = expand_ps1("\\w$ ", &state);
+        assert!(prompt.contains("/tmp/testdir"));
+    }
+
+    #[tokio::test]
+    async fn tty_detection_works() {
+        let mut bash = test_bash();
+        let result = bash.exec("[ -t 0 ] && echo yes || echo no").await.unwrap();
+        assert_eq!(result.stdout, "yes\n");
+    }
+
+    #[tokio::test]
+    async fn clear_command_streams_ansi_escape_codes() {
+        let mut bash = test_bash();
+        let chunks: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chunks_cb = chunks.clone();
+        let result = bash
+            .exec_streaming(
+                "clear",
+                Box::new(move |stdout, _stderr| {
+                    if !stdout.is_empty() {
+                        chunks_cb.lock().unwrap().push(stdout.to_string());
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        let collected = chunks.lock().unwrap();
+        let output: String = collected.iter().cloned().collect();
+        assert!(
+            output.contains("\x1b[2J"),
+            "clear should emit ESC[2J: {output:?}"
+        );
+        assert!(
+            output.contains("\x1b[H"),
+            "clear should emit ESC[H: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_output_callback_invoked() {
+        let mut bash = test_bash();
+        let chunks: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chunks_cb = chunks.clone();
+        let result = bash
+            .exec_streaming(
+                "echo one; echo two",
+                Box::new(move |stdout, _stderr| {
+                    if !stdout.is_empty() {
+                        chunks_cb.lock().unwrap().push(stdout.to_string());
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        let collected = chunks.lock().unwrap();
+        assert!(!collected.is_empty());
+    }
+
+    #[test]
+    fn error_result_has_correct_exit_code() {
+        let r = error_result(130);
+        assert_eq!(r.exit_code, 130);
+        assert!(r.stdout.is_empty());
+        assert!(r.stderr.is_empty());
+    }
+
+    /// Build a Bash with an on_exit hook that stores the exit code.
+    fn test_bash_with_exit_hook() -> (bashkit::Bash, Arc<std::sync::atomic::AtomicI32>) {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let code = Arc::new(AtomicI32::new(-1));
+        let c = Arc::clone(&code);
+        let bash = bashkit::Bash::builder()
+            .tty(0, true)
+            .tty(1, true)
+            .tty(2, true)
+            .profile(bashkit::ExecutionProfile::named(
+                bashkit::ExecutionProfileName::Interactive,
+            ))
+            .on_exit(Box::new(move |event| {
+                c.store(event.code, Ordering::Relaxed);
+                bashkit::hooks::HookAction::Continue(event)
+            }))
+            .build();
+        (bash, code)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_exit_hook_fires() {
+        let (mut bash, code) = test_bash_with_exit_hook();
+        bash.exec("exit").await.unwrap();
+        assert_eq!(code.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_exit_hook_carries_code() {
+        let (mut bash, code) = test_bash_with_exit_hook();
+        bash.exec("exit 42").await.unwrap();
+        assert_eq!(code.load(std::sync::atomic::Ordering::Relaxed), 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_exit_hook_fires_in_command_list() {
+        let (mut bash, code) = test_bash_with_exit_hook();
+        bash.exec("echo bye; exit 1").await.unwrap();
+        assert_eq!(code.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_exit_hook_not_fired_for_normal_commands() {
+        let (mut bash, code) = test_bash_with_exit_hook();
+        bash.exec("echo hello").await.unwrap();
+        // Hook should not have been called — code stays at initial -1.
+        assert_eq!(code.load(std::sync::atomic::Ordering::Relaxed), -1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_exit_hook_code_truncated_to_byte() {
+        let (mut bash, code) = test_bash_with_exit_hook();
+        bash.exec("exit 256").await.unwrap();
+        // exit truncates to 0-255 via & 0xFF
+        assert_eq!(code.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    // --- Tab completion: helpers ---
+
+    /// Build a BashkitHelper wired to the given Bash instance's VFS and state.
+    fn make_helper(bash: &bashkit::Bash) -> BashkitHelper {
+        let fs = bash.fs();
+        let state = bash.shell_state_view();
+        BashkitHelper {
+            fs: Arc::clone(&fs),
+            state_fn: Box::new(move || state.clone()),
+            builtin_names: bash.builtin_names(),
+        }
+    }
+
+    // =========================================================================
+    // complete_path — unit tests
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_basic_file_match() {
+        // Regression: complete_path() called handle.block_on() which panics
+        // with "Cannot start a runtime from within a runtime" on single-thread.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/aat.txt"), b"test")
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("aa");
+        assert!(results.iter().any(|r| r == "aat.txt"), "got: {results:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_directory_gets_trailing_slash() {
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .mkdir(&std::path::PathBuf::from("/home/user/mydir"), true)
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("my");
+        assert!(
+            results.iter().any(|r| r == "mydir/"),
+            "dirs get trailing slash: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_no_match_returns_empty() {
+        let bash = test_bash();
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("zzz_nonexistent_prefix");
+        assert!(results.is_empty(), "no match should be empty: {results:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_nonexistent_directory_returns_empty() {
+        let bash = test_bash();
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("/no/such/dir/fi");
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_nested_path() {
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .mkdir(&std::path::PathBuf::from("/home/user/sub"), true)
+            .await;
+        let _ = fs
+            .write_file(
+                &std::path::PathBuf::from("/home/user/sub/file.rs"),
+                b"fn main(){}",
+            )
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("sub/fi");
+        assert!(
+            results.iter().any(|r| r == "sub/file.rs"),
+            "nested: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_absolute_path() {
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/tmp/absolute_test.txt"), b"x")
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("/tmp/abs");
+        assert!(
+            results.iter().any(|r| r == "/tmp/absolute_test.txt"),
+            "absolute: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_dot_prefixed_hidden_files() {
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/.hidden"), b"")
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path(".hid");
+        assert!(
+            results.iter().any(|r| r == ".hidden"),
+            "hidden files: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_multiple_matches_sorted() {
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/foo_b.txt"), b"")
+            .await;
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/foo_a.txt"), b"")
+            .await;
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/foo_c.txt"), b"")
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("foo_");
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results,
+            vec!["foo_a.txt", "foo_b.txt", "foo_c.txt"],
+            "sorted"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_path_mixed_files_and_dirs() {
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/mix_file"), b"")
+            .await;
+        let _ = fs
+            .mkdir(&std::path::PathBuf::from("/home/user/mix_dir"), true)
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("mix_");
+        assert!(results.contains(&"mix_dir/".to_string()));
+        assert!(results.contains(&"mix_file".to_string()));
+    }
+
+    // =========================================================================
+    // Completer::complete — word parsing and position detection
+    // =========================================================================
+
+    // NOTE: rustyline::Context is not publicly constructable, so we test the
+    // Completer logic through complete_path + state_fn helpers. For full
+    // Completer::complete coverage we use integration tests below.
+
+    // =========================================================================
+    // Runtime safety — the core of the fix
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_safe_on_current_thread_runtime() {
+        // The exact scenario that caused the original abort.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/aat.txt"), b"test")
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("aa");
+        assert!(results.iter().any(|r| r.contains("aat.txt")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_safe_on_multi_thread_runtime() {
+        // Verify no panic on multi-threaded runtime either.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/mt.txt"), b"data")
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("mt");
+        assert!(results.iter().any(|r| r == "mt.txt"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_concurrent_from_multiple_threads() {
+        // Simulate rapid concurrent completions — must not panic or deadlock.
+        let bash = test_bash();
+        let fs = bash.fs();
+        for i in 0..20 {
+            let _ = fs
+                .write_file(
+                    &std::path::PathBuf::from(format!("/home/user/cc_{i:02}.txt")),
+                    b"",
+                )
+                .await;
+        }
+        let helper = Arc::new(make_helper(&bash));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let h = Arc::clone(&helper);
+                std::thread::spawn(move || {
+                    // Each thread enters a runtime context to match the real
+                    // interactive scenario (rustyline calls Completer from the
+                    // runtime thread).
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let _guard = rt.enter();
+                    h.complete_path("cc_")
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let results = handle.join().expect("thread panicked during completion");
+            assert_eq!(results.len(), 20, "each thread sees all 20 files");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_stress_rapid_successive() {
+        // Hammer completion 50 times in a row — must never panic.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/stress.txt"), b"")
+            .await;
+        let helper = make_helper(&bash);
+        for _ in 0..50 {
+            let results = helper.complete_path("str");
+            assert!(results.iter().any(|r| r == "stress.txt"));
+        }
+    }
+
+    // =========================================================================
+    // Security tests — tab completion must respect sandbox boundaries
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_path_traversal_stays_in_vfs() {
+        // THREAT[TM-ESC]: Tab-completing ../../ must not leak real host paths.
+        let bash = test_bash();
+        let fs = bash.fs();
+        // Create a file at the VFS root to prove we resolve within VFS
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/canary.txt"), b"")
+            .await;
+        let helper = make_helper(&bash);
+
+        // Attempt traversal — should resolve within VFS, not escape to host
+        let results = helper.complete_path("../../can");
+        // Whether it finds it or not, it must not panic and must not
+        // return real host paths like /etc/passwd.
+        for r in &results {
+            assert!(!r.contains("passwd"), "must not leak host files: {r}");
+            assert!(!r.contains("shadow"), "must not leak host files: {r}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_does_not_leak_host_filesystem() {
+        // THREAT[TM-ESC]: Completing /etc/ must not show real host entries.
+        let bash = test_bash();
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("/etc/pass");
+        // VFS has no /etc/passwd by default — must be empty
+        assert!(
+            !results.iter().any(|r| r.contains("passwd")),
+            "must not expose host /etc/passwd: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_does_not_leak_host_proc() {
+        // THREAT[TM-INF]: /proc should not expose host process info.
+        let bash = test_bash();
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("/proc/");
+        // VFS doesn't have /proc — should be empty
+        assert!(results.is_empty(), "must not expose /proc: {results:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_special_chars_in_filename() {
+        // THREAT[TM-INJ]: Filenames with shell metacharacters must not cause
+        // injection when completed. Verify they're returned as-is.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(
+                &std::path::PathBuf::from("/home/user/file with spaces.txt"),
+                b"",
+            )
+            .await;
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/file;rm -rf.txt"), b"")
+            .await;
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/file$(cmd).txt"), b"")
+            .await;
+        let helper = make_helper(&bash);
+
+        let results = helper.complete_path("file");
+        // All three files should be returned as literal strings
+        assert!(
+            results.iter().any(|r| r.contains("spaces")),
+            "spaces: {results:?}"
+        );
+        assert!(
+            results.iter().any(|r| r.contains(";rm")),
+            "semicolon: {results:?}"
+        );
+        assert!(
+            results.iter().any(|r| r.contains("$(cmd)")),
+            "subshell: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_unicode_filenames() {
+        // THREAT[TM-UNI]: Unicode filenames must not cause panics or garbled output.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/日本語.txt"), b"")
+            .await;
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/émojis🎉.txt"), b"")
+            .await;
+        let helper = make_helper(&bash);
+
+        let results = helper.complete_path("日");
+        assert!(
+            results.iter().any(|r| r == "日本語.txt"),
+            "CJK: {results:?}"
+        );
+
+        let results2 = helper.complete_path("émo");
+        assert!(
+            results2.iter().any(|r| r.contains("émojis")),
+            "emoji: {results2:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_deeply_nested_path_no_stackoverflow() {
+        // THREAT[TM-DOS]: Deeply nested completion should not stack-overflow.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let mut deep = String::from("/home/user");
+        for i in 0..50 {
+            deep.push_str(&format!("/d{i}"));
+            let _ = fs.mkdir(&std::path::PathBuf::from(&deep), true).await;
+        }
+        let _ = fs
+            .write_file(&std::path::PathBuf::from(format!("{deep}/target.txt")), b"")
+            .await;
+        let helper = make_helper(&bash);
+
+        // Complete the deepest level
+        let partial = format!("{}/tar", &deep["/home/user/".len()..]);
+        let results = helper.complete_path(&partial);
+        assert!(
+            results.iter().any(|r| r.contains("target.txt")),
+            "deep: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_very_long_filename() {
+        // THREAT[TM-DOS]: Extremely long filenames should not cause issues.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let long_name = "a".repeat(200);
+        let _ = fs
+            .write_file(
+                &std::path::PathBuf::from(format!("/home/user/{long_name}.txt")),
+                b"",
+            )
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path(&long_name[..10]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ends_with(".txt"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_large_directory_no_crash() {
+        // THREAT[TM-DOS]: Directory with many entries should complete without crash.
+        let bash = test_bash();
+        let fs = bash.fs();
+        for i in 0..200 {
+            let _ = fs
+                .write_file(
+                    &std::path::PathBuf::from(format!("/home/user/bulk_{i:04}.txt")),
+                    b"",
+                )
+                .await;
+        }
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("bulk_");
+        assert_eq!(results.len(), 200, "should find all 200 entries");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_symlink_in_vfs() {
+        // Symlinks should complete and show the link, not follow through to host.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(
+                &std::path::PathBuf::from("/home/user/real_file.txt"),
+                b"data",
+            )
+            .await;
+        let _ = fs
+            .symlink(
+                &std::path::PathBuf::from("/home/user/real_file.txt"),
+                &std::path::PathBuf::from("/home/user/link_file.txt"),
+            )
+            .await;
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("link_");
+        // Should show the symlink as a completion candidate (or be empty if
+        // symlinks aren't listed — either is safe, just no crash).
+        for r in &results {
+            assert!(!r.contains(".."), "no traversal via symlink: {r}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_empty_partial_lists_cwd_entries() {
+        // Completing an empty string should not panic.
+        let bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/visible.txt"), b"")
+            .await;
+        let helper = make_helper(&bash);
+        // empty prefix — matches everything in cwd
+        let results = helper.complete_path("");
+        assert!(
+            results.iter().any(|r| r == "visible.txt"),
+            "empty: {results:?}"
+        );
+    }
+
+    // =========================================================================
+    // Integration tests — full bash state + completion interaction
+    // =========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integration_cd_changes_completion_scope() {
+        // After cd, completion should reflect the new directory.
+        let mut bash = test_bash();
+        let fs = bash.fs();
+        let _ = fs
+            .mkdir(&std::path::PathBuf::from("/home/user/proj"), true)
+            .await;
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/proj/main.rs"), b"")
+            .await;
+        let _ = fs
+            .write_file(&std::path::PathBuf::from("/home/user/proj/lib.rs"), b"")
+            .await;
+
+        bash.exec("cd /home/user/proj").await.unwrap();
+
+        // Rebuild helper with updated state after cd
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("ma");
+        assert!(
+            results.iter().any(|r| r == "main.rs"),
+            "after cd: {results:?}"
+        );
+
+        // Old cwd files should not appear
+        let results2 = helper.complete_path("proj");
+        assert!(
+            results2.is_empty(),
+            "should not see parent entries: {results2:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integration_mkdir_then_complete() {
+        // Files created via bash exec should be completable.
+        let mut bash = test_bash();
+        bash.exec("mkdir -p /home/user/dynamic_dir").await.unwrap();
+        bash.exec("echo hello > /home/user/dynamic_dir/dyn.txt")
+            .await
+            .unwrap();
+
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("dynamic_dir/dy");
+        assert!(
+            results.iter().any(|r| r.contains("dyn.txt")),
+            "dynamic: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integration_variable_completion_via_helper() {
+        // Variable completion (tested through complete_path won't cover this,
+        // but we can verify via state_fn).
+        let mut bash = test_bash();
+        bash.exec("MY_CUSTOM_VAR=hello").await.unwrap();
+        bash.exec("export EXPORTED_VAR=world").await.unwrap();
+        let state = bash.shell_state_view();
+
+        // Verify state contains our variables (used by $VAR completion in complete())
+        assert!(
+            state.variables.contains_key("MY_CUSTOM_VAR")
+                || state.env.contains_key("MY_CUSTOM_VAR"),
+            "custom var in state"
+        );
+        assert!(
+            state.env.contains_key("EXPORTED_VAR"),
+            "exported var in state"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integration_alias_visible_in_state() {
+        // Aliases should be available in shell state for completion.
+        let mut bash = test_bash();
+        bash.exec("alias ll='ls -la'").await.unwrap();
+        let state = bash.shell_state_view();
+        assert!(
+            state.aliases.contains_key("ll"),
+            "alias in state: {:?}",
+            state.aliases.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integration_rm_file_then_complete() {
+        // After removing a file, it should no longer appear in completions.
+        let mut bash = test_bash();
+        bash.exec("touch /home/user/ephemeral.txt").await.unwrap();
+
+        let helper = make_helper(&bash);
+        let before = helper.complete_path("ephem");
+        assert!(!before.is_empty(), "file exists before rm");
+
+        bash.exec("rm /home/user/ephemeral.txt").await.unwrap();
+        let helper2 = make_helper(&bash);
+        let after = helper2.complete_path("ephem");
+        assert!(after.is_empty(), "file gone after rm: {after:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integration_completion_after_script_creates_many_files() {
+        // Script that creates files — completion should see them all.
+        let mut bash = test_bash();
+        bash.exec("for i in $(seq 1 10); do touch /home/user/batch_$i.log; done")
+            .await
+            .unwrap();
+        let helper = make_helper(&bash);
+        let results = helper.complete_path("batch_");
+        assert_eq!(results.len(), 10, "all 10 batch files: {results:?}");
+    }
+
+    // --- Source RC ---
+
+    #[tokio::test]
+    async fn source_rc_is_disabled_by_default() {
+        let mut bash = test_bash();
+        let fs = bash.fs();
+        let rc = std::path::PathBuf::from(RC_FILE);
+        let _ = fs.write_file(&rc, b"MY_RC_VAR=loaded\n").await;
+        source_rc_file(&mut bash).await;
+        let result = bash.exec("echo $MY_RC_VAR").await.unwrap();
+        assert_eq!(result.stdout, "\n");
+    }
+
+    #[tokio::test]
+    async fn source_rc_can_be_enabled_explicitly() {
+        let mut bash = test_bash();
+        let fs = bash.fs();
+        let rc = std::path::PathBuf::from(RC_FILE);
+        let _ = fs.write_file(&rc, b"MY_RC_VAR=loaded\n").await;
+        bash.exec("export BASHKIT_SOURCE_RC=1").await.unwrap();
+        source_rc_file(&mut bash).await;
+        let result = bash.exec("echo $MY_RC_VAR").await.unwrap();
+        assert_eq!(result.stdout, "loaded\n");
+    }
+}

@@ -1,0 +1,207 @@
+
+# cargo-vet audits file
+
+[[audits.aws-lc-sys]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+version = "0.39.1"
+
+[[audits.clap]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "4.6.0 -> 4.6.1"
+notes = "Reviewed delta: version/dependency metadata plus generated env! guard for derive defaults; clap remains unsafe-forbidden and no new ambient capabilities."
+
+[[audits.clap_derive]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "4.6.0 -> 4.6.1"
+notes = "Reviewed delta: derive macro emits compile-time env! guards for Cargo metadata and otherwise metadata/dependency updates; crate forbids unsafe code and adds no new runtime capabilities."
+
+[[audits.ctor]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.0 -> 0.10.1"
+notes = "Reviewed delta: macro support refactor adds explicit unsafe/no_warn handling, priority support, and dtor integration; linker-section and atexit behavior remains explicit, documented, and does not introduce new attacker-controlled ambient capabilities."
+
+[[audits.ctor-proc-macro]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.0.7 -> 0.0.13"
+notes = "Reviewed delta: crate metadata only; generated code behavior is unchanged."
+
+[[audits.dtor]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.3.0 -> 0.8.1"
+notes = "Reviewed delta: native atexit/__cxa_atexit helpers are exposed with unsafe APIs and used by macros; callbacks remain caller-supplied function pointers with documented lifecycle hazards and no new untrusted input handling."
+
+[[audits.dtor-proc-macro]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.0.6 -> 0.0.13"
+notes = "Reviewed delta: crate metadata only; generated code behavior is unchanged."
+
+[[audits.fancy-regex]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.17.0 -> 0.18.0"
+notes = "Reviewed delta: adds Oniguruma-compatible syntax, absent repeater, CRLF/newline handling, and subroutine calls; no Rust unsafe added, parser nesting/backtracking limits remain, subroutine expansion is bounded and analysis rejects left/unbounded recursion."
+
+[[audits.fastrand]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.get-size-derive2]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.7.4 -> 0.9.0"
+notes = "Reviewed delta: published crate changes only version metadata; derive macro source is unchanged and introduces no new generated code behavior or ambient capabilities."
+
+[[audits.get-size2]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.7.4 -> 0.9.0"
+notes = "Reviewed delta: adds optional GetSize impls for dashmap, half, and parking_lot plus test refactors; no filesystem/process/network capabilities, and lock access is limited to normal Mutex/RwLock guards."
+
+[[audits.gloo-timers]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Reviewed complete crate: thin wasm-bindgen wrappers around host setTimeout/setInterval with RAII cancellation, plus futures channels. No Rust unsafe code, filesystem/network/process access, or attacker-controlled ambient capabilities; unchecked_ref casts wasm-bindgen Closure handles to the JavaScript Function type they represent."
+
+[[audits.hybrid-array]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+version = "0.4.9"
+
+[[audits.iri-string]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+version = "0.7.12"
+
+[[audits.jiter]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.13.0 -> 0.15.0"
+notes = "Reviewed delta: number parsing API refactor, NumberFloat export, Rust 2024 explicit unsafe blocks, and string-cache allocation moved off stack; no new filesystem/process/network capabilities, existing SIMD/PyString unsafe paths remain bounded by parser checks and ASCII preconditions."
+
+[[audits.napi]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "3.8.4 -> 3.8.5"
+notes = "Reviewed delta: iterator prototype setup moves to class registration, threadsafe callback error handling preserves causes and avoids shutdown panics, and new unsafe N-API calls operate on env/value handles obtained from Node without new ambient capabilities."
+
+[[audits.napi-derive]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "3.5.3 -> 3.5.4"
+notes = "Reviewed delta: dependency metadata updates for ctor/napi backend only; proc-macro source unchanged."
+
+[[audits.napi-derive-backend]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "5.0.2 -> 5.0.3"
+notes = "Reviewed delta: register_class call now forwards async iterator metadata; no new filesystem/process/network capabilities and generated N-API unsafe shape remains through existing napi abstractions."
+
+[[audits.rand]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+delta = "0.8.5 -> 0.8.6"
+notes = "Reviewed delta: backports RUSTSEC-2026-0097 fix by removing rand logging callbacks, panics on reseed failure instead of logging, removes experimental SIMD support, and keeps public RNG behavior otherwise compatible; no new ambient capabilities."
+
+[[audits.rand]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+delta = "0.10.0 -> 0.10.1"
+
+[[audits.russh]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+delta = "0.60.0 -> 0.60.1"
+notes = "Reviewed delta: bounds keyboard-interactive auth response allocation/iteration by remaining packet data, adjusts PKCS#8 salt size, and adds roundtrip coverage; no new unsafe code or ambient capability changes."
+
+[[audits.russh]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+delta = "0.62.4 -> 0.62.5"
+notes = "Reviewed delta: rejects channel-scoped messages unless the SSH channel is confirmed, and bounds queued application output when channel windows are exhausted; no unsafe code or new ambient capabilities, with regression and backpressure coverage."
+
+[[audits.russh]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+delta = "0.62.5 -> 0.62.6"
+notes = "Reviewed delta: routes channel-open replies through a dedicated priority queue drained ahead of the bounded receivers, so a confirmation can no longer be silently dropped by a full queue or be overtaken by data for a channel that is not registered yet; enforces the server-side max_auth_attempts cap with a DISCONNECT while keeping publickey probes uncounted; and tolerates exactly one trailing comma in name-lists for OpenSSH interop, still rejecting a bare comma and a doubled separator. No new unsafe code (unchanged single occurrence), no new dependencies, and no ambient capability changes; each behaviour change lands with test coverage."
+
+[[audits.rustls-webpki]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+delta = "0.103.12 -> 0.103.13"
+notes = "Reviewed delta: fixes BIT STRING/CRL parsing edge cases and preserves fail-closed URI constraint handling; no new unsafe code or ambient capability changes."
+
+[[audits.thin-vec]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "0.2.16 -> 0.2.18"
+notes = "Reviewed delta: no_std feature compatibility fixes and std-to-core path changes in gecko-ffi code; no new allocation semantics, unsafe behavior, or ambient capabilities."
+
+[[audits.tokio]]
+who = "Mykhailo Chalyi <mike@chaliy.name>"
+criteria = "safe-to-deploy"
+delta = "1.51.0 -> 1.51.1"
+
+[[audits.tokio]]
+who = "Mykhailo Chalyi <mykhailo.chalyi-contractor@procore.com>"
+criteria = "safe-to-deploy"
+delta = "1.52.0 -> 1.52.1"
+notes = "Reviewed delta: reverts blocking-pool sharded queue to mutex/condvar VecDeque to fix spawn_blocking hang, adjusts fastrand cfg, and adds no new unsafe blocks or ambient capabilities."
+
+[[trusted.serde_spanned]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-01-20"
+end = "2027-05-16"
+notes = "Trusted Ed Page for the TOML crate family versions in this dependency bump; Mozilla cargo-vet imports also trust this publisher."
+
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-12-25"
+end = "2027-05-16"
+notes = "Trusted Alice Ryhl for Tokio patch releases in this dependency bump; Mozilla cargo-vet imports also trust this publisher."
+
+[[trusted.toml]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-12-14"
+end = "2027-05-16"
+notes = "Trusted Ed Page for the TOML crate family versions in this dependency bump; Mozilla cargo-vet imports also trust this publisher."
+
+[[trusted.toml_datetime]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-10-21"
+end = "2027-05-16"
+notes = "Trusted Ed Page for the TOML crate family versions in this dependency bump; Mozilla cargo-vet imports also trust this publisher."
+
+[[trusted.toml_parser]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-07-08"
+end = "2027-05-16"
+notes = "Trusted Ed Page for the TOML parser version in this dependency bump; Mozilla cargo-vet imports also trust this publisher."
+
+[[trusted.toml_writer]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-07-08"
+end = "2027-05-16"
+notes = "Trusted Ed Page for the TOML crate family versions in this dependency bump; Mozilla cargo-vet imports also trust this publisher."
+
+[[trusted.winnow]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-02-22"
+end = "2027-05-16"
+notes = "Trusted Ed Page for the parser dependency versions in this TOML dependency bump; Mozilla cargo-vet imports also trust this publisher."

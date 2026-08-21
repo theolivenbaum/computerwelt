@@ -1,0 +1,209 @@
+//! `vendored.toml` schema — declarative inventory of uucore modules
+//! vendored into bashkit by `bashkit-coreutils-port port-module`, plus
+//! per-import substitution policy.
+//!
+//! Single-source-of-truth: the drift workflow iterates this manifest
+//! to re-port every entry against uutils HEAD. Adding a new vendored
+//! module is one TOML stanza.
+//!
+//! Schema:
+//!
+//! ```toml
+//! # Top-level: list of modules. Each entry is one porting target.
+//! [[modules]]
+//! name = "format"                              # unique id, used on CLI
+//! source = "src/uucore/src/lib/features/format" # under <UUTILS_DIR>; file or dir
+//! out = "format"                               # under generated/; file or dir
+//!
+//! # `substitutions` declare how to handle uucore-internal `use` imports
+//! # encountered while porting. Any uucore-internal `use` path that does
+//! # not match a substitution prefix aborts the port — silent emission of
+//! # broken imports is rejected.
+//! [[modules.substitutions]]
+//! prefix = "uucore::error::UError"  # leading-segment match against the use path
+//! action = "error"                  # forbid the import outright
+//!
+//! [[modules.substitutions]]
+//! prefix = "uucore::extendedbigdecimal"
+//! action = "inline"                 # vendor the source defining this type too
+//! inline_source = "src/uucore/src/lib/features/extendedbigdecimal.rs"
+//!
+//! [[modules.substitutions]]
+//! prefix = "uucore::error::UError"
+//! action = "replace_with"           # rewrite the import to a bashkit-side type
+//! target = "crate::error::Error"
+//!
+//! [[modules.substitutions]]
+//! prefix = "uucore::translate"
+//! action = "fluent"                 # resolve translate!() at port time
+//! ftl_sources = ["src/uucore/locales/en-US.ftl"]
+//! ```
+//!
+//! Action support, current implementation:
+//!
+//! - `error` — fully implemented (port aborts when matched).
+//! - `replace_with` — fully implemented. The matched prefix in every
+//!   `use` path is rewritten to `target`. When the rewritten path's
+//!   final segment differs from the original, an `as <orig>` rename is
+//!   inserted so call sites compile unchanged. Use groups are
+//!   flattened into individual `use` items as a side effect.
+//! - `inline` — fully implemented. The file at `inline_source` is
+//!   vendored next to the module's output dir (under
+//!   `<out_base>/<leaf>.rs` where `<leaf>` is the prefix's final
+//!   segment), and matching `use` paths are rewritten to
+//!   `super::<leaf>::…` so the vendored module compiles. The
+//!   inlined file goes through the same enforce + rewrite pipeline
+//!   so transitive uucore references either substitute or surface.
+//! - `fluent` — fully implemented. Opts one uucore i18n macro
+//!   (`translate!` / `translate_text!`) into port-time resolution
+//!   against the `ftl_sources` message files: the `use` item is
+//!   dropped and every invocation folds to a `String` literal (or a
+//!   `format!` when the message carries `{ $placeable }` slots).
+//!   Keeps Fluent out of bashkit's runtime while letting modules that
+//!   only use flat messages stay vendorable. Missing keys, selectors,
+//!   and non-literal keys abort the port rather than emit wrong text.
+
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, Default)]
+pub struct Manifest {
+    #[serde(default)]
+    pub modules: Vec<Module>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Module {
+    pub name: String,
+    pub source: String,
+    pub out: String,
+    #[serde(default)]
+    pub substitutions: Vec<Substitution>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct Substitution {
+    pub prefix: String,
+    pub action: Action,
+    /// `replace_with`: replacement prefix.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// `inline`: source path (relative to uutils dir) of the file
+    /// that defines the substituted type.
+    #[serde(default)]
+    pub inline_source: Option<String>,
+    /// `fluent`: message files (relative to uutils dir) searched, in
+    /// order, for the keys this macro resolves. Merged across every
+    /// `fluent` substitution in the module, matching uucore's runtime
+    /// behaviour of resolving against one bundle.
+    #[serde(default)]
+    pub ftl_sources: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Inline,
+    ReplaceWith,
+    Error,
+    Fluent,
+}
+
+impl Action {
+    #[allow(dead_code)] // Kept for diagnostic strings that don't currently consume it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Inline => "inline",
+            Action::ReplaceWith => "replace_with",
+            Action::Error => "error",
+            Action::Fluent => "fluent",
+        }
+    }
+}
+
+impl Manifest {
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    pub fn find(&self, name: &str) -> Option<&Module> {
+        self.modules.iter().find(|m| m.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_minimal() {
+        let m = Manifest::parse("").unwrap();
+        assert!(m.modules.is_empty());
+    }
+
+    #[test]
+    fn parses_full_entry() {
+        let toml = r#"
+[[modules]]
+name = "format"
+source = "src/uucore/src/lib/features/format"
+out = "format"
+
+[[modules.substitutions]]
+prefix = "uucore::error::UError"
+action = "error"
+
+[[modules.substitutions]]
+prefix = "uucore::extendedbigdecimal"
+action = "inline"
+inline_source = "src/uucore/src/lib/features/extendedbigdecimal.rs"
+
+[[modules.substitutions]]
+prefix = "uucore::error::SomeOther"
+action = "replace_with"
+target = "crate::error::Other"
+"#;
+        let m = Manifest::parse(toml).unwrap();
+        assert_eq!(m.modules.len(), 1);
+        let entry = m.find("format").unwrap();
+        assert_eq!(entry.source, "src/uucore/src/lib/features/format");
+        assert_eq!(entry.substitutions.len(), 3);
+        assert_eq!(entry.substitutions[0].action, Action::Error);
+        assert_eq!(entry.substitutions[1].action, Action::Inline);
+        assert_eq!(entry.substitutions[2].action, Action::ReplaceWith);
+    }
+
+    #[test]
+    fn parses_fluent_action_with_sources() {
+        let toml = r#"
+[[modules]]
+name = "format"
+source = "src/uucore/src/lib/features/format"
+out = "format"
+
+[[modules.substitutions]]
+prefix = "crate::translate"
+action = "fluent"
+ftl_sources = ["src/uucore/locales/en-US.ftl", "src/uucore/locales/errors/en-US.ftl"]
+"#;
+        let m = Manifest::parse(toml).unwrap();
+        let sub = &m.find("format").unwrap().substitutions[0];
+        assert_eq!(sub.action, Action::Fluent);
+        assert_eq!(sub.ftl_sources.len(), 2);
+    }
+
+    #[test]
+    fn rejects_unknown_action() {
+        let toml = r#"
+[[modules]]
+name = "x"
+source = "x"
+out = "x"
+
+[[modules.substitutions]]
+prefix = "uucore::x"
+action = "nope"
+"#;
+        assert!(Manifest::parse(toml).is_err());
+    }
+}

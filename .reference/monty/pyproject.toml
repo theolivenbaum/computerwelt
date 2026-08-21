@@ -1,0 +1,233 @@
+[project]
+name = "monty-workspace"
+version = "0"
+requires-python = ">=3.10"
+
+[tool.uv.workspace]
+members = ["crates/monty-python", "crates/monty-runtime", "packages/pydantic-monty"]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.34.0",
+    "maturin>=1.9.4,<2.0",
+    "mypy>=2.1.0",
+    "ruff>=0.14.7",
+    "duckdb>=1.0.0",
+    "httpx>=0.28.1",
+    "playwright>=1.58.0",
+    "beautifulsoup4>=4.14.3",
+    "logfire>=4.25.0",
+    "devtools>=0.12.2",
+    "pydantic-ai-slim[anthropic,openai]>=1.63.0",
+    "websockets>=14",
+]
+
+# https://beta.ruff.rs/docs/configuration/
+[tool.ruff]
+line-length = 120
+include = [
+    "scripts/**/*.py",
+    "crates/**/*.py",
+    "crates/**/*.pyi",
+]
+# Exclude files with intentional syntax errors or special formatting requirements
+extend-exclude = [
+    "crates/monty/test_cases/function__err_duplicate_param.py",
+    "crates/monty/test_cases/nonlocal__error_module_level.py",
+    "crates/monty/test_cases/traceback__nonlocal_module_scope.py",
+    # These files test specific quote styles in error messages and must not be reformatted
+    "crates/monty/test_cases/type__float_repr_newline.py",
+    "crates/monty/test_cases/type__float_repr_both_quotes.py",
+    # Irregular spacing in the `class` header is the point of the test — locating
+    # the `class` keyword must not depend on it being exactly one space
+    "crates/monty/test_cases/decorator__class_body_traceback.py",
+]
+
+[tool.uv]
+# this is a monorepo without a root package
+package = false
+# https://docs.astral.sh/uv/reference/settings/#exclude-newer
+# make sure to use relative durations:
+exclude-newer = "7 days"
+
+[tool.ruff.lint]
+extend-select = [
+    "Q",      # https://docs.astral.sh/ruff/rules/#flake8-quotes-q
+    "RUF100", # https://docs.astral.sh/ruff/rules/unused-noqa/
+    "I",      # https://docs.astral.sh/ruff/rules/#isort-i
+    "FA",     # https://docs.astral.sh/ruff/rules/#flake8-future-annotations-fa
+]
+flake8-quotes = { inline-quotes = "single", multiline-quotes = "double" }
+mccabe = { max-complexity = 14 }
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["pydantic_monty"]
+
+[tool.ruff.lint.per-file-ignores]
+"crates/monty/test_cases/*.py" = [
+    "E722", # bare except - needed for testing try/except with bare except clauses
+    "E711", # Comparison to `None` should be `cond is None`
+    "E712", # Comparison to True/False - needed for testing boolean behavior
+    "E714", # Test for object identity should be `is not`
+    "E721", # Use `is` and `is not` for type comparisons, or `isinstance()` for isinstance checks
+    "E731", # Do not assign a lambda expression, use a def - needed for testing lambda expressions
+    "F541", # f-string without any placeholders
+    "F601", # duplicate dict literal key - tests duplicate-key replacement behavior
+    "F632", # ignore replace `is` with `==` - we have lots of these tests
+    "F701", # break outside loop - needed for testing break error handling
+    "F702", # continue not properly in loop - needed for testing continue error handling
+    "F704", # await outside function - needed for testing top-level async/await
+    "F811", # Redefinition of unused variable
+    "F821", # traceback undefined call test intentionally uses undefined name
+    "F823", # chained-assign test intentionally reads a local before its first assignment
+    "F841", # unused variable - needed for testing exception variable cleanup
+    "F401", # Intentionally imports unknown typing constructs to test silent ignore behavior
+    "F403", # star import test intentionally uses `from sys import *`
+    "F407", # unknown `__future__` feature - the point of the test is that it's a SyntaxError
+    "E402", # Typing test file has multiple import sections to test different import patterns
+    "E401", # Multiple imports on one line - needed for testing `import a, b` syntax
+    "I001", # Import block unsorted - needed for testing `import a, b` syntax
+]
+
+"crates/monty/test_cases/class__annotations.py" = [
+    # Scoped to this file so the single-quote convention stays enforced across
+    # the other test cases: these tests exist to prove that double-quoted
+    # annotations normalize to single quotes exactly as CPython's does.
+    "Q000", # double quotes are the subject of the test, not a style slip
+    "F722", # `e: "it's"` is a string literal under test, not a forward reference
+]
+
+"crates/monty-typeshed/vendor/typeshed/stdlib/**/*.pyi" = [
+    "F403", # unable to detect undefined names
+    "F821", # Undefined name
+]
+# Monty's narrowed replacement stubs keep upstream typeshed's structure verbatim
+# (e.g. the `from _collections_abc import *` fallback branch), so mirror the
+# vendored exemptions rather than diverging from upstream.
+"crates/monty-typeshed/custom/**/*.pyi" = [
+    "F403", # unable to detect undefined names
+    "F821", # Undefined name
+]
+"crates/monty-type-checking/tests/good_types.py" = [
+    "F704", # await outside function - needed for testing top-level async/await
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "single"
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
+reportUnnecessaryTypeIgnoreComment = true
+include = ["scripts", "crates/monty/test_cases", "crates/monty-python", "crates/monty-type-checking", "examples"]
+exclude = [
+    "crates/monty-type-checking/tests/bad_types.py",
+    "crates/monty-type-checking/tests/reveal_types.py",
+    # duplicate parameter name test intentionally has a syntax error
+    "crates/monty/test_cases/function__err_duplicate_param.py",
+    # annotation quote-normalization test: `e: "it's"` is a string literal under
+    # test, which pyright reads as a malformed forward reference
+    "crates/monty/test_cases/class__annotations.py",
+    # `break`/`return`/`continue` exiting a `finally` block (PEP 765) is the
+    # behavior under test; basedpyright rejects it unconditionally
+    "crates/monty/test_cases/async__control_flow.py",
+    "crates/monty/test_cases/refcount__finally_swallow.py",
+    "crates/monty/test_cases/try_finally__control_flow.py",
+    # break/continue outside loop tests intentionally test error handling
+    "crates/monty/test_cases/loop__break_outside_error.py",
+    "crates/monty/test_cases/loop__continue_outside_error.py",
+    "crates/monty/test_cases/loop__break_in_function_error.py",
+    "crates/monty/test_cases/loop__continue_in_function_error.py",
+    "crates/monty/test_cases/loop__break_in_if_error.py",
+    "crates/monty/test_cases/loop__continue_in_if_error.py",
+    "scripts/startup_performance.py",
+    "examples/web_scraper/example_code.py",
+]
+venv = ".venv"
+
+# we include tests cases in type checking then switch off all rules that break
+# so the files don't show as errors in the IDE
+[[tool.pyright.executionEnvironments]]
+root = "crates/monty/test_cases"
+reportUnusedExpression = false
+reportOperatorIssue = false
+reportGeneralTypeIssues = false
+reportMissingImports = false
+reportUnknownMemberType = false
+reportUnnecessaryComparison = false
+reportUnnecessaryIsInstance = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnhashable = false
+reportCallIssue = false
+reportUnknownParameterType = false
+reportMissingParameterType = false
+reportUnknownLambdaType = false
+reportArgumentType = false
+# iter mode tests use external functions defined in the test runner
+reportUndefinedVariable = false
+# loop variable persistence tests have "possibly unbound" variables
+reportPossiblyUnboundVariable = false
+# exception variable cleanup tests intentionally access unbound variables
+reportUnboundVariable = false
+# attribute error tests intentionally access/assign non-existent attributes
+reportAttributeAccessIssue = false
+# decorator tests deliberately use untyped decorators (incl. bare lambdas)
+reportUntypedClassDecorator = false
+reportUntypedFunctionDecorator = false
+# unused variables, classes, functions and imports are fine in test cases —
+# e.g. the walrus-in-decorator tests decorate a throwaway `def f(): pass`, the
+# same way the class-side ones decorate a throwaway `class C: pass`
+reportUnusedVariable = false
+reportUnusedClass = false
+reportUnusedFunction = false
+reportUnusedImport = false
+reportDuplicateImport = false
+reportAssignmentType = false
+reportFunctionMemberAccess = false
+# ~bool is deprecated in Python 3.16 but valid in 3.14
+reportDeprecated = false
+# star import test intentionally uses `from sys import *`
+reportWildcardImportFromLibrary = false
+# some test cases intentionally exercise invalid index assignment/runtime error paths
+reportIndexIssue = false
+# dunder tests intentionally return the wrong type (e.g. `__repr__` returning int)
+reportIncompatibleMethodOverride = false
+# collections.namedtuple factory tests use the functional form, not class-based NamedTuple
+reportUntypedNamedTuple = false
+# `break`/`return`/`continue` inside `with` tests bind through Optional outer
+# variables that pyright can't narrow.
+reportOptionalMemberAccess = false
+
+[[tool.pyright.executionEnvironments]]
+root = "crates/monty-type-checking"
+reportUnnecessaryIsInstance = false
+
+# mypy is only used by `mypy.stubtest` (see Makefile `lint-py`); these settings
+# keep it from traversing the whole monorepo when building the stub graph.
+[tool.mypy]
+files = ["crates/monty-python/python/pydantic_monty"]
+exclude = [
+    "crates/monty-typeshed/",
+    "crates/monty/test_cases/",
+    "crates/monty-type-checking/",
+    "examples/",
+    "playground/",
+    "target/",
+]
+
+[tool.codespell]
+# Ref: https://github.com/codespell-project/codespell#using-a-config-file
+ignore-words-list = 'crate,NotIn,ser,IST,Nd,afterAll,beforeAll,deques'
+skip = [
+    "Cargo.lock",
+    "crates/monty-js/package-lock.json",
+
+    "crates/monty-typeshed/vendor/typeshed/stdlib/*",
+    "crates/monty/src/types/str.rs",
+]
+
+[tool.inline-snapshot]
+format-command="ruff format --stdin-filename {filename}"

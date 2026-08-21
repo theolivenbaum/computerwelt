@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Computerwelt.Cli/Computerwelt.Cli.csproj" />
+    <Project Path="src/Computerwelt.Emulation.Bash/Computerwelt.Emulation.Bash.csproj" />
+    <Project Path="src/Computerwelt/Computerwelt.csproj" />
+    <Project Path="src/Computerwelt.Emulation.Python.Cli/Computerwelt.Emulation.Python.Cli.csproj" />
+    <Project Path="src/Computerwelt.Emulation.Python/Computerwelt.Emulation.Python.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Computerwelt.Emulation.Bash.SpecTests/Computerwelt.Emulation.Bash.SpecTests.csproj" />
+    <Project Path="tests/Computerwelt.Emulation.Bash.Tests/Computerwelt.Emulation.Bash.Tests.csproj" />
+    <Project Path="tests/Computerwelt.Tests/Computerwelt.Tests.csproj" />
+    <Project Path="tests/Computerwelt.Emulation.Python.SpecTests/Computerwelt.Emulation.Python.SpecTests.csproj" />
+    <Project Path="tests/Computerwelt.Emulation.Python.Tests/Computerwelt.Emulation.Python.Tests.csproj" />
+  </Folder>
+</Solution>

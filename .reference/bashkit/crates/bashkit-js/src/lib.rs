@@ -1,0 +1,4107 @@
+// napi macros generate code that triggers some clippy lints
+#![allow(clippy::needless_pass_by_value, clippy::trivially_copy_pass_by_ref)]
+
+//! Node.js/TypeScript bindings for the Bashkit sandboxed bash interpreter.
+//!
+//! Exposes `Bash` (core interpreter), `BashTool` (interpreter + LLM metadata),
+//! and `ExecResult` via napi-rs for use from JavaScript/TypeScript.
+//!
+//! # Safety: `Arc<SharedState>` pattern
+//!
+//! Both `Bash` and `BashTool` wrap all mutable state in `Arc<SharedState>`.
+//! Every `#[napi]` method clones the `Arc` *before* doing any blocking or async
+//! work. This prevents CodeQL `rust/access-invalid-pointer` alerts caused by
+//! holding a raw-pointer-derived `&self` across `block_on` or `.await` points.
+
+use bashkit::interop::fs::{
+    BashkitFsAbiHandleV1, BashkitFsAbiOwnedHandleV1, export_filesystem, import_filesystem,
+};
+use bashkit::tool::VERSION;
+use bashkit::{
+    Bash as RustBash, BashTool as RustBashTool, Builtin, BuiltinContext, BuiltinRegistry,
+    Credential, ExecResult as RustExecResult, ExecutionLimits, ExtFunctionResult,
+    FileSystem as BashFileSystem, FileType, InMemoryFs, Metadata, MontyObject, NetworkAllowlist,
+    OutputCallback, PosixFs, PythonExternalFnHandler, RealFs, RealFsMode,
+    ScriptedTool as RustScriptedTool, SnapshotOptions as RustSnapshotOptions, Tool, ToolArgs,
+    ToolDef, ToolRequest, async_trait,
+};
+use bashkit::{
+    CapabilityFingerprint as RustCapabilityFingerprint, CheckoutPolicy as RustCheckoutPolicy,
+    CommitOptions as RustCommitOptions, ObjectId as RustObjectId,
+    SnapshotGraph as RustSnapshotGraph,
+};
+use napi::bindgen_prelude::External;
+use napi::{Env, JsValue, Unknown, ValueType, sys};
+use napi_derive::napi;
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::mem::{MaybeUninit, size_of};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+// ---------------------------------------------------------------------------
+// Shared tokio runtime + concurrency limiter for JS tool callbacks (issue #982).
+// A single multi-thread runtime is created lazily and reused for every callback
+// invocation, replacing the previous pattern of spawning an unbounded number of
+// OS threads each with its own single-threaded runtime. A semaphore caps the
+// maximum number of concurrent in-flight callbacks to prevent DoS.
+// ---------------------------------------------------------------------------
+const MAX_CONCURRENT_TOOL_CALLBACKS: usize = 10;
+// Decision: JS async execute() is per-instance serialized by RustBash, so only
+// a small bounded backlog is useful. Bound it before awaiting the mutex so
+// pending futures cannot retain unbounded command strings.
+const MAX_PENDING_ASYNC_EXECUTIONS: usize = 8;
+const ASYNC_EXECUTE_QUEUE_FULL_ERROR: &str =
+    "too many pending async execute calls for this instance";
+
+fn callback_runtime() -> &'static tokio::runtime::Runtime {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to create shared callback runtime")
+    })
+}
+
+fn callback_semaphore() -> &'static tokio::sync::Semaphore {
+    use std::sync::OnceLock;
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLBACKS))
+}
+
+// Decision: reject same-instance onOutput re-entry at the binding boundary so
+// sync paths fail with a JS error instead of deadlocking or panicking.
+const ON_OUTPUT_REENTRY_ERROR: &str = "onOutput cannot re-enter the same Bash instance; use collected output or another Bash instance for live access";
+
+// Decision: surface the executeSync+custom-builtin deadlock as a normal script
+// error instead of a silent hang. executeSync blocks the JS event loop via
+// block_on, but a JsCustomBuiltinAdapter dispatches its callback over a
+// threadsafe function that requires the loop to be free — the call would never
+// resolve. Detect that case and fail the builtin with exit 1 + a clear message
+// so the user sees a real error and can migrate to async execute().
+const SYNC_BUILTIN_DEADLOCK_ERROR: &str = "custom builtins require execute() (async). executeSync() would deadlock because the JS event loop is blocked while the synchronous call is in flight";
+
+// Decision: ScriptedTool tool callbacks also dispatch through Node's event
+// loop. Reject registered-tool execution from executeSync before queueing the
+// callback so untrusted scripts cannot hang the process indefinitely.
+const SYNC_SCRIPTED_TOOL_DEADLOCK_ERROR: &str = "registered tools require execute() (async). executeSync() would deadlock because the JS event loop is blocked while the synchronous call is in flight";
+
+struct OnOutputReentryScope {
+    depth: Arc<AtomicUsize>,
+}
+
+impl OnOutputReentryScope {
+    fn enter(depth: Arc<AtomicUsize>) -> Self {
+        depth.fetch_add(1, Ordering::SeqCst);
+        Self { depth }
+    }
+}
+
+impl Drop for OnOutputReentryScope {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reject_on_output_reentry(state: &Arc<SharedState>) -> napi::Result<()> {
+    if state.on_output_reentry_depth.load(Ordering::SeqCst) > 0 {
+        return Err(napi::Error::from_reason(ON_OUTPUT_REENTRY_ERROR));
+    }
+    Ok(())
+}
+
+struct SyncExecuteScope {
+    depth: Arc<AtomicUsize>,
+}
+
+impl SyncExecuteScope {
+    fn enter(depth: Arc<AtomicUsize>) -> Self {
+        depth.fetch_add(1, Ordering::SeqCst);
+        Self { depth }
+    }
+}
+
+impl Drop for SyncExecuteScope {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// ============================================================================
+// MontyObject <-> JSON conversion
+// ============================================================================
+
+#[allow(dead_code)]
+fn monty_to_json(obj: &MontyObject) -> serde_json::Value {
+    match obj {
+        MontyObject::None => serde_json::Value::Null,
+        MontyObject::Bool(b) => serde_json::Value::Bool(*b),
+        MontyObject::Int(i) => serde_json::json!(*i),
+        MontyObject::BigInt(b) => serde_json::Value::String(b.to_string()),
+        MontyObject::Float(f) => serde_json::json!(*f),
+        MontyObject::String(s) | MontyObject::Path(s) => serde_json::Value::String(s.clone()),
+        MontyObject::Bytes(b) => serde_json::Value::String(base64_encode(b)),
+        MontyObject::Tuple(items) | MontyObject::List(items) => {
+            serde_json::Value::Array(items.iter().map(monty_to_json).collect())
+        }
+        MontyObject::Set(items) | MontyObject::FrozenSet(items) => {
+            serde_json::Value::Array(items.iter().map(monty_to_json).collect())
+        }
+        MontyObject::Dict(pairs) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs.clone() {
+                let key = match &k {
+                    MontyObject::String(s) => s.clone(),
+                    other => format!("{}", monty_to_json(other)),
+                };
+                map.insert(key, monty_to_json(&v));
+            }
+            serde_json::Value::Object(map)
+        }
+        MontyObject::NamedTuple {
+            field_names,
+            values,
+            ..
+        } => {
+            let mut map = serde_json::Map::new();
+            for (name, value) in field_names.iter().zip(values.iter()) {
+                map.insert(name.clone(), monty_to_json(value));
+            }
+            serde_json::Value::Object(map)
+        }
+        other => serde_json::Value::String(other.py_repr()),
+    }
+}
+
+#[allow(dead_code)]
+fn json_to_monty(val: &serde_json::Value) -> MontyObject {
+    match val {
+        serde_json::Value::Null => MontyObject::None,
+        serde_json::Value::Bool(b) => MontyObject::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                MontyObject::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                MontyObject::Float(f)
+            } else {
+                MontyObject::None
+            }
+        }
+        serde_json::Value::String(s) => MontyObject::String(s.clone()),
+        serde_json::Value::Array(arr) => MontyObject::List(arr.iter().map(json_to_monty).collect()),
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<(MontyObject, MontyObject)> = map
+                .iter()
+                .map(|(k, v)| (MontyObject::String(k.clone()), json_to_monty(v)))
+                .collect();
+            MontyObject::dict(pairs)
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[(n >> 18 & 63) as usize] as char);
+        result.push(CHARS[(n >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[(n >> 6 & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+// ============================================================================
+// FileMetadata + JsDirEntry + JsFileSystem
+// ============================================================================
+
+/// Metadata for a VFS entry, returned by `stat()` and `readDir()`.
+#[napi(object)]
+pub struct FileMetadata {
+    pub file_type: String,
+    pub size: f64,
+    pub mode: u32,
+    pub modified: f64,
+    pub created: f64,
+}
+
+/// Directory entry with name and metadata.
+#[napi(object)]
+pub struct JsDirEntry {
+    pub name: String,
+    pub metadata: FileMetadata,
+}
+
+fn metadata_to_js(meta: &Metadata) -> FileMetadata {
+    let file_type = match meta.file_type {
+        FileType::File => "file",
+        FileType::Directory => "directory",
+        FileType::Symlink => "symlink",
+        FileType::Fifo => "fifo",
+    }
+    .to_string();
+    FileMetadata {
+        file_type,
+        size: meta.size as f64,
+        mode: meta.mode,
+        modified: meta
+            .modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        created: meta
+            .created
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+    }
+}
+
+/// Direct VFS accessor — bypasses shell command parsing for file operations.
+///
+/// Obtained via `bash.fs()` or `bashTool.fs()`. All methods are synchronous
+/// and block until the underlying async VFS operation completes.
+#[derive(Clone)]
+enum FileSystemHandle {
+    Static(Arc<dyn BashFileSystem>),
+    Live(Arc<SharedState>),
+}
+
+// Decision: keep filesystem handles opaque in Node. `FileSystem.toExternal()`
+// returns a native N-API External carrying `BashkitFsAbiOwnedHandleV1`; JS never
+// receives mutable handle bytes or function pointers.
+pub struct NativeFileSystemState {
+    inner: FileSystemHandle,
+}
+
+impl NativeFileSystemState {
+    fn new() -> Self {
+        Self::from_static(Arc::new(InMemoryFs::new()))
+    }
+
+    fn from_static(fs: Arc<dyn BashFileSystem>) -> Self {
+        Self {
+            inner: FileSystemHandle::Static(fs),
+        }
+    }
+
+    fn from_live(state: Arc<SharedState>) -> Self {
+        Self {
+            inner: FileSystemHandle::Live(state),
+        }
+    }
+
+    fn with_fs<T, Fut>(&self, f: impl FnOnce(Arc<dyn BashFileSystem>) -> Fut) -> napi::Result<T>
+    where
+        Fut: std::future::Future<Output = napi::Result<T>>,
+    {
+        match &self.inner {
+            FileSystemHandle::Static(fs) => callback_runtime().block_on(f(fs.clone())),
+            FileSystemHandle::Live(state) => block_on_with(state, |s| async move {
+                let bash = s.inner.lock().await;
+                f(bash.fs()).await
+            }),
+        }
+    }
+
+    fn export_fs(&self) -> napi::Result<Arc<dyn BashFileSystem>> {
+        self.with_fs(|fs| async move { Ok(fs) })
+    }
+}
+
+unsafe extern "C" fn finalize_owned_file_system_handle(
+    _env: sys::napi_env,
+    data: *mut c_void,
+    _hint: *mut c_void,
+) {
+    if !data.is_null() {
+        unsafe {
+            drop(Box::from_raw(data.cast::<BashkitFsAbiOwnedHandleV1>()));
+        }
+    }
+}
+
+fn napi_status_result(status: sys::napi_status, action: &str) -> napi::Result<()> {
+    if status == sys::Status::napi_ok {
+        return Ok(());
+    }
+    Err(napi::Error::from_reason(format!(
+        "{action} failed with napi status {status}"
+    )))
+}
+
+fn create_file_system_external(
+    env: &Env,
+    handle: BashkitFsAbiOwnedHandleV1,
+) -> napi::Result<Unknown<'static>> {
+    let raw_handle = Box::into_raw(Box::new(handle));
+    let mut raw_external = ptr::null_mut();
+    let status = unsafe {
+        sys::napi_create_external(
+            env.raw(),
+            raw_handle.cast::<c_void>(),
+            Some(finalize_owned_file_system_handle),
+            ptr::null_mut(),
+            &mut raw_external,
+        )
+    };
+    if let Err(err) = napi_status_result(status, "create filesystem external") {
+        unsafe {
+            drop(Box::from_raw(raw_handle));
+        }
+        return Err(err);
+    }
+    Ok(unsafe { Unknown::from_raw_unchecked(env.raw(), raw_external) })
+}
+
+fn file_system_external_handle(external: Unknown<'_>) -> napi::Result<BashkitFsAbiHandleV1> {
+    if external.get_type()? != ValueType::External {
+        return Err(napi::Error::from_reason(
+            "filesystem external must be a native External token",
+        ));
+    }
+    let value = external.value();
+    let mut raw_external = ptr::null_mut();
+    let status = unsafe { sys::napi_get_value_external(value.env, value.value, &mut raw_external) };
+    napi_status_result(status, "read filesystem external")?;
+    if raw_external.is_null() {
+        return Err(napi::Error::from_reason(
+            "filesystem external must not be null",
+        ));
+    }
+    let mut handle = MaybeUninit::<BashkitFsAbiHandleV1>::uninit();
+    unsafe {
+        ptr::copy_nonoverlapping(
+            raw_external.cast::<u8>(),
+            handle.as_mut_ptr().cast::<u8>(),
+            size_of::<BashkitFsAbiHandleV1>(),
+        );
+        Ok(handle.assume_init())
+    }
+}
+
+fn import_external_file_system(external: Unknown<'_>) -> napi::Result<Arc<dyn BashFileSystem>> {
+    let handle = file_system_external_handle(external)?;
+    // SAFETY: `external` was created by export_external_file_system; the
+    // ABI handle inside it is valid as long as the external value lives.
+    unsafe { import_filesystem(&handle) }.map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+impl NativeFileSystemState {
+    #[allow(deprecated)] // FileSystem.real is an intentionally synchronous JS factory.
+    fn real(
+        host_path: String,
+        writable: Option<bool>,
+        allowed_mount_paths: Option<Vec<String>>,
+    ) -> napi::Result<Self> {
+        let is_writable = writable.unwrap_or(false);
+        if is_writable {
+            eprintln!(
+                "bashkit: warning: writable mount at {} — scripts can modify host files",
+                host_path
+            );
+        }
+        enforce_mount_policy(
+            allowed_mount_paths.as_deref(),
+            &host_path,
+            "FileSystem.real",
+        )?;
+        let mode = if is_writable {
+            RealFsMode::ReadWrite
+        } else {
+            RealFsMode::ReadOnly
+        };
+        let backend =
+            RealFs::new(&host_path, mode).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let fs: Arc<dyn BashFileSystem> = Arc::new(PosixFs::new(backend));
+        Ok(Self::from_static(fs))
+    }
+
+    fn import_external(external: Unknown<'_>) -> napi::Result<Self> {
+        let fs = import_external_file_system(external)?;
+        Ok(Self::from_static(fs))
+    }
+
+    fn to_external(&self, env: Env) -> napi::Result<Unknown<'static>> {
+        let fs = self.export_fs()?;
+        let handle = export_filesystem(fs).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        create_file_system_external(&env, handle)
+    }
+
+    fn read_file(&self, path: String) -> napi::Result<String> {
+        self.with_fs(|fs| async move {
+            let bytes = fs
+                .read_file(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            String::from_utf8(bytes)
+                .map_err(|e| napi::Error::from_reason(format!("Invalid UTF-8: {e}")))
+        })
+    }
+
+    fn write_file(&self, path: String, content: String) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.write_file(Path::new(&path), content.as_bytes())
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn append_file(&self, path: String, content: String) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.append_file(Path::new(&path), content.as_bytes())
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn mkdir(&self, path: String, recursive: Option<bool>) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.mkdir(Path::new(&path), recursive.unwrap_or(false))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn remove(&self, path: String, recursive: Option<bool>) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.remove(Path::new(&path), recursive.unwrap_or(false))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn stat(&self, path: String) -> napi::Result<FileMetadata> {
+        self.with_fs(|fs| async move {
+            let meta = fs
+                .stat(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(metadata_to_js(&meta))
+        })
+    }
+
+    fn exists(&self, path: String) -> napi::Result<bool> {
+        self.with_fs(|fs| async move {
+            fs.exists(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn read_dir(&self, path: String) -> napi::Result<Vec<JsDirEntry>> {
+        self.with_fs(|fs| async move {
+            let entries = fs
+                .read_dir(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(entries
+                .iter()
+                .map(|e| JsDirEntry {
+                    name: e.name.clone(),
+                    metadata: metadata_to_js(&e.metadata),
+                })
+                .collect())
+        })
+    }
+
+    fn symlink(&self, target: String, link: String) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.symlink(Path::new(&target), Path::new(&link))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn read_link(&self, path: String) -> napi::Result<String> {
+        self.with_fs(|fs| async move {
+            let target = fs
+                .read_link(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(target.to_string_lossy().to_string())
+        })
+    }
+
+    fn chmod(&self, path: String, mode: u32) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.chmod(Path::new(&path), mode)
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn rename(&self, from_path: String, to_path: String) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.rename(Path::new(&from_path), Path::new(&to_path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn copy(&self, from_path: String, to_path: String) -> napi::Result<()> {
+        self.with_fs(|fs| async move {
+            fs.copy(Path::new(&from_path), Path::new(&to_path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+}
+
+impl Default for NativeFileSystemState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[napi(js_name = "__createFileSystem")]
+pub fn create_file_system() -> External<NativeFileSystemState> {
+    External::new(NativeFileSystemState::new())
+}
+
+#[napi(js_name = "__realFileSystem")]
+pub fn real_file_system(
+    host_path: String,
+    writable: Option<bool>,
+    allowed_mount_paths: Option<Vec<String>>,
+) -> napi::Result<External<NativeFileSystemState>> {
+    Ok(External::new(NativeFileSystemState::real(
+        host_path,
+        writable,
+        allowed_mount_paths,
+    )?))
+}
+
+#[napi(js_name = "__importFileSystem")]
+pub fn import_file_system(external: Unknown<'_>) -> napi::Result<External<NativeFileSystemState>> {
+    Ok(External::new(NativeFileSystemState::import_external(
+        external,
+    )?))
+}
+
+#[napi(js_name = "__fileSystemToExternal")]
+pub fn file_system_to_external(
+    fs: &External<NativeFileSystemState>,
+    env: Env,
+) -> napi::Result<Unknown<'static>> {
+    fs.to_external(env)
+}
+
+#[napi(js_name = "__fileSystemReadFile")]
+pub fn file_system_read_file(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+) -> napi::Result<String> {
+    fs.read_file(path)
+}
+
+#[napi(js_name = "__fileSystemWriteFile")]
+pub fn file_system_write_file(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+    content: String,
+) -> napi::Result<()> {
+    fs.write_file(path, content)
+}
+
+#[napi(js_name = "__fileSystemAppendFile")]
+pub fn file_system_append_file(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+    content: String,
+) -> napi::Result<()> {
+    fs.append_file(path, content)
+}
+
+#[napi(js_name = "__fileSystemMkdir")]
+pub fn file_system_mkdir(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+    recursive: Option<bool>,
+) -> napi::Result<()> {
+    fs.mkdir(path, recursive)
+}
+
+#[napi(js_name = "__fileSystemRemove")]
+pub fn file_system_remove(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+    recursive: Option<bool>,
+) -> napi::Result<()> {
+    fs.remove(path, recursive)
+}
+
+#[napi(js_name = "__fileSystemStat")]
+pub fn file_system_stat(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+) -> napi::Result<FileMetadata> {
+    fs.stat(path)
+}
+
+#[napi(js_name = "__fileSystemExists")]
+pub fn file_system_exists(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+) -> napi::Result<bool> {
+    fs.exists(path)
+}
+
+#[napi(js_name = "__fileSystemReadDir")]
+pub fn file_system_read_dir(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+) -> napi::Result<Vec<JsDirEntry>> {
+    fs.read_dir(path)
+}
+
+#[napi(js_name = "__fileSystemSymlink")]
+pub fn file_system_symlink(
+    fs: &External<NativeFileSystemState>,
+    target: String,
+    link: String,
+) -> napi::Result<()> {
+    fs.symlink(target, link)
+}
+
+#[napi(js_name = "__fileSystemReadLink")]
+pub fn file_system_read_link(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+) -> napi::Result<String> {
+    fs.read_link(path)
+}
+
+#[napi(js_name = "__fileSystemChmod")]
+pub fn file_system_chmod(
+    fs: &External<NativeFileSystemState>,
+    path: String,
+    mode: u32,
+) -> napi::Result<()> {
+    fs.chmod(path, mode)
+}
+
+#[napi(js_name = "__fileSystemRename")]
+pub fn file_system_rename(
+    fs: &External<NativeFileSystemState>,
+    from_path: String,
+    to_path: String,
+) -> napi::Result<()> {
+    fs.rename(from_path, to_path)
+}
+
+#[napi(js_name = "__fileSystemCopy")]
+pub fn file_system_copy(
+    fs: &External<NativeFileSystemState>,
+    from_path: String,
+    to_path: String,
+) -> napi::Result<()> {
+    fs.copy(from_path, to_path)
+}
+
+// ============================================================================
+// ExecResult
+// ============================================================================
+
+/// Result from executing bash commands.
+#[napi(object)]
+#[derive(Clone)]
+pub struct ExecResult {
+    pub stdout: String,
+    pub stdout_bytes: Vec<u8>,
+    pub stderr: String,
+    pub stderr_bytes: Vec<u8>,
+    pub exit_code: i32,
+    pub error: Option<String>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub final_env: Option<HashMap<String, String>>,
+    /// True if exit_code is 0.
+    pub success: bool,
+}
+
+/// Lightweight snapshot of shell state for inspection (prompt rendering,
+/// debugging). Mirrors the Python binding's `ShellState`; omits function
+/// definitions (use `snapshot()` for full state capture/restore).
+#[napi(object)]
+pub struct ShellState {
+    /// Environment variables.
+    pub env: HashMap<String, String>,
+    /// Shell variables (non-exported).
+    pub variables: HashMap<String, String>,
+    /// Indexed arrays: name → { index (as string) → value }. Sparse indices
+    /// are preserved, hence a map rather than a dense JS array.
+    pub arrays: HashMap<String, HashMap<String, String>>,
+    /// Associative arrays: name → { key → value }.
+    pub assoc_arrays: HashMap<String, HashMap<String, String>>,
+    /// Current working directory.
+    pub cwd: String,
+    /// Exit code of the last executed command.
+    pub last_exit_code: i32,
+    /// Shell aliases.
+    pub aliases: HashMap<String, String>,
+    /// Trap handlers keyed by signal/condition name.
+    pub traps: HashMap<String, String>,
+}
+
+fn shell_state_to_js(view: bashkit::ShellStateView) -> ShellState {
+    ShellState {
+        env: view.env,
+        variables: view.variables,
+        arrays: view
+            .arrays
+            .into_iter()
+            .map(|(name, entries)| {
+                (
+                    name,
+                    entries
+                        .into_iter()
+                        .map(|(idx, value)| (idx.to_string(), value))
+                        .collect(),
+                )
+            })
+            .collect(),
+        assoc_arrays: view.assoc_arrays,
+        cwd: view.cwd.to_string_lossy().into_owned(),
+        last_exit_code: view.last_exit_code,
+        aliases: view.aliases,
+        traps: view.traps,
+    }
+}
+
+// The native JS callback arrives as one `[stdout, stderr]` tuple payload even
+// though napi-rs models the args as `(String, String)`. Keep the public TS
+// wrapper responsible for adapting that odd FFI shape into its
+// object-shaped `{ stdout, stderr }` callback API.
+type SyncOutputFn = napi::bindgen_prelude::FunctionRef<(String, String), Option<String>>;
+type OutputTsfn = napi::threadsafe_function::ThreadsafeFunction<
+    (String, String),
+    Option<String>,
+    (String, String),
+    napi::Status,
+    false,
+    true,
+>;
+
+fn js_exec_result_from_rust(result: RustExecResult) -> ExecResult {
+    let stdout_bytes = result.stdout.as_bytes().to_vec();
+    let stderr_bytes = result.stderr.as_bytes().to_vec();
+    ExecResult {
+        stdout: result.stdout.to_string(),
+        stdout_bytes,
+        stderr: result.stderr.to_string(),
+        stderr_bytes,
+        exit_code: result.exit_code,
+        error: None,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
+        final_env: result.final_env,
+        success: result.exit_code == 0,
+    }
+}
+
+fn js_exec_result_from_error(err: impl ToString) -> ExecResult {
+    let msg = err.to_string();
+    ExecResult {
+        stdout: String::new(),
+        stdout_bytes: Vec::new(),
+        stderr: msg.clone(),
+        stderr_bytes: msg.as_bytes().to_vec(),
+        exit_code: 1,
+        error: Some(msg),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        final_env: None,
+        success: false,
+    }
+}
+
+fn js_exec_result_from_bash_result(result: bashkit::Result<RustExecResult>) -> ExecResult {
+    match result {
+        Ok(result) => js_exec_result_from_rust(result),
+        Err(err) => js_exec_result_from_error(err),
+    }
+}
+
+fn callback_error_reason(err: impl ToString) -> String {
+    format!("onOutput callback failed: {}", err.to_string())
+}
+
+fn record_callback_error(
+    callback_error: &StdMutex<Option<String>>,
+    cancelled: &Arc<AtomicBool>,
+    callback_requested_cancel: &Arc<AtomicBool>,
+    message: String,
+) {
+    if let Ok(mut callback_error) = callback_error.lock()
+        && callback_error.is_none()
+    {
+        *callback_error = Some(message);
+    }
+    if !cancelled.swap(true, Ordering::SeqCst) {
+        callback_requested_cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+fn take_callback_error(callback_error: &StdMutex<Option<String>>) -> Option<napi::Error> {
+    callback_error
+        .lock()
+        .ok()
+        .and_then(|mut callback_error| callback_error.take())
+        .map(napi::Error::from_reason)
+}
+
+fn build_sync_output_callback(
+    env_raw: usize,
+    on_output: SyncOutputFn,
+    cancelled: Arc<AtomicBool>,
+    callback_requested_cancel: Arc<AtomicBool>,
+    callback_error: Arc<StdMutex<Option<String>>>,
+    on_output_reentry_depth: Arc<AtomicUsize>,
+) -> OutputCallback {
+    Box::new(move |stdout_chunk, stderr_chunk| {
+        let has_error = callback_error
+            .lock()
+            .map(|callback_error| callback_error.is_some())
+            .unwrap_or(false);
+        if has_error {
+            return;
+        }
+
+        let env = napi::Env::from_raw(env_raw as napi::sys::napi_env);
+        let callback = match on_output.borrow_back(&env) {
+            Ok(callback) => callback,
+            Err(err) => {
+                record_callback_error(
+                    &callback_error,
+                    &cancelled,
+                    &callback_requested_cancel,
+                    callback_error_reason(err),
+                );
+                return;
+            }
+        };
+
+        let _reentry_scope = OnOutputReentryScope::enter(on_output_reentry_depth.clone());
+        match callback.call((stdout_chunk.to_string(), stderr_chunk.to_string())) {
+            Ok(Some(err)) => {
+                record_callback_error(
+                    &callback_error,
+                    &cancelled,
+                    &callback_requested_cancel,
+                    callback_error_reason(err),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                record_callback_error(
+                    &callback_error,
+                    &cancelled,
+                    &callback_requested_cancel,
+                    callback_error_reason(err),
+                );
+            }
+        }
+    })
+}
+
+fn build_async_output_callback(
+    tsfn: Arc<OutputTsfn>,
+    cancelled: Arc<AtomicBool>,
+    callback_requested_cancel: Arc<AtomicBool>,
+    on_output_reentry_depth: Arc<AtomicUsize>,
+) -> (OutputCallback, Arc<StdMutex<Option<String>>>) {
+    let callback_error = Arc::new(StdMutex::new(None));
+    let callback_error_output = callback_error.clone();
+    let cancelled_output = cancelled.clone();
+    let callback_requested_cancel_output = callback_requested_cancel.clone();
+
+    let output_callback: OutputCallback = Box::new(move |stdout_chunk, stderr_chunk| {
+        let has_error = callback_error_output
+            .lock()
+            .map(|callback_error| callback_error.is_some())
+            .unwrap_or(false);
+        if has_error {
+            return;
+        }
+
+        let stdout = stdout_chunk.to_string();
+        let stderr = stderr_chunk.to_string();
+        let tsfn = tsfn.clone();
+        let on_output_reentry_depth = on_output_reentry_depth.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // OutputCallback in core bashkit is synchronous. Dispatch onto the
+        // shared callback runtime, then block until JS finishes so callback
+        // errors abort execution immediately and chunk ordering stays stable.
+        callback_runtime().spawn(async move {
+            let result: Result<Option<String>, String> = {
+                let _reentry_scope = OnOutputReentryScope::enter(on_output_reentry_depth);
+                tsfn.call_async((stdout, stderr))
+                    .await
+                    .map_err(callback_error_reason)
+            };
+            let _ = tx.send(result);
+        });
+
+        match rx.recv() {
+            Ok(Ok(Some(err))) => {
+                record_callback_error(
+                    &callback_error_output,
+                    &cancelled_output,
+                    &callback_requested_cancel_output,
+                    callback_error_reason(err),
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                record_callback_error(
+                    &callback_error_output,
+                    &cancelled_output,
+                    &callback_requested_cancel_output,
+                    err,
+                );
+            }
+            Err(_) => {
+                record_callback_error(
+                    &callback_error_output,
+                    &cancelled_output,
+                    &callback_requested_cancel_output,
+                    "onOutput callback failed: callback channel closed".to_string(),
+                );
+            }
+        }
+    });
+
+    (output_callback, callback_error)
+}
+
+fn create_output_tsfn(
+    on_output: napi::bindgen_prelude::Function<'_, (String, String), Option<String>>,
+) -> napi::Result<Arc<OutputTsfn>> {
+    let tsfn = on_output
+        .build_threadsafe_function::<(String, String)>()
+        .weak::<true>()
+        .build()?;
+    Ok(Arc::new(tsfn))
+}
+
+async fn execute_rust_bash(
+    bash: &mut RustBash,
+    commands: &str,
+    output_callback: Option<OutputCallback>,
+    callback_error: Option<&Arc<StdMutex<Option<String>>>>,
+    cancelled: Option<&Arc<AtomicBool>>,
+    callback_requested_cancel: Option<&Arc<AtomicBool>>,
+) -> napi::Result<ExecResult> {
+    let result = if let Some(output_callback) = output_callback {
+        bash.exec_streaming(commands, output_callback).await
+    } else {
+        bash.exec(commands).await
+    };
+
+    if let Some(callback_error) = callback_error
+        && let Some(err) = take_callback_error(callback_error)
+    {
+        if let Some((cancelled, callback_requested_cancel)) =
+            cancelled.zip(callback_requested_cancel)
+            && callback_requested_cancel.load(Ordering::SeqCst)
+        {
+            cancelled.store(false, Ordering::SeqCst);
+        }
+        return Err(err);
+    }
+
+    Ok(js_exec_result_from_bash_result(result))
+}
+
+// ============================================================================
+// MountConfig + BashOptions
+// ============================================================================
+
+/// Configuration for a real filesystem mount.
+#[napi(object)]
+#[derive(Clone)]
+pub struct MountConfig {
+    /// Host filesystem path to mount.
+    pub host_path: String,
+    /// VFS path where mount appears (defaults to host_path).
+    pub vfs_path: Option<String>,
+    /// If true, mount is read-write (default: false → read-only).
+    pub writable: Option<bool>,
+}
+
+/// A single HTTP header (name/value pair) for credential injection.
+#[napi(object)]
+#[derive(Clone)]
+pub struct CredentialHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Credential injected into outbound HTTP requests matching `pattern`.
+///
+/// `kind` selects the shape: `"bearer"` (requires `token`), `"header"`
+/// (requires `name` + `value`), or `"headers"` (requires `headers`).
+/// Scripts never see the secret — it is attached on the wire only.
+#[napi(object)]
+#[derive(Clone)]
+pub struct NetworkCredential {
+    /// URL pattern the credential applies to (e.g. `https://api.example.com/**`).
+    pub pattern: String,
+    /// One of `"bearer"`, `"header"`, `"headers"`.
+    pub kind: String,
+    /// Bearer token (for `kind: "bearer"`).
+    pub token: Option<String>,
+    /// Header name (for `kind: "header"`).
+    pub name: Option<String>,
+    /// Header value (for `kind: "header"`).
+    pub value: Option<String>,
+    /// Header list (for `kind: "headers"`).
+    pub headers: Option<Vec<CredentialHeader>>,
+}
+
+/// Placeholder-mode credential injection: `env` is set to an opaque
+/// placeholder value visible to scripts; outbound requests matching
+/// `pattern` have the placeholder replaced with the real credential.
+#[napi(object)]
+#[derive(Clone)]
+pub struct NetworkCredentialPlaceholder {
+    /// Environment variable that receives the placeholder value.
+    pub env: String,
+    /// URL pattern the credential applies to.
+    pub pattern: String,
+    /// One of `"bearer"`, `"header"`, `"headers"`.
+    pub kind: String,
+    /// Bearer token (for `kind: "bearer"`).
+    pub token: Option<String>,
+    /// Header name (for `kind: "header"`).
+    pub name: Option<String>,
+    /// Header value (for `kind: "header"`).
+    pub value: Option<String>,
+    /// Header list (for `kind: "headers"`).
+    pub headers: Option<Vec<CredentialHeader>>,
+}
+
+/// Outbound network configuration (enables `curl`/`wget`).
+///
+/// Must specify either `allow` (list of URL patterns) or `allowAll: true`,
+/// not both. `blockPrivateIps` defaults to `true`.
+#[napi(object)]
+#[derive(Clone)]
+pub struct NetworkOptions {
+    /// URL patterns permitted for outbound requests.
+    pub allow: Option<Vec<String>>,
+    /// Allow all outbound requests (mutually exclusive with `allow`).
+    pub allow_all: Option<bool>,
+    /// Block requests resolving to private/loopback IPs (default: true).
+    pub block_private_ips: Option<bool>,
+    /// Credentials injected transparently into matching requests.
+    pub credentials: Option<Vec<NetworkCredential>>,
+    /// Placeholder-mode credential injection (see type docs).
+    pub credential_placeholders: Option<Vec<NetworkCredentialPlaceholder>>,
+}
+
+/// Build a core [`Credential`] from the kind-discriminated option fields.
+/// Mirrors the Python binding's `parse_credential_spec` validation rules.
+fn credential_from_parts(
+    label: &str,
+    kind: &str,
+    token: Option<&String>,
+    name: Option<&String>,
+    value: Option<&String>,
+    headers: Option<&Vec<CredentialHeader>>,
+) -> napi::Result<Credential> {
+    let invalid = |msg: String| -> napi::Result<Credential> { Err(napi::Error::from_reason(msg)) };
+    match kind {
+        "bearer" => {
+            let Some(token) = token else {
+                return invalid(format!("network.{label}: kind 'bearer' requires 'token'"));
+            };
+            if name.is_some() || value.is_some() || headers.is_some() {
+                return invalid(format!(
+                    "network.{label}: kind 'bearer' accepts only 'token'"
+                ));
+            }
+            Ok(Credential::bearer(token.clone()))
+        }
+        "header" => {
+            let (Some(name), Some(value)) = (name, value) else {
+                return invalid(format!(
+                    "network.{label}: kind 'header' requires 'name' and 'value'"
+                ));
+            };
+            if name.is_empty() {
+                return invalid(format!(
+                    "network.{label}: 'name' must be a non-empty header name"
+                ));
+            }
+            if token.is_some() || headers.is_some() {
+                return invalid(format!(
+                    "network.{label}: kind 'header' accepts only 'name' and 'value'"
+                ));
+            }
+            Ok(Credential::header(name.clone(), value.clone()))
+        }
+        "headers" => {
+            let Some(headers) = headers else {
+                return invalid(format!(
+                    "network.{label}: kind 'headers' requires 'headers'"
+                ));
+            };
+            if headers.is_empty() {
+                return invalid(format!(
+                    "network.{label}: 'headers' must contain at least one entry"
+                ));
+            }
+            if token.is_some() || name.is_some() || value.is_some() {
+                return invalid(format!(
+                    "network.{label}: kind 'headers' accepts only 'headers'"
+                ));
+            }
+            if let Some(idx) = headers.iter().position(|h| h.name.is_empty()) {
+                return invalid(format!(
+                    "network.{label}: headers[{idx}] name must be a non-empty header name"
+                ));
+            }
+            Ok(Credential::headers(
+                headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        other => invalid(format!(
+            "network.{label}: unknown kind '{other}' (expected 'bearer', 'header', or 'headers')"
+        )),
+    }
+}
+
+/// Validate `NetworkOptions` up front so `build_bash_from_state` (also used
+/// by `reset()`) can apply them infallibly later.
+fn validate_network_options(net: &NetworkOptions) -> napi::Result<()> {
+    let allow_all = net.allow_all.unwrap_or(false);
+    if allow_all && net.allow.is_some() {
+        return Err(napi::Error::from_reason(
+            "network: 'allow' and 'allowAll' are mutually exclusive",
+        ));
+    }
+    if !allow_all && net.allow.is_none() {
+        return Err(napi::Error::from_reason(
+            "network: must provide 'allow' (list of URL patterns) or 'allowAll: true'",
+        ));
+    }
+    for (idx, cred) in net.credentials.iter().flatten().enumerate() {
+        credential_from_parts(
+            &format!("credentials[{idx}]"),
+            &cred.kind,
+            cred.token.as_ref(),
+            cred.name.as_ref(),
+            cred.value.as_ref(),
+            cred.headers.as_ref(),
+        )?;
+    }
+    for (idx, ph) in net.credential_placeholders.iter().flatten().enumerate() {
+        if ph.env.is_empty() {
+            return Err(napi::Error::from_reason(format!(
+                "network.credentialPlaceholders[{idx}]: 'env' must be a non-empty environment variable name"
+            )));
+        }
+        credential_from_parts(
+            &format!("credentialPlaceholders[{idx}]"),
+            &ph.kind,
+            ph.token.as_ref(),
+            ph.name.as_ref(),
+            ph.value.as_ref(),
+            ph.headers.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Apply pre-validated network options to the builder. Panics are impossible
+/// for inputs that passed [`validate_network_options`]; on the (unreachable)
+/// invalid path the credential is skipped.
+fn apply_network_options(
+    mut builder: bashkit::BashBuilder,
+    net: &NetworkOptions,
+) -> bashkit::BashBuilder {
+    let allowlist = if net.allow_all.unwrap_or(false) {
+        NetworkAllowlist::allow_all()
+    } else {
+        NetworkAllowlist::new().allow_many(net.allow.iter().flatten().cloned())
+    }
+    .block_private_ips(net.block_private_ips.unwrap_or(true));
+    builder = builder.network(allowlist);
+    for (idx, cred) in net.credentials.iter().flatten().enumerate() {
+        if let Ok(credential) = credential_from_parts(
+            &format!("credentials[{idx}]"),
+            &cred.kind,
+            cred.token.as_ref(),
+            cred.name.as_ref(),
+            cred.value.as_ref(),
+            cred.headers.as_ref(),
+        ) {
+            builder = builder.credential(&cred.pattern, credential);
+        }
+    }
+    for (idx, ph) in net.credential_placeholders.iter().flatten().enumerate() {
+        if let Ok(credential) = credential_from_parts(
+            &format!("credentialPlaceholders[{idx}]"),
+            &ph.kind,
+            ph.token.as_ref(),
+            ph.name.as_ref(),
+            ph.value.as_ref(),
+            ph.headers.as_ref(),
+        ) {
+            builder = builder.credential_placeholder(&ph.env, &ph.pattern, credential);
+        }
+    }
+    builder
+}
+
+/// Options for creating a Bash or BashTool instance.
+#[napi(object)]
+pub struct BashOptions {
+    /// Named resource-policy baseline. Individual options override its fields.
+    pub profile: Option<ExecutionProfileName>,
+    pub username: Option<String>,
+    pub hostname: Option<String>,
+    /// Initial working directory for the shell (mirrors `Bash::builder().cwd()`).
+    /// Avoids a leading `cd "$cwd"` command just to set the starting directory.
+    pub cwd: Option<String>,
+    /// Initial environment variables (mirrors `Bash::builder().env()`).
+    /// Applied before execution so scripts see them without an `export` prelude.
+    pub env: Option<HashMap<String, String>>,
+    pub max_commands: Option<u32>,
+    pub max_loop_iterations: Option<u32>,
+    pub max_total_loop_iterations: Option<u32>,
+    pub max_function_depth: Option<u32>,
+    /// Execution timeout in milliseconds.
+    pub timeout_ms: Option<u32>,
+    /// Parser timeout in milliseconds.
+    pub parser_timeout_ms: Option<u32>,
+    pub max_input_bytes: Option<u32>,
+    pub max_ast_depth: Option<u32>,
+    pub max_parser_operations: Option<u32>,
+    pub max_stdout_bytes: Option<u32>,
+    pub max_stderr_bytes: Option<u32>,
+    /// Maximum interpreter memory in bytes (variables, arrays, functions).
+    ///
+    /// Caps `max_total_variable_bytes` and clamps `max_function_body_bytes`.
+    /// Prevents OOM from untrusted input such as exponential string doubling.
+    /// Default (when omitted): 10 MB.
+    pub max_memory: Option<f64>,
+    /// Whether to capture the final environment state in ExecResult.
+    pub capture_final_env: Option<bool>,
+    /// Files to mount in the virtual filesystem.
+    /// Keys are absolute paths, values are file content strings.
+    pub files: Option<HashMap<String, String>>,
+    /// Real filesystem mounts. Each entry: { hostPath, vfsPath?, writable? }
+    pub mounts: Option<Vec<MountConfig>>,
+    /// Allowlist of host path prefixes permitted for real filesystem mounts.
+    ///
+    /// Required to use `mounts` or runtime `mount()` APIs.
+    pub allowed_mount_paths: Option<Vec<String>>,
+    /// Enable embedded Python execution (`python`/`python3` builtins).
+    pub python: Option<bool>,
+    /// Names of external functions callable from embedded Python code.
+    pub external_functions: Option<Vec<String>>,
+    /// Enable the embedded SQLite builtin (`sqlite`/`sqlite3`).
+    ///
+    /// Backed by Turso. When `true`, the binding both registers the
+    /// builtin and injects `BASHKIT_ALLOW_INPROCESS_SQLITE=1` so the
+    /// runtime gate is satisfied. Defaults to `false`.
+    pub sqlite: Option<bool>,
+    /// Outbound network configuration. When set, enables `curl`/`wget`
+    /// restricted to the configured allowlist, with optional transparent
+    /// credential injection. Omitted = network disabled.
+    pub network: Option<NetworkOptions>,
+}
+
+/// Typed named execution-profile selector.
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy)]
+pub enum ExecutionProfileName {
+    Hardened,
+    Standard,
+    Interactive,
+}
+
+impl From<ExecutionProfileName> for bashkit::ExecutionProfileName {
+    fn from(value: ExecutionProfileName) -> Self {
+        match value {
+            ExecutionProfileName::Hardened => Self::Hardened,
+            ExecutionProfileName::Standard => Self::Standard,
+            ExecutionProfileName::Interactive => Self::Interactive,
+        }
+    }
+}
+
+/// One simple command found by `analyze()`.
+///
+/// `name` and each entry of `args` are `null` when the word is not fully
+/// literal — a computed name or argument is reported as unknown, never as safe.
+#[napi(object, js_name = "AnalyzedCommand")]
+pub struct JsAnalyzedCommand {
+    /// Command name, or `null` when it is not statically known.
+    ///
+    /// `Option<Option<_>>` so the field is always present and explicitly
+    /// `null` — an omitted property would read as "no such field".
+    #[napi(ts_type = "string | null")]
+    pub name: Option<Option<String>>,
+    /// One entry per argument; `null` when not fully literal.
+    #[napi(ts_type = "Array<string | null>")]
+    pub args: Vec<Option<String>>,
+    /// `"direct"`, `"substitution"`, or `"function_body"`.
+    pub context: String,
+    /// Names of prefix assignments (`FOO=1 cmd` → `["FOO"]`).
+    pub assignments: Vec<String>,
+    /// True for a bare assignment (`FOO=1`), which names no command and hides
+    /// nothing — distinguishes it from a genuinely unknown name.
+    pub is_assignment_only: bool,
+}
+
+/// One file redirect found by `analyze()`.
+#[napi(object, js_name = "AnalyzedRedirect")]
+pub struct JsAnalyzedRedirect {
+    /// Target path, or `null` when it is not fully literal.
+    #[napi(ts_type = "string | null")]
+    pub path: Option<Option<String>>,
+    /// `"read"`, `"write"`, or `"append"`.
+    pub mode: String,
+    /// True for modes that can create or modify a file.
+    pub is_write: bool,
+}
+
+/// Result of `analyze()` — what a script statically refers to.
+///
+/// **Advisory only.** Static analysis cannot see through dynamic dispatch,
+/// `eval`, functions, or aliases; those set `isOpaque`. Enforcement stays with
+/// the builtin registry, the network allowlist, and the mount policy.
+#[napi(object, js_name = "ScriptAnalysis")]
+pub struct JsScriptAnalysis {
+    /// Every simple command, in source order.
+    pub commands: Vec<JsAnalyzedCommand>,
+    /// Every file redirect target, in source order.
+    pub redirects: Vec<JsAnalyzedRedirect>,
+    /// Function names the script defines.
+    pub functions: Vec<String>,
+    /// Distinct statically known command names, in first-seen order.
+    pub command_names: Vec<String>,
+    /// Some command name is not statically known.
+    pub has_dynamic_commands: bool,
+    /// Script contains `$(…)`, backticks, or process substitution.
+    pub has_command_substitution: bool,
+    /// Script hands a script back to the interpreter: `eval`, `source`, `.`,
+    /// or a nested `bash`/`sh`.
+    pub has_interpreter_reentry: bool,
+    /// Node budget hit — `commands` and `redirects` are incomplete.
+    pub truncated: bool,
+    /// The script hides work: dynamic command, `eval`/`source`, or truncated.
+    /// Allowlist checks must treat this as "ask the user".
+    pub is_opaque: bool,
+}
+
+fn analysis_to_js(analysis: bashkit::ScriptAnalysis) -> JsScriptAnalysis {
+    JsScriptAnalysis {
+        command_names: analysis
+            .command_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        is_opaque: analysis.is_opaque(),
+        commands: analysis
+            .commands
+            .iter()
+            .map(|c| JsAnalyzedCommand {
+                name: Some(c.name.clone()),
+                args: c.args.clone(),
+                context: c.context.as_str().to_owned(),
+                assignments: c.assignments.clone(),
+                is_assignment_only: c.is_assignment_only(),
+            })
+            .collect(),
+        redirects: analysis
+            .redirects
+            .iter()
+            .map(|r| JsAnalyzedRedirect {
+                path: Some(r.path.clone()),
+                mode: r.mode.as_str().to_owned(),
+                is_write: r.mode.is_write(),
+            })
+            .collect(),
+        functions: analysis.functions,
+        has_dynamic_commands: analysis.has_dynamic_commands,
+        has_command_substitution: analysis.has_command_substitution,
+        has_interpreter_reentry: analysis.has_interpreter_reentry,
+        truncated: analysis.truncated,
+    }
+}
+
+#[napi(object)]
+pub struct SnapshotOptions {
+    pub exclude_filesystem: Option<bool>,
+    pub exclude_functions: Option<bool>,
+    pub hmac_key: Option<napi::bindgen_prelude::Buffer>,
+}
+
+fn default_opts() -> BashOptions {
+    BashOptions {
+        username: None,
+        profile: None,
+        hostname: None,
+        cwd: None,
+        env: None,
+        max_commands: None,
+        max_loop_iterations: None,
+        max_total_loop_iterations: None,
+        max_function_depth: None,
+        timeout_ms: None,
+        parser_timeout_ms: None,
+        max_input_bytes: None,
+        max_ast_depth: None,
+        max_parser_operations: None,
+        max_stdout_bytes: None,
+        max_stderr_bytes: None,
+        max_memory: None,
+        capture_final_env: None,
+        files: None,
+        mounts: None,
+        allowed_mount_paths: None,
+        python: None,
+        external_functions: None,
+        sqlite: None,
+        network: None,
+    }
+}
+
+fn to_snapshot_options(options: Option<&SnapshotOptions>) -> RustSnapshotOptions {
+    RustSnapshotOptions {
+        exclude_filesystem: options
+            .and_then(|options| options.exclude_filesystem)
+            .unwrap_or(false),
+        exclude_functions: options
+            .and_then(|options| options.exclude_functions)
+            .unwrap_or(false),
+    }
+}
+
+fn snapshot_hmac_key(options: Option<&SnapshotOptions>) -> Option<&[u8]> {
+    options.and_then(|options| options.hmac_key.as_deref())
+}
+
+fn require_snapshot_hmac_key(options: Option<&SnapshotOptions>) -> napi::Result<&[u8]> {
+    let Some(key) = snapshot_hmac_key(options) else {
+        return Err(napi::Error::from_reason(
+            "BashTool snapshots require SnapshotOptions.hmacKey for HMAC authentication",
+        ));
+    };
+    if key.is_empty() {
+        return Err(napi::Error::from_reason(
+            "BashTool snapshots require a non-empty SnapshotOptions.hmacKey",
+        ));
+    }
+    Ok(key)
+}
+
+// ============================================================================
+// SharedState — all mutable state behind Arc to avoid raw pointer issues
+// ============================================================================
+
+struct SharedState {
+    inner: Mutex<RustBash>,
+    rt: Mutex<tokio::runtime::Runtime>,
+    cancelled: std::sync::Mutex<Arc<AtomicBool>>,
+    on_output_reentry_depth: Arc<AtomicUsize>,
+    /// Tracks whether the JS event loop is currently blocked inside an
+    /// `executeSync` call. Custom builtins dispatched through a threadsafe
+    /// function check this and fail closed instead of deadlocking on a
+    /// callback the loop can never service. See [`SYNC_BUILTIN_DEADLOCK_ERROR`].
+    in_sync_execute_depth: Arc<AtomicUsize>,
+    async_execute_semaphore: Arc<Semaphore>,
+    username: Option<String>,
+    profile: Option<ExecutionProfileName>,
+    hostname: Option<String>,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    max_commands: Option<u32>,
+    max_loop_iterations: Option<u32>,
+    max_total_loop_iterations: Option<u32>,
+    max_function_depth: Option<u32>,
+    timeout_ms: Option<u32>,
+    parser_timeout_ms: Option<u32>,
+    max_input_bytes: Option<u32>,
+    max_ast_depth: Option<u32>,
+    max_parser_operations: Option<u32>,
+    max_stdout_bytes: Option<u32>,
+    max_stderr_bytes: Option<u32>,
+    max_memory: Option<f64>,
+    capture_final_env: Option<bool>,
+    /// Constructor-provided VFS seed restored by `reset()`; runtime-created
+    /// files remain transient.
+    files: Option<HashMap<String, String>>,
+    mounts: Option<Vec<MountConfig>>,
+    allowed_mount_paths: Option<Vec<String>>,
+    python: bool,
+    sqlite: bool,
+    /// Validated network configuration (see [`validate_network_options`]).
+    network: Option<NetworkOptions>,
+    external_functions: Vec<String>,
+    external_handler: Option<ExternalHandlerArc>,
+    /// Host-owned mutable registry of custom builtins. The same handle is
+    /// passed to the bashkit builder *and* retained here so JS-side
+    /// `addBuiltin()` calls insert into the live interpreter without rebuilding
+    /// it (and without disturbing the VFS).
+    host_registry: BuiltinRegistry,
+    /// Host mutations applied *after* construction — `setEnv()` and the
+    /// runtime `mount*()` APIs.
+    ///
+    /// THREAT[TM-ISO-025]: `reset()` must not silently drop host capabilities.
+    /// Constructor options are replayed from the fields above; recording the
+    /// runtime equivalents here puts them on the same rebuild path, so a bundle
+    /// of setup installed on a live instance (mount + env + builtins, the
+    /// extension shape from issue #2291) is whole after a reset instead of
+    /// half-applied. Script-set env is deliberately *not* recorded — only what
+    /// the host asked for survives.
+    runtime_env: RuntimeEnvLog,
+    runtime_mounts: RuntimeMountLog,
+}
+
+/// Ordered log of host `setEnv()` calls, replayed on rebuild.
+///
+/// A `Vec` rather than a map so replay follows call order. One entry per key:
+/// re-setting a key replaces its entry, which keeps last-write-wins semantics
+/// and bounds the log by distinct key count — a host that calls `setEnv()` per
+/// request must not accumulate an entry per call.
+type RuntimeEnvLog = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// Ordered log of host runtime mounts, replayed on rebuild.
+type RuntimeMountLog = Arc<std::sync::Mutex<Vec<RuntimeMount>>>;
+
+/// A mount applied to a live instance, retained so `reset()` can replay it.
+#[derive(Clone)]
+enum RuntimeMount {
+    /// Host directory mount (`mount(hostPath, vfsPath, writable)`). Replayed
+    /// through the builder, the same path constructor mounts take, so the
+    /// allowlist check applies identically on every rebuild.
+    Real {
+        host_path: String,
+        vfs_path: String,
+        writable: bool,
+    },
+    /// Filesystem-handle mount (`mount(vfsPath, fs)`). The `Arc` is retained,
+    /// so a replayed mount is the *same* filesystem, not a copy — writes made
+    /// through it before the reset are still there afterwards.
+    Fs {
+        vfs_path: String,
+        fs: Arc<dyn BashFileSystem>,
+    },
+}
+
+impl RuntimeMount {
+    fn vfs_path(&self) -> &str {
+        match self {
+            RuntimeMount::Real { vfs_path, .. } | RuntimeMount::Fs { vfs_path, .. } => vfs_path,
+        }
+    }
+}
+
+/// Record a host `setEnv()` call for replay on the next rebuild.
+fn record_runtime_env(log: &RuntimeEnvLog, key: &str, value: &str) {
+    let mut entries = log.lock().expect("runtime env log poisoned");
+    entries.retain(|(existing, _)| existing != key);
+    entries.push((key.to_string(), value.to_string()));
+}
+
+/// Record a host runtime mount for replay on the next rebuild.
+///
+/// A mount at an already-recorded path replaces that record: the live VFS keeps
+/// one filesystem per mount point, so the replay must too.
+fn record_runtime_mount(log: &RuntimeMountLog, mount: RuntimeMount) {
+    let mut mounts = log.lock().expect("runtime mount log poisoned");
+    mounts.retain(|existing| existing.vfs_path() != mount.vfs_path());
+    mounts.push(mount);
+}
+
+/// Retract a recorded mount so `reset()` does not resurrect it after `unmount()`.
+fn forget_runtime_mount(log: &RuntimeMountLog, vfs_path: &str) {
+    let mut mounts = log.lock().expect("runtime mount log poisoned");
+    mounts.retain(|existing| existing.vfs_path() != vfs_path);
+}
+
+/// Wrapper for the external handler that can be stored and cloned.
+type ExternalHandlerArc = Arc<
+    dyn Fn(
+            String,
+            Vec<MontyObject>,
+            Vec<(MontyObject, MontyObject)>,
+        ) -> Pin<Box<dyn std::future::Future<Output = ExtFunctionResult> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Clone `Arc<SharedState>`, then use the runtime to block on a future that
+/// captures only the cloned Arc. This avoids holding raw `&self` across
+/// `block_on` boundaries.
+fn block_on_with<Fut, T>(
+    state: &Arc<SharedState>,
+    f: impl FnOnce(Arc<SharedState>) -> Fut,
+) -> napi::Result<T>
+where
+    Fut: std::future::Future<Output = napi::Result<T>>,
+{
+    reject_on_output_reentry(state)?;
+    let s = state.clone();
+    let rt_guard = s.rt.blocking_lock();
+    let s2 = state.clone();
+    rt_guard.block_on(f(s2))
+}
+
+fn max_input_bytes_for_state(state: &SharedState) -> usize {
+    state.max_input_bytes.map_or_else(
+        || ExecutionLimits::default().max_input_bytes,
+        |v| v as usize,
+    )
+}
+
+fn validate_async_execute_input(state: &SharedState, commands: &str) -> Option<ExecResult> {
+    let max_input_bytes = max_input_bytes_for_state(state);
+    let input_len = commands.len();
+    if input_len > max_input_bytes {
+        return Some(js_exec_result_from_error(format!(
+            "input too large: {input_len} bytes exceeds maxInputBytes {max_input_bytes}"
+        )));
+    }
+    None
+}
+
+fn acquire_async_execute_slot(state: &Arc<SharedState>) -> napi::Result<OwnedSemaphorePermit> {
+    state
+        .async_execute_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| napi::Error::from_reason(ASYNC_EXECUTE_QUEUE_FULL_ERROR))
+}
+
+fn canonicalize_path(path: &str, label: &str) -> napi::Result<PathBuf> {
+    std::fs::canonicalize(path)
+        .map_err(|e| napi::Error::from_reason(format!("Invalid {label} '{path}': {e}")))
+}
+
+fn canonicalize_allowlist(allowlist: &[String]) -> napi::Result<Vec<PathBuf>> {
+    allowlist
+        .iter()
+        .map(|path| canonicalize_path(path, "allowedMountPaths entry"))
+        .collect()
+}
+
+fn enforce_mount_policy(
+    allowlist: Option<&[String]>,
+    host_path: &str,
+    api_name: &str,
+) -> napi::Result<()> {
+    let allowlist = allowlist.ok_or_else(|| {
+        napi::Error::from_reason(format!(
+            "{api_name} requires allowedMountPaths; refusing unrestricted host filesystem mount"
+        ))
+    })?;
+    if allowlist.is_empty() {
+        return Err(napi::Error::from_reason(
+            "allowedMountPaths cannot be empty when using real filesystem mounts".to_string(),
+        ));
+    }
+    let canonical_host = canonicalize_path(host_path, "host_path")?;
+    let canonical_allowlist = canonicalize_allowlist(allowlist)?;
+    if canonical_allowlist
+        .iter()
+        .any(|allowed| canonical_host.starts_with(allowed))
+    {
+        return Ok(());
+    }
+    Err(napi::Error::from_reason(format!(
+        "Mount path '{host_path}' is not in allowedMountPaths"
+    )))
+}
+
+// ============================================================================
+// Bash — core interpreter
+// ============================================================================
+
+/// Core bash interpreter with virtual filesystem.
+///
+/// State persists between calls — files created in one `execute()` are
+/// available in subsequent calls.
+#[napi]
+pub struct Bash {
+    state: Arc<SharedState>,
+}
+
+#[napi]
+impl Bash {
+    #[napi(constructor)]
+    pub fn new(options: Option<BashOptions>) -> napi::Result<Self> {
+        let opts = options.unwrap_or_else(default_opts);
+        let state = shared_state_from_opts(opts, None)?;
+        Ok(Self {
+            state: Arc::new(state),
+        })
+    }
+
+    /// Execute bash commands synchronously.
+    #[napi(
+        ts_args_type = "commands: string, onOutput?: (chunkPair: [string, string]) => string | undefined"
+    )]
+    pub fn execute_sync(
+        &self,
+        commands: String,
+        on_output: Option<napi::bindgen_prelude::Function<'_, (String, String), Option<String>>>,
+    ) -> napi::Result<ExecResult> {
+        let _sync_scope = SyncExecuteScope::enter(self.state.in_sync_execute_depth.clone());
+        let env_raw = on_output
+            .as_ref()
+            .map(|on_output| on_output.value().env as usize);
+        let on_output = on_output
+            .map(|on_output| on_output.create_ref())
+            .transpose()?;
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            if let Some((env_raw, on_output)) = env_raw.zip(on_output) {
+                let cancelled = bash.cancellation_token();
+                let callback_requested_cancel = Arc::new(AtomicBool::new(false));
+                let callback_error = Arc::new(StdMutex::new(None));
+                let output_callback = build_sync_output_callback(
+                    env_raw,
+                    on_output,
+                    cancelled.clone(),
+                    callback_requested_cancel.clone(),
+                    callback_error.clone(),
+                    s.on_output_reentry_depth.clone(),
+                );
+                execute_rust_bash(
+                    &mut bash,
+                    &commands,
+                    Some(output_callback),
+                    Some(&callback_error),
+                    Some(&cancelled),
+                    Some(&callback_requested_cancel),
+                )
+                .await
+            } else {
+                execute_rust_bash(&mut bash, &commands, None, None, None, None).await
+            }
+        })
+    }
+
+    /// Execute bash commands asynchronously, returning a Promise.
+    #[napi]
+    pub async fn execute(&self, commands: String) -> napi::Result<ExecResult> {
+        reject_on_output_reentry(&self.state)?;
+        if let Some(result) = validate_async_execute_input(&self.state, &commands) {
+            return Ok(result);
+        }
+        let s = self.state.clone();
+        let _slot = acquire_async_execute_slot(&s)?;
+        let mut bash = s.inner.lock().await;
+        execute_rust_bash(&mut bash, &commands, None, None, None, None).await
+    }
+
+    #[napi(
+        js_name = "executeWithOutput",
+        ts_args_type = "commands: string, onOutput: (chunkPair: [string, string]) => string | undefined"
+    )]
+    pub fn execute_with_output<'env>(
+        &self,
+        commands: String,
+        on_output: napi::bindgen_prelude::Function<'env, (String, String), Option<String>>,
+    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, ExecResult>> {
+        reject_on_output_reentry(&self.state)?;
+        let raw_env = on_output.value().env;
+        let tsfn = create_output_tsfn(on_output)?;
+        let state = self.state.clone();
+        let promise = napi::bindgen_prelude::execute_tokio_future(
+            raw_env,
+            async move {
+                reject_on_output_reentry(&state)?;
+                if let Some(result) = validate_async_execute_input(&state, &commands) {
+                    return Ok(result);
+                }
+                let _slot = acquire_async_execute_slot(&state)?;
+                let mut bash = state.inner.lock().await;
+                let cancelled = bash.cancellation_token();
+                let callback_requested_cancel = Arc::new(AtomicBool::new(false));
+                let (output_callback, callback_error) = build_async_output_callback(
+                    tsfn,
+                    cancelled.clone(),
+                    callback_requested_cancel.clone(),
+                    state.on_output_reentry_depth.clone(),
+                );
+                execute_rust_bash(
+                    &mut bash,
+                    &commands,
+                    Some(output_callback),
+                    Some(&callback_error),
+                    Some(&cancelled),
+                    Some(&callback_requested_cancel),
+                )
+                .await
+            },
+            |env, val| unsafe {
+                <ExecResult as napi::bindgen_prelude::ToNapiValue>::to_napi_value(env, val)
+            },
+        )?;
+        Ok(napi::bindgen_prelude::PromiseRaw::new(raw_env, promise))
+    }
+
+    /// Analyze a script without running it.
+    ///
+    /// Parses `script` with this instance's parser limits and reports the
+    /// commands, redirect targets, and function definitions it statically
+    /// refers to. Nothing is executed and no instance state changes.
+    ///
+    /// Intended for permission prompts and audit logging. **Advisory only** —
+    /// check `isOpaque` before treating an allowlist match as safe. Throws if
+    /// the script does not parse; treat that as "deny or prompt", never as
+    /// "no commands".
+    #[napi]
+    pub fn analyze(&self, script: String) -> napi::Result<JsScriptAnalysis> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.analyze(&script)
+                .map(analysis_to_js)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Cancel the currently running execution.
+    ///
+    /// Safe to call from any thread. Execution will abort at the next
+    /// command boundary.
+    #[napi]
+    pub fn cancel(&self) {
+        let arc = self.state.cancelled.lock().unwrap().clone();
+        arc.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the cancellation flag so subsequent executions proceed normally.
+    ///
+    /// Call this after a `cancel()` once the in-flight execution has finished
+    /// and you want to reuse the same `Bash` instance without discarding shell
+    /// or VFS state.
+    #[napi]
+    pub fn clear_cancel(&self) {
+        let arc = self.state.cancelled.lock().unwrap().clone();
+        arc.store(false, Ordering::SeqCst);
+    }
+
+    /// Register a JS callback as a custom bash builtin.
+    ///
+    /// The callback receives a JSON-serialized `BuiltinContext`
+    /// (`{name, argv, stdin, env, cwd}`) plus a native VFS handle, and
+    /// returns the stdout to emit — either as a string (sync) or a
+    /// `Promise<string>` (async). Exceptions surface as stderr with exit
+    /// code 1. The TS wrapper adapts `(json, fsHandle)` into a single
+    /// `BuiltinContext` object with a live `fs` accessor.
+    ///
+    /// Unlike `customBuiltins` at construction time, this can be called at
+    /// any point in the instance's lifetime — the interpreter consults the
+    /// shared registry on every dispatch, so subsequent `execute*()` calls
+    /// pick up the new builtin without rebuilding the interpreter or
+    /// disturbing the VFS.
+    #[napi(
+        ts_args_type = "name: string, callback: (requestPair: [string, unknown]) => Promise<string>"
+    )]
+    pub fn add_builtin(
+        &self,
+        name: String,
+        callback: napi::bindgen_prelude::Function<
+            (String, External<NativeFileSystemState>),
+            napi::bindgen_prelude::Promise<String>,
+        >,
+    ) -> napi::Result<()> {
+        let tsfn: BuiltinTsfn = callback
+            .build_threadsafe_function::<(String, External<NativeFileSystemState>)>()
+            .weak::<true>()
+            .build()?;
+        self.state.host_registry.insert(
+            name.clone(),
+            Arc::new(JsCustomBuiltinAdapter {
+                name,
+                callback: Arc::new(tsfn),
+                in_sync_execute_depth: self.state.in_sync_execute_depth.clone(),
+            }),
+        );
+        Ok(())
+    }
+
+    /// Remove a previously registered custom builtin. No-op if not present.
+    #[napi]
+    pub fn remove_builtin(&self, name: String) {
+        self.state.host_registry.remove(&name);
+    }
+
+    /// Reset interpreter to fresh state, preserving configuration.
+    ///
+    /// Custom builtins registered via `addBuiltin` or `customBuiltins` are
+    /// preserved (the registry is host-owned, separate from the interpreter
+    /// state that `reset()` discards).
+    #[napi]
+    pub fn reset(&self) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            *bash = build_bash_from_state(&s);
+            *s.cancelled.lock().unwrap() = bash.cancellation_token();
+            Ok(())
+        })
+    }
+
+    // ========================================================================
+    // Snapshot / Resume
+    // ========================================================================
+
+    /// Capture state as a content-addressed commit for session history.
+    ///
+    /// Returns the objects to persist and the commit id to remember. Pass the
+    /// ids your store already holds via `options.have` to keep consecutive
+    /// commits incremental — unchanged files then cost a hash reference
+    /// instead of a copy. A fork is a commit whose parent is not the branch
+    /// tip: pass any earlier id in `options.parents`.
+    #[napi]
+    pub fn commit(&self, options: Option<CommitOptions>) -> napi::Result<JsPackedCommit> {
+        let options = options.unwrap_or(CommitOptions {
+            parents: None,
+            meta: None,
+            have: None,
+            exclude_filesystem: None,
+            exclude_functions: None,
+        });
+        let parents: Vec<RustObjectId> = options
+            .parents
+            .unwrap_or_default()
+            .iter()
+            .map(|p| js_object_id(p))
+            .collect::<napi::Result<_>>()?;
+        let have: Vec<RustObjectId> = options
+            .have
+            .unwrap_or_default()
+            .iter()
+            .map(|h| js_object_id(h))
+            .collect::<napi::Result<_>>()?;
+        let meta = options.meta.unwrap_or_default();
+        let exclude_filesystem = options.exclude_filesystem.unwrap_or(false);
+        let exclude_functions = options.exclude_functions.unwrap_or(false);
+
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let mut opts = RustCommitOptions::new()
+                .have(have.iter())
+                .exclude_filesystem(exclude_filesystem)
+                .exclude_functions(exclude_functions);
+            for parent in parents {
+                opts = opts.parent(parent);
+            }
+            for (key, value) in meta {
+                opts = opts.meta(key, value);
+            }
+
+            let packed = bash.commit(opts).map_err(js_snapshot_error)?;
+            let self_contained = packed.is_self_contained();
+            let packed_bytes = if self_contained {
+                Some(napi::bindgen_prelude::Buffer::from(
+                    packed.to_bytes().map_err(js_snapshot_error)?,
+                ))
+            } else {
+                None
+            };
+
+            Ok(JsPackedCommit {
+                id: packed.id().to_hex(),
+                object_count: packed.object_count() as u32,
+                stored_bytes: packed.stored_bytes() as f64,
+                self_contained,
+                packed: packed_bytes,
+                objects: packed
+                    .objects()
+                    .map(|(oid, blob)| {
+                        (
+                            oid.to_hex(),
+                            napi::bindgen_prelude::Buffer::from(blob.to_vec()),
+                        )
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    /// Restore the state a commit describes, pulling objects from a store.
+    ///
+    /// This is how rewinds and forks work: check out any commit, tip or not.
+    /// `policy` is `'superset'` (default), `'strict'`, or `'force'`. Nothing is
+    /// mutated if the checkout fails.
+    #[napi]
+    pub fn checkout(
+        &self,
+        commit_id: String,
+        objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+        policy: Option<String>,
+    ) -> napi::Result<()> {
+        let root = js_object_id(&commit_id)?;
+        let store = js_store(objects)?;
+        let policy = js_policy(policy)?;
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            bash.checkout(root, &store, policy)
+                .map_err(js_snapshot_error)
+        })
+    }
+
+    /// Fingerprint this instance's environment.
+    ///
+    /// Compare against `snapshotCapabilities(...)` to tell whether a stored
+    /// commit will pass a given checkout policy before attempting it.
+    #[napi]
+    pub fn capabilities(&self) -> napi::Result<JsCapabilityFingerprint> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let caps = RustCapabilityFingerprint::capture(&bash);
+            Ok(JsCapabilityFingerprint {
+                bashkit_version: caps.bashkit_version,
+                builtins: caps.builtins,
+                features: caps.features,
+                fs_backend: caps.fs_backend,
+            })
+        })
+    }
+
+    /// Serialize interpreter state (shell variables, VFS contents, counters) to bytes.
+    ///
+    /// Returns a `Buffer` (Uint8Array) that can be persisted and used with
+    /// `Bash.fromSnapshot()` to restore the session later.
+    #[napi]
+    pub fn snapshot(
+        &self,
+        options: Option<SnapshotOptions>,
+    ) -> napi::Result<napi::bindgen_prelude::Buffer> {
+        let snapshot_options = to_snapshot_options(options.as_ref());
+        let hmac_key = snapshot_hmac_key(options.as_ref()).map(Vec::from);
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let bytes = if let Some(key) = hmac_key.as_deref() {
+                bash.snapshot_to_bytes_keyed_with_options(key, snapshot_options)
+            } else {
+                bash.snapshot_with_options(snapshot_options)
+            }
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(napi::bindgen_prelude::Buffer::from(bytes))
+        })
+    }
+
+    /// Restore interpreter state from a snapshot previously created with `snapshot()`.
+    #[napi]
+    pub fn restore_snapshot(
+        &self,
+        data: napi::bindgen_prelude::Buffer,
+        options: Option<SnapshotOptions>,
+    ) -> napi::Result<()> {
+        let hmac_key = snapshot_hmac_key(options.as_ref()).map(Vec::from);
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            if let Some(key) = hmac_key.as_deref() {
+                bash.restore_snapshot_keyed(&data, key)
+            } else {
+                bash.restore_snapshot(&data)
+            }
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Serialize interpreter state to HMAC-protected bytes using a caller-provided key.
+    ///
+    /// Use this when snapshots cross trust boundaries.
+    #[napi]
+    pub fn snapshot_keyed(
+        &self,
+        key: napi::bindgen_prelude::Buffer,
+        options: Option<SnapshotOptions>,
+    ) -> napi::Result<napi::bindgen_prelude::Buffer> {
+        let options = to_snapshot_options(options.as_ref());
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let bytes = bash
+                .snapshot_to_bytes_keyed_with_options(&key, options)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(napi::bindgen_prelude::Buffer::from(bytes))
+        })
+    }
+
+    /// Restore interpreter state from a HMAC-protected snapshot.
+    #[napi]
+    pub fn restore_snapshot_keyed(
+        &self,
+        data: napi::bindgen_prelude::Buffer,
+        key: napi::bindgen_prelude::Buffer,
+    ) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            bash.restore_snapshot_keyed(&data, &key)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Create a new Bash instance from a snapshot.
+    ///
+    /// Accepts optional `BashOptions` to re-apply execution limits.
+    /// Without options, safe defaults are used (not unlimited).
+    #[napi(factory)]
+    pub fn from_snapshot(
+        data: napi::bindgen_prelude::Buffer,
+        options: Option<BashOptions>,
+        snapshot_options: Option<SnapshotOptions>,
+    ) -> napi::Result<Self> {
+        let opts = options.unwrap_or_else(default_opts);
+        let mut state = shared_state_from_opts(opts, None)?;
+
+        // restore_snapshot preserves the instance's limits while restoring shell state
+        if let Some(key) = snapshot_hmac_key(snapshot_options.as_ref()) {
+            state.inner.get_mut().restore_snapshot_keyed(&data, key)
+        } else {
+            state.inner.get_mut().restore_snapshot(&data)
+        }
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        Ok(Self {
+            state: Arc::new(state),
+        })
+    }
+
+    /// Create a new Bash instance from a HMAC-protected snapshot.
+    ///
+    /// Accepts optional `BashOptions` to re-apply execution limits.
+    #[napi(factory)]
+    pub fn from_snapshot_keyed(
+        data: napi::bindgen_prelude::Buffer,
+        key: napi::bindgen_prelude::Buffer,
+        options: Option<BashOptions>,
+    ) -> napi::Result<Self> {
+        let opts = options.unwrap_or_else(default_opts);
+        let mut state = shared_state_from_opts(opts, None)?;
+
+        state
+            .inner
+            .get_mut()
+            .restore_snapshot_keyed(&data, &key)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        Ok(Self {
+            state: Arc::new(state),
+        })
+    }
+
+    // ========================================================================
+    // VFS — direct filesystem access
+    // ========================================================================
+
+    /// Get metadata for a path in the virtual filesystem.
+    #[napi]
+    pub fn stat(&self, path: String) -> napi::Result<FileMetadata> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let meta = bash
+                .fs()
+                .stat(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(metadata_to_js(&meta))
+        })
+    }
+
+    /// Append content to a file in the virtual filesystem.
+    #[napi]
+    pub fn append_file(&self, path: String, content: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .append_file(Path::new(&path), content.as_bytes())
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Change file permissions in the virtual filesystem.
+    #[napi]
+    pub fn chmod(&self, path: String, mode: u32) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .chmod(Path::new(&path), mode)
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Create a symbolic link in the virtual filesystem.
+    #[napi]
+    pub fn symlink(&self, target: String, link: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .symlink(Path::new(&target), Path::new(&link))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Read the target of a symbolic link.
+    #[napi]
+    pub fn read_link(&self, path: String) -> napi::Result<String> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let target = bash
+                .fs()
+                .read_link(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(target.display().to_string())
+        })
+    }
+
+    /// Read a file from the virtual filesystem. Returns contents as a UTF-8 string.
+    #[napi]
+    pub fn read_file(&self, path: String) -> napi::Result<String> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let bytes = bash
+                .fs()
+                .read_file(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            String::from_utf8(bytes)
+                .map_err(|e| napi::Error::from_reason(format!("Invalid UTF-8: {e}")))
+        })
+    }
+
+    /// Write a string to a file in the virtual filesystem.
+    /// Creates the file if it doesn't exist, replaces contents if it does.
+    #[napi]
+    pub fn write_file(&self, path: String, content: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .write_file(Path::new(&path), content.as_bytes())
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Create a directory. If recursive is true, creates parent directories as needed.
+    #[napi]
+    pub fn mkdir(&self, path: String, recursive: Option<bool>) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .mkdir(Path::new(&path), recursive.unwrap_or(false))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Check if a path exists in the virtual filesystem.
+    #[napi]
+    pub fn exists(&self, path: String) -> napi::Result<bool> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .exists(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Remove a file or directory. If recursive is true, removes directory contents.
+    #[napi]
+    pub fn remove(&self, path: String, recursive: Option<bool>) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .remove(Path::new(&path), recursive.unwrap_or(false))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// List entries in a directory with metadata (name, file type, size, etc.).
+    #[napi]
+    pub fn read_dir(&self, path: String) -> napi::Result<Vec<JsDirEntry>> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let entries = bash
+                .fs()
+                .read_dir(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(entries
+                .into_iter()
+                .map(|e| JsDirEntry {
+                    name: e.name.clone(),
+                    metadata: metadata_to_js(&e.metadata),
+                })
+                .collect())
+        })
+    }
+
+    // ========================================================================
+    // Mount — real filesystem mounts at runtime
+    // ========================================================================
+
+    /// Mount a host directory into the VFS at runtime.
+    ///
+    /// Read-only by default; pass `writable: true` to enable writes.
+    ///
+    /// **Security**: Writable mounts log a warning. Consider using
+    /// `allowedMountPaths` in `BashOptions` to restrict which host paths
+    /// may be mounted.
+    #[napi]
+    pub fn mount(
+        &self,
+        host_path: String,
+        vfs_path: String,
+        writable: Option<bool>,
+    ) -> napi::Result<()> {
+        let is_writable = writable.unwrap_or(false);
+        if is_writable {
+            eprintln!(
+                "bashkit: warning: writable mount at {} — scripts can modify host files",
+                host_path
+            );
+        }
+        enforce_mount_policy(
+            self.state.allowed_mount_paths.as_deref(),
+            &host_path,
+            "Bash.mount",
+        )?;
+        let recorded = RuntimeMount::Real {
+            host_path: host_path.clone(),
+            vfs_path: vfs_path.clone(),
+            writable: is_writable,
+        };
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let mode = if is_writable {
+                RealFsMode::ReadWrite
+            } else {
+                RealFsMode::ReadOnly
+            };
+            let real_backend = RealFs::open(&host_path, mode)
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            let fs: Arc<dyn BashFileSystem> = Arc::new(PosixFs::new(real_backend));
+            bash.mount(Path::new(&vfs_path), fs)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            record_runtime_mount(&s.runtime_mounts, recorded);
+            Ok(())
+        })
+    }
+
+    /// Mount a filesystem handle without rebuilding the interpreter.
+    #[napi]
+    pub fn mount_file_system(&self, vfs_path: String, fs: Unknown<'_>) -> napi::Result<()> {
+        let mounted_fs = import_external_file_system(fs)?;
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.mount(Path::new(&vfs_path), Arc::clone(&mounted_fs))
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            record_runtime_mount(
+                &s.runtime_mounts,
+                RuntimeMount::Fs {
+                    vfs_path,
+                    fs: mounted_fs,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    /// Unmount a previously mounted filesystem.
+    #[napi]
+    pub fn unmount(&self, vfs_path: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.unmount(Path::new(&vfs_path))
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            forget_runtime_mount(&s.runtime_mounts, &vfs_path);
+            Ok(())
+        })
+    }
+
+    /// Set an exported environment variable on the live interpreter.
+    ///
+    /// The env counterpart to runtime `mount()`: usable after construction, so
+    /// a reusable setup bundle can apply mounts, env, and builtins to an
+    /// existing instance instead of only through `BashOptions`. Survives
+    /// `reset()` — like `customBuiltins`, and unlike env a *script* exported.
+    #[napi]
+    pub fn set_env(&self, key: String, value: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            bash.set_env(&key, &value);
+            record_runtime_env(&s.runtime_env, &key, &value);
+            Ok(())
+        })
+    }
+
+    /// Get a `JsFileSystem` handle for direct VFS operations.
+    #[napi]
+    pub fn fs(&self) -> napi::Result<External<NativeFileSystemState>> {
+        reject_on_output_reentry(&self.state)?;
+        Ok(External::new(NativeFileSystemState::from_live(
+            self.state.clone(),
+        )))
+    }
+
+    /// Capture a lightweight snapshot of shell state (variables, env, cwd,
+    /// arrays, aliases, traps) for inspection. Function definitions are
+    /// omitted — use `snapshot()` for full state capture/restore.
+    #[napi]
+    pub fn shell_state(&self) -> napi::Result<ShellState> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            Ok(shell_state_to_js(bash.shell_state_view()))
+        })
+    }
+}
+
+// ============================================================================
+// BashTool — interpreter + tool-contract metadata
+// ============================================================================
+
+/// Bash interpreter with tool-contract metadata (`description`, `help`,
+/// `system_prompt`, schemas).
+///
+/// Use this when integrating with AI frameworks that need tool definitions.
+#[napi]
+pub struct BashTool {
+    state: Arc<SharedState>,
+}
+
+impl BashTool {
+    fn build_rust_tool(state: &SharedState) -> RustBashTool {
+        let mut builder = RustBashTool::builder();
+
+        if let Some(ref username) = state.username {
+            builder = builder.username(username);
+        }
+        if let Some(ref hostname) = state.hostname {
+            builder = builder.hostname(hostname);
+        }
+        if let Some(ref cwd) = state.cwd {
+            builder = builder.cwd(cwd.as_str());
+        }
+        if let Some(ref env) = state.env {
+            for (k, v) in env {
+                builder = builder.env(k, v);
+            }
+        }
+
+        builder.limits(build_limits(state)).build()
+    }
+}
+
+#[napi]
+impl BashTool {
+    #[napi(constructor)]
+    pub fn new(options: Option<BashOptions>) -> napi::Result<Self> {
+        let opts = options.unwrap_or_else(default_opts);
+        let state = shared_state_from_opts(opts, None)?;
+        Ok(Self {
+            state: Arc::new(state),
+        })
+    }
+
+    /// Execute bash commands synchronously.
+    #[napi(
+        ts_args_type = "commands: string, onOutput?: (chunkPair: [string, string]) => string | undefined"
+    )]
+    pub fn execute_sync(
+        &self,
+        commands: String,
+        on_output: Option<napi::bindgen_prelude::Function<'_, (String, String), Option<String>>>,
+    ) -> napi::Result<ExecResult> {
+        let _sync_scope = SyncExecuteScope::enter(self.state.in_sync_execute_depth.clone());
+        let env_raw = on_output
+            .as_ref()
+            .map(|on_output| on_output.value().env as usize);
+        let on_output = on_output
+            .map(|on_output| on_output.create_ref())
+            .transpose()?;
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            if let Some((env_raw, on_output)) = env_raw.zip(on_output) {
+                let cancelled = bash.cancellation_token();
+                let callback_requested_cancel = Arc::new(AtomicBool::new(false));
+                let callback_error = Arc::new(StdMutex::new(None));
+                let output_callback = build_sync_output_callback(
+                    env_raw,
+                    on_output,
+                    cancelled.clone(),
+                    callback_requested_cancel.clone(),
+                    callback_error.clone(),
+                    s.on_output_reentry_depth.clone(),
+                );
+                execute_rust_bash(
+                    &mut bash,
+                    &commands,
+                    Some(output_callback),
+                    Some(&callback_error),
+                    Some(&cancelled),
+                    Some(&callback_requested_cancel),
+                )
+                .await
+            } else {
+                execute_rust_bash(&mut bash, &commands, None, None, None, None).await
+            }
+        })
+    }
+
+    /// Execute bash commands asynchronously, returning a Promise.
+    #[napi]
+    pub async fn execute(&self, commands: String) -> napi::Result<ExecResult> {
+        reject_on_output_reentry(&self.state)?;
+        if let Some(result) = validate_async_execute_input(&self.state, &commands) {
+            return Ok(result);
+        }
+        let s = self.state.clone();
+        let _slot = acquire_async_execute_slot(&s)?;
+        let mut bash = s.inner.lock().await;
+        execute_rust_bash(&mut bash, &commands, None, None, None, None).await
+    }
+
+    #[napi(
+        js_name = "executeWithOutput",
+        ts_args_type = "commands: string, onOutput: (chunkPair: [string, string]) => string | undefined"
+    )]
+    pub fn execute_with_output<'env>(
+        &self,
+        commands: String,
+        on_output: napi::bindgen_prelude::Function<'env, (String, String), Option<String>>,
+    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, ExecResult>> {
+        reject_on_output_reentry(&self.state)?;
+        let raw_env = on_output.value().env;
+        let tsfn = create_output_tsfn(on_output)?;
+        let state = self.state.clone();
+        let promise = napi::bindgen_prelude::execute_tokio_future(
+            raw_env,
+            async move {
+                reject_on_output_reentry(&state)?;
+                if let Some(result) = validate_async_execute_input(&state, &commands) {
+                    return Ok(result);
+                }
+                let _slot = acquire_async_execute_slot(&state)?;
+                let mut bash = state.inner.lock().await;
+                let cancelled = bash.cancellation_token();
+                let callback_requested_cancel = Arc::new(AtomicBool::new(false));
+                let (output_callback, callback_error) = build_async_output_callback(
+                    tsfn,
+                    cancelled.clone(),
+                    callback_requested_cancel.clone(),
+                    state.on_output_reentry_depth.clone(),
+                );
+                execute_rust_bash(
+                    &mut bash,
+                    &commands,
+                    Some(output_callback),
+                    Some(&callback_error),
+                    Some(&cancelled),
+                    Some(&callback_requested_cancel),
+                )
+                .await
+            },
+            |env, val| unsafe {
+                <ExecResult as napi::bindgen_prelude::ToNapiValue>::to_napi_value(env, val)
+            },
+        )?;
+        Ok(napi::bindgen_prelude::PromiseRaw::new(raw_env, promise))
+    }
+
+    /// Analyze a script without running it.
+    ///
+    /// Parses `script` with this instance's parser limits and reports the
+    /// commands, redirect targets, and function definitions it statically
+    /// refers to. Nothing is executed and no instance state changes.
+    ///
+    /// Intended for permission prompts and audit logging. **Advisory only** —
+    /// check `isOpaque` before treating an allowlist match as safe. Throws if
+    /// the script does not parse; treat that as "deny or prompt", never as
+    /// "no commands".
+    #[napi]
+    pub fn analyze(&self, script: String) -> napi::Result<JsScriptAnalysis> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.analyze(&script)
+                .map(analysis_to_js)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Cancel the currently running execution.
+    #[napi]
+    pub fn cancel(&self) {
+        let arc = self.state.cancelled.lock().unwrap().clone();
+        arc.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the cancellation flag so subsequent executions proceed normally.
+    ///
+    /// Call this after a `cancel()` once the in-flight execution has finished
+    /// and you want to reuse the same `BashTool` instance without discarding
+    /// shell or VFS state.
+    #[napi]
+    pub fn clear_cancel(&self) {
+        let arc = self.state.cancelled.lock().unwrap().clone();
+        arc.store(false, Ordering::SeqCst);
+    }
+
+    /// Register a JS callback as a custom bash builtin.
+    /// See [`Bash::add_builtin`] for semantics.
+    #[napi(
+        ts_args_type = "name: string, callback: (requestPair: [string, unknown]) => Promise<string>"
+    )]
+    pub fn add_builtin(
+        &self,
+        name: String,
+        callback: napi::bindgen_prelude::Function<
+            (String, External<NativeFileSystemState>),
+            napi::bindgen_prelude::Promise<String>,
+        >,
+    ) -> napi::Result<()> {
+        let tsfn: BuiltinTsfn = callback
+            .build_threadsafe_function::<(String, External<NativeFileSystemState>)>()
+            .weak::<true>()
+            .build()?;
+        self.state.host_registry.insert(
+            name.clone(),
+            Arc::new(JsCustomBuiltinAdapter {
+                name,
+                callback: Arc::new(tsfn),
+                in_sync_execute_depth: self.state.in_sync_execute_depth.clone(),
+            }),
+        );
+        Ok(())
+    }
+
+    /// Remove a previously registered custom builtin. No-op if not present.
+    #[napi]
+    pub fn remove_builtin(&self, name: String) {
+        self.state.host_registry.remove(&name);
+    }
+
+    /// Reset interpreter to fresh state, preserving configuration.
+    ///
+    /// Custom builtins registered via `addBuiltin` or `customBuiltins` are
+    /// preserved (the registry is host-owned, separate from the interpreter
+    /// state that `reset()` discards).
+    #[napi]
+    pub fn reset(&self) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            *bash = build_bash_from_state(&s);
+            *s.cancelled.lock().unwrap() = bash.cancellation_token();
+            Ok(())
+        })
+    }
+
+    // ========================================================================
+    // Snapshot / Resume
+    // ========================================================================
+
+    /// Serialize interpreter state (shell variables, VFS contents, counters) to bytes.
+    #[napi]
+    pub fn snapshot(
+        &self,
+        options: Option<SnapshotOptions>,
+    ) -> napi::Result<napi::bindgen_prelude::Buffer> {
+        let key = require_snapshot_hmac_key(options.as_ref())?.to_vec();
+        let snapshot_options = to_snapshot_options(options.as_ref());
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let bytes = bash
+                .snapshot_to_bytes_keyed_with_options(&key, snapshot_options)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(napi::bindgen_prelude::Buffer::from(bytes))
+        })
+    }
+
+    /// Restore interpreter state from a snapshot previously created with `snapshot()`.
+    #[napi]
+    pub fn restore_snapshot(
+        &self,
+        data: napi::bindgen_prelude::Buffer,
+        options: Option<SnapshotOptions>,
+    ) -> napi::Result<()> {
+        let key = require_snapshot_hmac_key(options.as_ref())?.to_vec();
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            bash.restore_snapshot_keyed(&data, &key)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Serialize interpreter state to HMAC-protected bytes using a caller-provided key.
+    #[napi]
+    pub fn snapshot_keyed(
+        &self,
+        key: napi::bindgen_prelude::Buffer,
+        options: Option<SnapshotOptions>,
+    ) -> napi::Result<napi::bindgen_prelude::Buffer> {
+        let options = to_snapshot_options(options.as_ref());
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let bytes = bash
+                .snapshot_to_bytes_keyed_with_options(&key, options)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(napi::bindgen_prelude::Buffer::from(bytes))
+        })
+    }
+
+    /// Restore interpreter state from a HMAC-protected snapshot.
+    #[napi]
+    pub fn restore_snapshot_keyed(
+        &self,
+        data: napi::bindgen_prelude::Buffer,
+        key: napi::bindgen_prelude::Buffer,
+    ) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            bash.restore_snapshot_keyed(&data, &key)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Create a new BashTool instance from a snapshot.
+    ///
+    /// Accepts optional `BashOptions` so restored instances preserve caller-provided
+    /// execution limits and identity settings.
+    #[napi(factory)]
+    pub fn from_snapshot(
+        data: napi::bindgen_prelude::Buffer,
+        options: Option<BashOptions>,
+        snapshot_options: Option<SnapshotOptions>,
+    ) -> napi::Result<Self> {
+        let opts = options.unwrap_or_else(default_opts);
+        let key = require_snapshot_hmac_key(snapshot_options.as_ref())?.to_vec();
+        let mut state = shared_state_from_opts(opts, None)?;
+
+        state
+            .inner
+            .get_mut()
+            .restore_snapshot_keyed(&data, &key)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        Ok(Self {
+            state: Arc::new(state),
+        })
+    }
+
+    /// Create a new BashTool instance from a HMAC-protected snapshot.
+    ///
+    /// Accepts optional `BashOptions` so restored instances preserve caller-provided
+    /// execution limits and identity settings.
+    #[napi(factory)]
+    pub fn from_snapshot_keyed(
+        data: napi::bindgen_prelude::Buffer,
+        key: napi::bindgen_prelude::Buffer,
+        options: Option<BashOptions>,
+    ) -> napi::Result<Self> {
+        let opts = options.unwrap_or_else(default_opts);
+        let mut state = shared_state_from_opts(opts, None)?;
+
+        state
+            .inner
+            .get_mut()
+            .restore_snapshot_keyed(&data, &key)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        Ok(Self {
+            state: Arc::new(state),
+        })
+    }
+
+    /// Get tool name.
+    #[napi(getter)]
+    pub fn name(&self) -> &str {
+        "bashkit"
+    }
+
+    /// Get short description.
+    #[napi(getter)]
+    pub fn short_description(&self) -> &str {
+        "Run bash commands in an isolated virtual filesystem"
+    }
+
+    /// Get token-efficient tool description.
+    #[napi]
+    pub fn description(&self) -> String {
+        Self::build_rust_tool(&self.state).description().to_string()
+    }
+
+    /// Get help as a Markdown document.
+    #[napi]
+    pub fn help(&self) -> String {
+        Self::build_rust_tool(&self.state).help()
+    }
+
+    /// Get compact system-prompt text for orchestration.
+    #[napi]
+    pub fn system_prompt(&self) -> String {
+        Self::build_rust_tool(&self.state).system_prompt()
+    }
+
+    /// Get JSON input schema as string.
+    #[napi]
+    pub fn input_schema(&self) -> napi::Result<String> {
+        let schema = Self::build_rust_tool(&self.state).input_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| napi::Error::from_reason(format!("Schema serialization failed: {e}")))
+    }
+
+    /// Get JSON output schema as string.
+    #[napi]
+    pub fn output_schema(&self) -> napi::Result<String> {
+        let schema = Self::build_rust_tool(&self.state).output_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| napi::Error::from_reason(format!("Schema serialization failed: {e}")))
+    }
+
+    /// Get tool version.
+    #[napi(getter)]
+    pub fn version(&self) -> &str {
+        VERSION
+    }
+
+    // ========================================================================
+    // VFS — direct filesystem access (no shell command composition)
+    // ========================================================================
+
+    /// Get metadata for a path in the virtual filesystem.
+    #[napi]
+    pub fn stat(&self, path: String) -> napi::Result<FileMetadata> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let meta = bash
+                .fs()
+                .stat(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(metadata_to_js(&meta))
+        })
+    }
+
+    /// Append content to a file in the virtual filesystem.
+    #[napi]
+    pub fn append_file(&self, path: String, content: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .append_file(Path::new(&path), content.as_bytes())
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Change file permissions in the virtual filesystem.
+    #[napi]
+    pub fn chmod(&self, path: String, mode: u32) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .chmod(Path::new(&path), mode)
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Create a symbolic link in the virtual filesystem.
+    #[napi]
+    pub fn symlink(&self, target: String, link: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .symlink(Path::new(&target), Path::new(&link))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Read the target of a symbolic link.
+    #[napi]
+    pub fn read_link(&self, path: String) -> napi::Result<String> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let target = bash
+                .fs()
+                .read_link(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(target.display().to_string())
+        })
+    }
+
+    /// Read a file from the virtual filesystem. Returns contents as a UTF-8 string.
+    #[napi]
+    pub fn read_file(&self, path: String) -> napi::Result<String> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let bytes = bash
+                .fs()
+                .read_file(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            String::from_utf8(bytes)
+                .map_err(|e| napi::Error::from_reason(format!("Invalid UTF-8: {e}")))
+        })
+    }
+
+    /// Write a string to a file in the virtual filesystem.
+    #[napi]
+    pub fn write_file(&self, path: String, content: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .write_file(Path::new(&path), content.as_bytes())
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Create a directory. If recursive is true, creates parent directories as needed.
+    #[napi]
+    pub fn mkdir(&self, path: String, recursive: Option<bool>) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .mkdir(Path::new(&path), recursive.unwrap_or(false))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Check if a path exists in the virtual filesystem.
+    #[napi]
+    pub fn exists(&self, path: String) -> napi::Result<bool> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .exists(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// Remove a file or directory. If recursive is true, removes directory contents.
+    #[napi]
+    pub fn remove(&self, path: String, recursive: Option<bool>) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.fs()
+                .remove(Path::new(&path), recursive.unwrap_or(false))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        })
+    }
+
+    /// List entries in a directory with metadata (name, file type, size, etc.).
+    #[napi]
+    pub fn read_dir(&self, path: String) -> napi::Result<Vec<JsDirEntry>> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let entries = bash
+                .fs()
+                .read_dir(Path::new(&path))
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(entries
+                .into_iter()
+                .map(|e| JsDirEntry {
+                    name: e.name.clone(),
+                    metadata: metadata_to_js(&e.metadata),
+                })
+                .collect())
+        })
+    }
+
+    // ========================================================================
+    // Mount — real filesystem mounts at runtime
+    // ========================================================================
+
+    /// Mount a host directory into the VFS at runtime.
+    ///
+    /// Read-only by default; pass `writable: true` to enable writes.
+    ///
+    /// **Security**: Writable mounts log a warning. Consider using
+    /// `allowedMountPaths` in `BashOptions` to restrict which host paths
+    /// may be mounted.
+    #[napi]
+    pub fn mount(
+        &self,
+        host_path: String,
+        vfs_path: String,
+        writable: Option<bool>,
+    ) -> napi::Result<()> {
+        let is_writable = writable.unwrap_or(false);
+        if is_writable {
+            eprintln!(
+                "bashkit: warning: writable mount at {} — scripts can modify host files",
+                host_path
+            );
+        }
+        enforce_mount_policy(
+            self.state.allowed_mount_paths.as_deref(),
+            &host_path,
+            "BashTool.mount",
+        )?;
+        let recorded = RuntimeMount::Real {
+            host_path: host_path.clone(),
+            vfs_path: vfs_path.clone(),
+            writable: is_writable,
+        };
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            let mode = if is_writable {
+                RealFsMode::ReadWrite
+            } else {
+                RealFsMode::ReadOnly
+            };
+            let real_backend = RealFs::open(&host_path, mode)
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            let fs: Arc<dyn BashFileSystem> = Arc::new(PosixFs::new(real_backend));
+            bash.mount(Path::new(&vfs_path), fs)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            record_runtime_mount(&s.runtime_mounts, recorded);
+            Ok(())
+        })
+    }
+
+    /// Mount a filesystem handle without rebuilding the interpreter.
+    #[napi]
+    pub fn mount_file_system(&self, vfs_path: String, fs: Unknown<'_>) -> napi::Result<()> {
+        let mounted_fs = import_external_file_system(fs)?;
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.mount(Path::new(&vfs_path), Arc::clone(&mounted_fs))
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            record_runtime_mount(
+                &s.runtime_mounts,
+                RuntimeMount::Fs {
+                    vfs_path,
+                    fs: mounted_fs,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    /// Unmount a previously mounted filesystem.
+    #[napi]
+    pub fn unmount(&self, vfs_path: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            bash.unmount(Path::new(&vfs_path))
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            forget_runtime_mount(&s.runtime_mounts, &vfs_path);
+            Ok(())
+        })
+    }
+
+    /// Set an exported environment variable on the live interpreter.
+    ///
+    /// See [`Bash::set_env`]. Survives `reset()`.
+    #[napi]
+    pub fn set_env(&self, key: String, value: String) -> napi::Result<()> {
+        block_on_with(&self.state, |s| async move {
+            let mut bash = s.inner.lock().await;
+            bash.set_env(&key, &value);
+            record_runtime_env(&s.runtime_env, &key, &value);
+            Ok(())
+        })
+    }
+
+    /// Get a `JsFileSystem` handle for direct VFS operations.
+    #[napi]
+    pub fn fs(&self) -> napi::Result<External<NativeFileSystemState>> {
+        reject_on_output_reentry(&self.state)?;
+        Ok(External::new(NativeFileSystemState::from_live(
+            self.state.clone(),
+        )))
+    }
+
+    /// Capture a lightweight snapshot of shell state (variables, env, cwd,
+    /// arrays, aliases, traps) for inspection. Function definitions are
+    /// omitted — use `snapshot()` for full state capture/restore.
+    #[napi]
+    pub fn shell_state(&self) -> napi::Result<ShellState> {
+        block_on_with(&self.state, |s| async move {
+            let bash = s.inner.lock().await;
+            Ok(shell_state_to_js(bash.shell_state_view()))
+        })
+    }
+}
+
+// ============================================================================
+// ScriptedTool — multi-tool orchestration via bash scripts
+// ============================================================================
+
+/// Options for creating a ScriptedTool instance.
+#[napi(object)]
+pub struct ScriptedToolOptions {
+    pub name: String,
+    pub short_description: Option<String>,
+    pub max_commands: Option<u32>,
+    pub max_loop_iterations: Option<u32>,
+}
+
+/// Threadsafe callback: data=(String,), return=String, CalleeHandled=false.
+/// The tuple matches the JS function signature `(request: string) => string`.
+type ToolTsfn = napi::threadsafe_function::ThreadsafeFunction<
+    (String,),
+    String,
+    (String,),
+    napi::Status,
+    false,
+    true,
+>;
+
+/// Threadsafe callback used by custom builtins registered via `addBuiltin`.
+///
+/// The JS dispatcher always wraps its result in `Promise.resolve(...)`, so
+/// the TSFN return is uniformly `Promise<String>` regardless of whether the
+/// user's callback was sync or async. Both branches resolve via the same
+/// `.await` on the returned `Promise<String>` future.
+///
+/// Args: the JSON-serialized context string plus an opaque native handle to
+/// the interpreter's live VFS (wrapped by the TS dispatcher into `ctx.fs`).
+type BuiltinTsfn = napi::threadsafe_function::ThreadsafeFunction<
+    (String, External<NativeFileSystemState>),
+    napi::bindgen_prelude::Promise<String>,
+    (String, External<NativeFileSystemState>),
+    napi::Status,
+    false,
+    true,
+>;
+
+/// Adapts a JS callback into a bashkit [`Builtin`].
+///
+/// The callback receives a JSON string `{"name", "argv", "stdin", "env", "cwd"}`
+/// plus a native VFS handle (surfaced to user code as `ctx.fs`), and resolves
+/// with the stdout to emit. Exceptions/rejections surface as
+/// stderr + exit-code-1 (real-shell semantics).
+struct JsCustomBuiltinAdapter {
+    name: String,
+    callback: Arc<BuiltinTsfn>,
+    /// Shared depth counter incremented by the binding's `executeSync` entry
+    /// points. When non-zero the JS event loop is blocked, so dispatching the
+    /// TSFN callback would never resolve. We surface a real error in that case
+    /// instead of hanging.
+    in_sync_execute_depth: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Builtin for JsCustomBuiltinAdapter {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<RustExecResult> {
+        if self.in_sync_execute_depth.load(Ordering::SeqCst) > 0 {
+            return Ok(RustExecResult::err(
+                format!("{}: {}\n", self.name, SYNC_BUILTIN_DEADLOCK_ERROR),
+                1,
+            ));
+        }
+
+        let request = serde_json::json!({
+            "name": self.name,
+            "argv": ctx.args,
+            "stdin": ctx.stdin,
+            "env": ctx.env,
+            "cwd": ctx.cwd.to_string_lossy(),
+        });
+        let request_str = serde_json::to_string(&request)
+            .map_err(|e| bashkit::Error::Execution(format!("{}: {}", self.name, e)))?;
+
+        // Bound concurrent JS callbacks across all instances (issue #982).
+        let sem = callback_semaphore();
+        let _permit = sem
+            .acquire()
+            .await
+            .map_err(|e| bashkit::Error::Execution(format!("{}: semaphore: {}", self.name, e)))?;
+
+        // Wrap the interpreter's live VFS as a `Static` handle so the JS
+        // callback reads and writes the same filesystem without re-locking
+        // the interpreter (mirrors the Python binding's `BuiltinContext.fs`).
+        let fs_handle = External::new(NativeFileSystemState::from_static(ctx.fs.clone()));
+
+        // Two-step await: first call_async returns the `Promise<String>`
+        // handle from JS, then awaiting the Promise resolves to its value.
+        let promise = match self.callback.call_async((request_str, fs_handle)).await {
+            Ok(p) => p,
+            Err(e) => return Ok(RustExecResult::err(format!("{}\n", e), 1)),
+        };
+        match promise.await {
+            Ok(stdout) => Ok(RustExecResult::ok(stdout)),
+            Err(e) => Ok(RustExecResult::err(format!("{}\n", e), 1)),
+        }
+    }
+}
+
+/// Entry for a registered JS tool callback.
+///
+/// Stores a threadsafe function that receives a JSON-serialized request string
+/// `{"params": {...}, "stdin": "..." | null}` and returns a string result.
+struct JsToolEntry {
+    name: String,
+    description: String,
+    schema: serde_json::Value,
+    /// Wrapped in Arc so we can share references with Rust ScriptedTool callbacks
+    /// (ThreadsafeFunction doesn't implement Clone).
+    callback: Arc<ToolTsfn>,
+    /// Shared depth counter incremented by ScriptedTool.executeSync. Non-zero
+    /// means the Node event loop is blocked by native sync execution, so the
+    /// TSFN callback would never run.
+    in_sync_execute_depth: Arc<AtomicUsize>,
+}
+
+/// Compose JS callbacks as bash builtins for multi-tool orchestration.
+///
+/// Each registered tool becomes a bash builtin command. An LLM (or user) writes
+/// a single bash script that pipes, loops, and branches across all tools.
+#[napi]
+pub struct ScriptedTool {
+    name: String,
+    short_desc: Option<String>,
+    tools: Vec<JsToolEntry>,
+    env_vars: Vec<(String, String)>,
+    rt: Mutex<tokio::runtime::Runtime>,
+    max_commands: Option<u32>,
+    max_loop_iterations: Option<u32>,
+    in_sync_execute_depth: Arc<AtomicUsize>,
+}
+
+#[napi]
+impl ScriptedTool {
+    #[napi(constructor)]
+    pub fn new(options: ScriptedToolOptions) -> napi::Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| napi::Error::from_reason(format!("Failed to create runtime: {e}")))?;
+
+        Ok(Self {
+            name: options.name,
+            short_desc: options.short_description,
+            tools: Vec::new(),
+            env_vars: Vec::new(),
+            rt: Mutex::new(rt),
+            max_commands: options.max_commands,
+            max_loop_iterations: options.max_loop_iterations,
+            in_sync_execute_depth: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Register a tool command.
+    ///
+    /// The callback receives a JSON string `{"params": {...}, "stdin": "..." | null}`
+    /// and must return a string result.
+    #[napi(
+        ts_args_type = "name: string, description: string, callback: (request: string) => string, schema?: string"
+    )]
+    pub fn add_tool(
+        &mut self,
+        name: String,
+        description: String,
+        callback: napi::bindgen_prelude::Function<(String,), String>,
+        schema: Option<String>,
+    ) -> napi::Result<()> {
+        let tsfn: ToolTsfn = callback
+            .build_threadsafe_function::<(String,)>()
+            .weak::<true>()
+            .build()?;
+
+        let schema_val = match schema {
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| napi::Error::from_reason(format!("Invalid schema JSON: {e}")))?,
+            None => serde_json::Value::Object(Default::default()),
+        };
+
+        self.tools.push(JsToolEntry {
+            name,
+            description,
+            schema: schema_val,
+            callback: Arc::new(tsfn),
+            in_sync_execute_depth: self.in_sync_execute_depth.clone(),
+        });
+        Ok(())
+    }
+
+    /// Add an environment variable visible inside scripts.
+    #[napi]
+    pub fn env(&mut self, key: String, value: String) {
+        self.env_vars.push((key, value));
+    }
+
+    /// Execute a bash script synchronously.
+    #[napi]
+    pub fn execute_sync(&self, commands: String) -> napi::Result<ExecResult> {
+        let _sync_scope = SyncExecuteScope::enter(self.in_sync_execute_depth.clone());
+        let tool = self.build_rust_tool();
+        let rt_guard = self.rt.blocking_lock();
+        let resp = rt_guard.block_on(async move {
+            tool.execute(ToolRequest {
+                commands,
+                timeout_ms: None,
+            })
+            .await
+        });
+        let stdout_bytes = resp.stdout.as_bytes().to_vec();
+        let stderr_bytes = resp.stderr.as_bytes().to_vec();
+        Ok(ExecResult {
+            stdout: resp.stdout,
+            stdout_bytes,
+            stderr: resp.stderr,
+            stderr_bytes,
+            exit_code: resp.exit_code,
+            error: resp.error,
+            stdout_truncated: resp.stdout_truncated,
+            stderr_truncated: resp.stderr_truncated,
+            final_env: resp.final_env,
+            success: resp.exit_code == 0,
+        })
+    }
+
+    /// Execute a bash script asynchronously, returning a Promise.
+    #[napi]
+    pub async fn execute(&self, commands: String) -> napi::Result<ExecResult> {
+        let tool = self.build_rust_tool();
+        let resp = tool
+            .execute(ToolRequest {
+                commands,
+                timeout_ms: None,
+            })
+            .await;
+        let stdout_bytes = resp.stdout.as_bytes().to_vec();
+        let stderr_bytes = resp.stderr.as_bytes().to_vec();
+        Ok(ExecResult {
+            stdout: resp.stdout,
+            stdout_bytes,
+            stderr: resp.stderr,
+            stderr_bytes,
+            exit_code: resp.exit_code,
+            error: resp.error,
+            stdout_truncated: resp.stdout_truncated,
+            stderr_truncated: resp.stderr_truncated,
+            final_env: resp.final_env,
+            success: resp.exit_code == 0,
+        })
+    }
+
+    /// Get tool name.
+    #[napi(getter)]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get short description.
+    #[napi(getter)]
+    pub fn short_description(&self) -> String {
+        self.short_desc
+            .clone()
+            .unwrap_or_else(|| format!("ScriptedTool: {}", self.name))
+    }
+
+    /// Number of registered tools.
+    #[napi]
+    pub fn tool_count(&self) -> u32 {
+        self.tools.len() as u32
+    }
+
+    /// Get token-efficient tool description.
+    #[napi]
+    pub fn description(&self) -> String {
+        self.build_rust_tool().description().to_string()
+    }
+
+    /// Get help as a Markdown document.
+    #[napi]
+    pub fn help(&self) -> String {
+        self.build_rust_tool().help()
+    }
+
+    /// Get compact system-prompt text for orchestration.
+    #[napi]
+    pub fn system_prompt(&self) -> String {
+        self.build_rust_tool().system_prompt()
+    }
+
+    /// Get JSON input schema as string.
+    #[napi]
+    pub fn input_schema(&self) -> napi::Result<String> {
+        let tool = self.build_rust_tool();
+        let schema = tool.input_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| napi::Error::from_reason(format!("Schema serialization failed: {e}")))
+    }
+
+    /// Get JSON output schema as string.
+    #[napi]
+    pub fn output_schema(&self) -> napi::Result<String> {
+        let tool = self.build_rust_tool();
+        let schema = tool.output_schema();
+        serde_json::to_string_pretty(&schema)
+            .map_err(|e| napi::Error::from_reason(format!("Schema serialization failed: {e}")))
+    }
+
+    /// Get tool version.
+    #[napi(getter)]
+    pub fn version(&self) -> &str {
+        VERSION
+    }
+}
+
+impl ScriptedTool {
+    fn build_rust_tool(&self) -> RustScriptedTool {
+        let mut builder = RustScriptedTool::builder(&self.name);
+
+        // sanitize_errors(false): JS callback errors are already sanitized inside
+        // the closure below; this setting lets the trusted deadlock message pass through.
+        builder = builder.sanitize_errors(false);
+
+        if let Some(ref desc) = self.short_desc {
+            builder = builder.short_description(desc);
+        }
+
+        for entry in &self.tools {
+            let tsfn = entry.callback.clone();
+            let tool_name = entry.name.clone();
+            let in_sync_execute_depth = entry.in_sync_execute_depth.clone();
+
+            let callback = move |args: &ToolArgs| -> Result<String, String> {
+                if in_sync_execute_depth.load(Ordering::SeqCst) > 0 {
+                    return Err(format!(
+                        "{}: {}\n",
+                        tool_name, SYNC_SCRIPTED_TOOL_DEADLOCK_ERROR
+                    ));
+                }
+
+                // Serialize params + stdin as JSON for the JS callback
+                let request = serde_json::json!({
+                    "params": args.params,
+                    "stdin": args.stdin.as_deref(),
+                });
+                let request_str = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+
+                // Dispatch the TSFN call on the shared callback runtime with a
+                // concurrency semaphore to prevent unbounded thread/task creation
+                // (see issue #982).
+                let tsfn_clone = tsfn.clone();
+                let tool_name_clone = tool_name.clone();
+                let rt = callback_runtime();
+                let sem = callback_semaphore();
+                let (tx, rx) = std::sync::mpsc::channel();
+                rt.spawn(async move {
+                    let result = match sem.acquire().await {
+                        Ok(_permit) => tsfn_clone
+                            .call_async((request_str,))
+                            .await
+                            // Sanitize JS callback errors here — don't let exception
+                            // details (paths, connection strings, stack traces) leak
+                            // into script stderr. Only the generic form passes through.
+                            .map_err(|_| format!("{}: callback failed\n", tool_name_clone)),
+                        Err(_) => Err(format!("{}: semaphore error\n", tool_name_clone)),
+                    };
+                    let _ = tx.send(result);
+                });
+                rx.recv()
+                    .map_err(|_| format!("{}: callback channel closed", tool_name))?
+            };
+
+            builder = builder.tool_fn(
+                ToolDef::new(&entry.name, &entry.description).with_schema(entry.schema.clone()),
+                callback,
+            );
+        }
+
+        for (k, v) in &self.env_vars {
+            builder = builder.env(k, v);
+        }
+
+        if self.max_commands.is_some() || self.max_loop_iterations.is_some() {
+            let mut limits = ExecutionLimits::new();
+            if let Some(mc) = self.max_commands {
+                limits = limits.max_commands(mc as usize);
+            }
+            if let Some(mli) = self.max_loop_iterations {
+                limits = limits.max_loop_iterations(mli as usize);
+            }
+            builder = builder.limits(limits);
+        }
+
+        builder.build()
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Build `ExecutionLimits` from the limit fields stored in `SharedState`.
+fn build_limits(state: &SharedState) -> ExecutionLimits {
+    let mut limits = core_profile(state).execution_limits().clone();
+    if let Some(v) = state.max_commands {
+        limits = limits.max_commands(v as usize);
+    }
+    if let Some(v) = state.max_loop_iterations {
+        limits = limits.max_loop_iterations(v as usize);
+    }
+    if let Some(v) = state.max_total_loop_iterations {
+        limits = limits.max_total_loop_iterations(v as usize);
+    }
+    if let Some(v) = state.max_function_depth {
+        limits = limits.max_function_depth(v as usize);
+    }
+    if let Some(v) = state.timeout_ms {
+        limits = limits.timeout(std::time::Duration::from_millis(v as u64));
+    }
+    if let Some(v) = state.parser_timeout_ms {
+        limits = limits.parser_timeout(std::time::Duration::from_millis(v as u64));
+    }
+    if let Some(v) = state.max_input_bytes {
+        limits = limits.max_input_bytes(v as usize);
+    }
+    if let Some(v) = state.max_ast_depth {
+        limits = limits.max_ast_depth(v as usize);
+    }
+    if let Some(v) = state.max_parser_operations {
+        limits = limits.max_parser_operations(v as usize);
+    }
+    if let Some(v) = state.max_stdout_bytes {
+        limits = limits.max_stdout_bytes(v as usize);
+    }
+    if let Some(v) = state.max_stderr_bytes {
+        limits = limits.max_stderr_bytes(v as usize);
+    }
+    if let Some(v) = state.capture_final_env {
+        limits = limits.capture_final_env(v);
+    }
+    limits
+}
+
+fn derive_sqlite_limits(state: &SharedState) -> bashkit::SqliteLimits {
+    let mut limits = core_profile(state).sqlite_limits().clone();
+    if let Some(ms) = state.timeout_ms {
+        limits = limits.max_duration(std::time::Duration::from_millis(u64::from(ms)));
+    }
+    if let Some(memory_bytes) = state.max_memory {
+        let max_db_bytes = memory_bytes.max(0.0).floor() as usize;
+        if max_db_bytes > 0 {
+            limits = limits.max_db_bytes(max_db_bytes);
+        }
+    }
+    limits
+}
+
+fn core_profile(state: &SharedState) -> bashkit::ExecutionProfile {
+    bashkit::ExecutionProfile::named(
+        state
+            .profile
+            .map(Into::into)
+            .unwrap_or(bashkit::ExecutionProfileName::Standard),
+    )
+}
+
+fn build_bash_from_state(state: &SharedState) -> RustBash {
+    let profile = core_profile(state);
+    let mut builder = RustBash::builder().profile(profile.clone());
+
+    if let Some(ref u) = state.username {
+        builder = builder.username(u);
+    }
+    if let Some(ref h) = state.hostname {
+        builder = builder.hostname(h);
+    }
+    if let Some(ref cwd) = state.cwd {
+        builder = builder.cwd(cwd.as_str());
+    }
+    if let Some(ref env) = state.env {
+        for (k, v) in env {
+            builder = builder.env(k, v);
+        }
+    }
+
+    builder = builder.limits(build_limits(state));
+
+    if let Some(max_mem) = state.max_memory {
+        builder = builder.max_memory(max_mem as usize);
+    }
+
+    // Mount files into the virtual filesystem
+    // THREAT[TM-ISO-025]: Reset must rebuild every constructor capability;
+    // dropping seed files can silently remove host-provided policy/config data.
+    if let Some(files) = &state.files {
+        for (path, content) in files {
+            builder = builder.mount_text(path, content);
+        }
+    }
+
+    // Apply real filesystem mounts
+    if let Some(ref allowed_mount_paths) = state.allowed_mount_paths {
+        builder = builder.allowed_mount_paths(allowed_mount_paths.iter().cloned());
+    }
+
+    if let Some(ref mounts) = state.mounts {
+        for m in mounts {
+            let writable = m.writable.unwrap_or(false);
+            builder = match (writable, &m.vfs_path) {
+                (false, None) => builder.mount_real_readonly(&m.host_path),
+                (false, Some(vfs)) => builder.mount_real_readonly_at(&m.host_path, vfs),
+                (true, None) => builder.mount_real_readwrite(&m.host_path),
+                (true, Some(vfs)) => builder.mount_real_readwrite_at(&m.host_path, vfs),
+            };
+        }
+    }
+
+    // Replay host directory mounts that were applied at runtime. They ride the
+    // builder alongside constructor mounts so the allowlist check and host-path
+    // bookkeeping are identical on every rebuild.
+    let runtime_mounts = state
+        .runtime_mounts
+        .lock()
+        .expect("runtime mount log poisoned")
+        .clone();
+    for mount in &runtime_mounts {
+        if let RuntimeMount::Real {
+            host_path,
+            vfs_path,
+            writable,
+        } = mount
+        {
+            builder = if *writable {
+                builder.mount_real_readwrite_at(host_path, vfs_path)
+            } else {
+                builder.mount_real_readonly_at(host_path, vfs_path)
+            };
+        }
+    }
+
+    // Enable Python/Monty. Passing `python: true` from JS is the explicit
+    // opt-in that must also flip the in-process Python env gate.
+    if state.python {
+        if let Some(ref handler) = state.external_handler {
+            let h = handler.clone();
+            let fn_names = state.external_functions.to_vec();
+            let python_handler: PythonExternalFnHandler = Arc::new(move |name, args, kwargs| {
+                let h = h.clone();
+                Box::pin(async move { h(name, args, kwargs).await })
+            });
+            builder = builder.python_with_external_handler(
+                profile.python_limits().clone(),
+                fn_names,
+                python_handler,
+            );
+        } else {
+            builder = builder.python();
+        }
+        builder = builder.env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1");
+    }
+
+    // Enable embedded SQLite (Turso). Passing `sqlite: true` from JS is the
+    // explicit opt-in that must also flip the in-process SQLite env gate.
+    if state.sqlite {
+        builder = builder.sqlite_with_limits(derive_sqlite_limits(state));
+        builder = builder.env("BASHKIT_ALLOW_INPROCESS_SQLITE", "1");
+    }
+
+    // Enable outbound network (curl/wget). Options were validated at
+    // construction time, so application here is infallible.
+    if let Some(ref network) = state.network {
+        builder = apply_network_options(builder, network);
+    }
+
+    // Attach the host-owned builtin registry. Entries inserted via JS
+    // `addBuiltin()` are visible to the running interpreter without rebuilding.
+    builder = builder.builtin_registry(state.host_registry.clone());
+
+    let mut bash = builder.build();
+
+    // Replay filesystem-handle mounts, which have no builder equivalent — they
+    // carry a live `Arc`, so they attach to the instance after build.
+    for mount in &runtime_mounts {
+        if let RuntimeMount::Fs { vfs_path, fs } = mount {
+            // A recorded mount was accepted once on a live instance; a failure
+            // here means the path is no longer mountable (e.g. shadowed by a
+            // constructor mount). Skipping keeps reset infallible, and the
+            // absent mount is observable, unlike a panic mid-rebuild.
+            let _ = bash.mount(Path::new(vfs_path), Arc::clone(fs));
+        }
+    }
+
+    // Replay host env last so it wins over constructor `env` for the same key,
+    // matching what happened on the live instance before the rebuild.
+    for (key, value) in state
+        .runtime_env
+        .lock()
+        .expect("runtime env log poisoned")
+        .iter()
+    {
+        bash.set_env(key, value);
+    }
+
+    bash
+}
+
+/// Build a `SharedState` from `BashOptions`, wiring up all config + interpreter.
+fn shared_state_from_opts(
+    opts: BashOptions,
+    external_handler: Option<ExternalHandlerArc>,
+) -> napi::Result<SharedState> {
+    let py = opts.python.unwrap_or(false);
+    let sql = opts.sqlite.unwrap_or(false);
+    let ext_fns = opts.external_functions.clone().unwrap_or_default();
+    let mounts = opts.mounts.clone();
+    let allowed_mount_paths = opts.allowed_mount_paths.clone();
+    if let Some(ref network) = opts.network {
+        validate_network_options(network)?;
+    }
+    let network = opts.network.clone();
+    // A single registry handle threaded through the tmp + final SharedState
+    // *and* the built interpreter — all observe the same underlying storage.
+    let host_registry = BuiltinRegistry::new();
+    // Same sharing rule for the runtime mutation logs: `reset()` rebuilds
+    // through the tmp-state path, so both handles must see the same entries.
+    let runtime_env: RuntimeEnvLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runtime_mounts: RuntimeMountLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Build a temporary SharedState to pass to build_bash_from_state
+    let tmp = SharedState {
+        inner: Mutex::new(RustBash::new()),
+        rt: Mutex::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| napi::Error::from_reason(format!("Failed to create runtime: {e}")))?,
+        ),
+        cancelled: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
+        on_output_reentry_depth: Arc::new(AtomicUsize::new(0)),
+        in_sync_execute_depth: Arc::new(AtomicUsize::new(0)),
+        async_execute_semaphore: Arc::new(Semaphore::new(MAX_PENDING_ASYNC_EXECUTIONS)),
+        username: opts.username.clone(),
+        profile: opts.profile,
+        hostname: opts.hostname.clone(),
+        cwd: opts.cwd.clone(),
+        env: opts.env.clone(),
+        max_commands: opts.max_commands,
+        max_loop_iterations: opts.max_loop_iterations,
+        max_total_loop_iterations: opts.max_total_loop_iterations,
+        max_function_depth: opts.max_function_depth,
+        timeout_ms: opts.timeout_ms,
+        parser_timeout_ms: opts.parser_timeout_ms,
+        max_input_bytes: opts.max_input_bytes,
+        max_ast_depth: opts.max_ast_depth,
+        max_parser_operations: opts.max_parser_operations,
+        max_stdout_bytes: opts.max_stdout_bytes,
+        max_stderr_bytes: opts.max_stderr_bytes,
+        max_memory: opts.max_memory,
+        capture_final_env: opts.capture_final_env,
+        files: opts.files.clone(),
+        mounts: mounts.clone(),
+        allowed_mount_paths: allowed_mount_paths.clone(),
+        python: py,
+        sqlite: sql,
+        network: network.clone(),
+        external_functions: ext_fns.clone(),
+        external_handler: external_handler.clone(),
+        host_registry: host_registry.clone(),
+        runtime_env: runtime_env.clone(),
+        runtime_mounts: runtime_mounts.clone(),
+    };
+
+    if let Some(ref mounts) = mounts {
+        for m in mounts {
+            enforce_mount_policy(
+                allowed_mount_paths.as_deref(),
+                &m.host_path,
+                "BashOptions.mounts",
+            )?;
+        }
+    }
+
+    let bash = build_bash_from_state(&tmp);
+    let cancelled = bash.cancellation_token();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create runtime: {e}")))?;
+
+    Ok(SharedState {
+        inner: Mutex::new(bash),
+        rt: Mutex::new(rt),
+        cancelled: std::sync::Mutex::new(cancelled),
+        on_output_reentry_depth: tmp.on_output_reentry_depth,
+        in_sync_execute_depth: tmp.in_sync_execute_depth,
+        async_execute_semaphore: Arc::new(Semaphore::new(MAX_PENDING_ASYNC_EXECUTIONS)),
+        username: opts.username,
+        profile: opts.profile,
+        hostname: opts.hostname,
+        cwd: opts.cwd,
+        env: opts.env,
+        max_commands: opts.max_commands,
+        max_loop_iterations: opts.max_loop_iterations,
+        max_total_loop_iterations: opts.max_total_loop_iterations,
+        max_function_depth: opts.max_function_depth,
+        timeout_ms: opts.timeout_ms,
+        parser_timeout_ms: opts.parser_timeout_ms,
+        max_input_bytes: opts.max_input_bytes,
+        max_ast_depth: opts.max_ast_depth,
+        max_parser_operations: opts.max_parser_operations,
+        max_stdout_bytes: opts.max_stdout_bytes,
+        max_stderr_bytes: opts.max_stderr_bytes,
+        max_memory: opts.max_memory,
+        capture_final_env: opts.capture_final_env,
+        files: opts.files,
+        mounts,
+        allowed_mount_paths,
+        python: py,
+        sqlite: sql,
+        network,
+        external_functions: ext_fns,
+        external_handler,
+        host_registry,
+        runtime_env,
+        runtime_mounts,
+    })
+}
+
+// ============================================================================
+// Snapshot history: commits, forks, and the object graph
+// ============================================================================
+
+// Decision: the JS object store is a plain `Record<string, Buffer>` keyed by hex
+// object id, matching the Python binding. Hosts persist these in their own
+// database, so the binding hands back what a driver or blob store already
+// accepts rather than a bespoke class.
+
+/// A commit plus the objects a host needs to persist.
+#[napi(object)]
+pub struct JsPackedCommit {
+    /// Content address of this commit — store it per message.
+    pub id: String,
+    /// Objects to persist, keyed by hex object id.
+    pub objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+    /// Number of new objects this commit emitted.
+    pub object_count: u32,
+    /// Total encoded size of the new objects, in bytes.
+    pub stored_bytes: f64,
+    /// Whether this commit carries every object needed to restore it.
+    /// False once `have` has excluded anything.
+    pub self_contained: bool,
+    /// Self-contained bytes equivalent to `snapshot()`, or `null` for an
+    /// incremental commit — packing one would produce unrestorable bytes.
+    pub packed: Option<napi::bindgen_prelude::Buffer>,
+}
+
+/// What changed between two commits.
+#[napi(object)]
+pub struct JsSnapshotDiff {
+    pub files_added: Vec<String>,
+    pub files_modified: Vec<String>,
+    pub files_removed: Vec<String>,
+    pub shell_changed: bool,
+}
+
+/// The environment that produced a commit.
+#[napi(object)]
+pub struct JsCapabilityFingerprint {
+    pub bashkit_version: String,
+    pub builtins: Vec<String>,
+    pub features: Vec<String>,
+    pub fs_backend: String,
+}
+
+/// Options for [`Bash::commit`].
+#[napi(object)]
+pub struct CommitOptions {
+    /// Commits this one descends from. Pass an id that is not the branch tip
+    /// to fork.
+    pub parents: Option<Vec<String>>,
+    /// Opaque host metadata (message id, timestamp). Bashkit stores it
+    /// verbatim and never interprets it.
+    pub meta: Option<HashMap<String, String>>,
+    /// Object ids the store already holds, so they are not emitted again.
+    /// This is what makes a commit incremental.
+    pub have: Option<Vec<String>>,
+    pub exclude_filesystem: Option<bool>,
+    pub exclude_functions: Option<bool>,
+}
+
+fn js_object_id(value: &str) -> napi::Result<RustObjectId> {
+    RustObjectId::from_hex(value)
+        .map_err(|e| napi::Error::from_reason(format!("invalid snapshot object id: {e}")))
+}
+
+fn js_store(
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+) -> napi::Result<HashMap<RustObjectId, Vec<u8>>> {
+    objects
+        .into_iter()
+        .map(|(id, blob)| Ok((js_object_id(&id)?, blob.to_vec())))
+        .collect()
+}
+
+fn js_policy(policy: Option<String>) -> napi::Result<RustCheckoutPolicy> {
+    match policy
+        .as_deref()
+        .unwrap_or("superset")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "strict" => Ok(RustCheckoutPolicy::Strict),
+        "superset" => Ok(RustCheckoutPolicy::Superset),
+        "force" => Ok(RustCheckoutPolicy::Force),
+        other => Err(napi::Error::from_reason(format!(
+            "unknown checkout policy '{other}'; expected 'strict', 'superset', or 'force'"
+        ))),
+    }
+}
+
+fn js_ids(ids: Vec<RustObjectId>) -> Vec<String> {
+    ids.iter().copied().map(RustObjectId::to_hex).collect()
+}
+
+fn js_snapshot_error(e: bashkit::Error) -> napi::Error {
+    napi::Error::from_reason(e.to_string())
+}
+
+/// Commits `commitId` descends from.
+#[napi]
+pub fn snapshot_parents(
+    commit_id: String,
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+) -> napi::Result<Vec<String>> {
+    let store = js_store(objects)?;
+    RustSnapshotGraph::parents(js_object_id(&commit_id)?, &store)
+        .map(js_ids)
+        .map_err(js_snapshot_error)
+}
+
+/// Host metadata attached when the commit was made.
+#[napi]
+pub fn snapshot_meta(
+    commit_id: String,
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+) -> napi::Result<HashMap<String, String>> {
+    let store = js_store(objects)?;
+    RustSnapshotGraph::meta(js_object_id(&commit_id)?, &store)
+        .map(|m| m.into_iter().collect())
+        .map_err(js_snapshot_error)
+}
+
+/// Capability fingerprint of the instance that produced this commit.
+#[napi]
+pub fn snapshot_capabilities(
+    commit_id: String,
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+) -> napi::Result<JsCapabilityFingerprint> {
+    let store = js_store(objects)?;
+    let caps = RustSnapshotGraph::capabilities(js_object_id(&commit_id)?, &store)
+        .map_err(js_snapshot_error)?;
+    Ok(JsCapabilityFingerprint {
+        bashkit_version: caps.bashkit_version,
+        builtins: caps.builtins,
+        features: caps.features,
+        fs_backend: caps.fs_backend,
+    })
+}
+
+/// Walk ancestry newest-first, stopping at `limit` or at the first commit the
+/// store does not contain.
+#[napi]
+pub fn snapshot_ancestry(
+    commit_id: String,
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+    limit: Option<u32>,
+) -> napi::Result<Vec<String>> {
+    let store = js_store(objects)?;
+    RustSnapshotGraph::ancestry(
+        js_object_id(&commit_id)?,
+        &store,
+        limit.unwrap_or(100) as usize,
+    )
+    .map(js_ids)
+    .map_err(js_snapshot_error)
+}
+
+/// Object ids needed to check out this commit that `objects` lacks.
+///
+/// Call repeatedly — each wave reveals the next — until it returns an empty
+/// array.
+#[napi]
+pub fn snapshot_plan_checkout(
+    commit_id: String,
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+) -> napi::Result<Vec<String>> {
+    let store = js_store(objects)?;
+    RustSnapshotGraph::plan_checkout(js_object_id(&commit_id)?, &store)
+        .map(js_ids)
+        .map_err(js_snapshot_error)
+}
+
+/// Every object this commit reaches, for host-side garbage collection.
+#[napi]
+pub fn snapshot_reachable(
+    commit_id: String,
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+) -> napi::Result<Vec<String>> {
+    let store = js_store(objects)?;
+    RustSnapshotGraph::reachable(js_object_id(&commit_id)?, &store)
+        .map(js_ids)
+        .map_err(js_snapshot_error)
+}
+
+/// Compare two commits.
+#[napi]
+pub fn snapshot_diff(
+    commit_a: String,
+    commit_b: String,
+    objects: HashMap<String, napi::bindgen_prelude::Buffer>,
+) -> napi::Result<JsSnapshotDiff> {
+    let store = js_store(objects)?;
+    let diff = RustSnapshotGraph::diff(js_object_id(&commit_a)?, js_object_id(&commit_b)?, &store)
+        .map_err(js_snapshot_error)?;
+    Ok(JsSnapshotDiff {
+        files_added: diff.files_added,
+        files_modified: diff.files_modified,
+        files_removed: diff.files_removed,
+        shell_changed: diff.shell_changed,
+    })
+}
+
+/// Get the bashkit version string.
+#[napi]
+pub fn get_version() -> &'static str {
+    VERSION
+}

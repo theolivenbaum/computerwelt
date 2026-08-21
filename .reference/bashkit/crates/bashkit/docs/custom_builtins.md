@@ -1,0 +1,486 @@
+# Custom Builtins
+
+Bashkit supports registering custom builtin commands to extend the shell with
+domain-specific functionality. Custom builtins receive an execution-scoped
+context including arguments, environment variables, shell variables, and a
+revocable virtual-filesystem view. Retaining the VFS or extension handles is
+safe: access fails deterministically after that `exec*()` completes or is cancelled.
+
+**See also:**
+- [API Documentation](https://docs.rs/bashkit) - Full API reference
+- [Clap Builtins](./clap-builtins.md) - Derive parser structs for custom builtin args
+- [Hooks](./hooks.md) - Interceptor hooks for the execution pipeline
+- [Compatibility Reference](./compatibility.md) - Supported bash features
+- [Threat Model](./threat-model.md) - Security considerations
+
+## Quick Start
+
+```rust
+use bashkit::{Bash, Builtin, BuiltinContext, ExecResult, async_trait};
+
+struct MyCommand;
+
+#[async_trait]
+impl Builtin for MyCommand {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        let name = ctx.args.first().map(|s| s.as_str()).unwrap_or("World");
+        Ok(ExecResult::ok(format!("Hello, {}!\n", name)))
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut bash = Bash::builder()
+        .builtin("greet", Box::new(MyCommand))
+        .build();
+
+    let result = bash.exec("greet Alice").await?;
+    assert_eq!(result.stdout, "Hello, Alice!\n");
+    Ok(())
+}
+```
+
+## The Builtin Trait
+
+All custom builtins must implement the `Builtin` trait:
+
+```rust,ignore
+#[async_trait]
+pub trait Builtin: Send + Sync {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> Result<ExecResult>;
+}
+```
+
+The trait is async-first (via `async_trait`) and requires `Send + Sync` for
+thread safety in async contexts.
+
+## Execution Context
+
+The `BuiltinContext` provides access to the execution environment:
+
+```rust,ignore
+pub struct BuiltinContext<'a> {
+    /// Command arguments (not including the command name)
+    pub args: &'a [String],
+
+    /// Environment variables
+    pub env: &'a HashMap<String, String>,
+
+    /// Shell variables (mutable)
+    pub variables: &'a mut HashMap<String, String>,
+
+    /// Current working directory (mutable)
+    pub cwd: &'a mut PathBuf,
+
+    /// Virtual filesystem
+    pub fs: Arc<dyn FileSystem>,
+
+    /// Standard input (from pipeline)
+    pub stdin: Option<&'a str>,
+}
+```
+
+### Per-Execution Extensions
+
+For request-scoped data that should not live on the builtin itself, use
+`Bash::exec_with_extensions()` (or `exec_streaming_with_extensions()`) and read
+the value inside the builtin with `ctx.execution_extension::<T>()`.
+
+```rust,ignore
+use bashkit::{Bash, Builtin, BuiltinContext, ExecResult, ExecutionExtensions, async_trait};
+
+struct RequestId;
+
+#[async_trait]
+impl Builtin for RequestId {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        let req = ctx
+            .execution_extension::<String>()
+            .and_then(|req| req.try_with(Clone::clone).ok())
+            .unwrap_or_else(|| "missing".to_string());
+        Ok(ExecResult::ok(format!("{req}\n")))
+    }
+}
+
+let bash = Bash::builder()
+    .builtin("request-id", Box::new(RequestId))
+    .build();
+
+let result = bash
+    .exec_with_extensions(
+        "request-id",
+        ExecutionExtensions::new().with("req-123".to_string()),
+    )
+    .await?;
+assert_eq!(result.stdout, "req-123\n");
+```
+
+## Extensions
+
+Use an `Extension` when one capability contributes multiple builtins.
+
+```rust,ignore
+use bashkit::{Bash, Builtin, BuiltinContext, ExecResult, Extension, async_trait};
+
+struct Hello;
+
+#[async_trait]
+impl Builtin for Hello {
+    async fn execute(&self, _ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        Ok(ExecResult::ok("hello\n".to_string()))
+    }
+}
+
+struct MyExtension;
+
+impl Extension for MyExtension {
+    fn builtins(&self) -> Vec<(String, Box<dyn Builtin>)> {
+        vec![("hello".to_string(), Box::new(Hello))]
+    }
+}
+
+let mut bash = Bash::builder().extension(MyExtension).build();
+let result = bash.exec("hello").await?;
+assert_eq!(result.stdout, "hello\n");
+```
+
+The same extension can be added to `BashTool::builder().extension(...)`.
+`TypeScriptExtension` uses this model to register the embedded
+TypeScript/JavaScript builtins.
+
+## Process-Local Host Calls
+
+Use an event-backed builtin when the host, not a `Builtin::execute`
+implementation, must receive a request and later supply its shell result. The
+execution remains parked in memory while the host performs the work.
+
+```rust
+use bashkit::{Bash, ExecResult, ExecutionEvent};
+
+# #[tokio::main]
+# async fn main() -> bashkit::Result<()> {
+let mut bash = Bash::builder()
+    .host_call_builtin("lookup")
+    .build();
+let mut execution = bash.start_execution("lookup alice; echo done");
+
+loop {
+    match execution.next_event().await? {
+        ExecutionEvent::HostCall(request) => {
+            assert_eq!(request.command(), "lookup");
+            assert_eq!(request.args(), &["alice"]);
+            execution.resume(request.id(), ExecResult::ok("Alice Example\n"))?;
+        }
+        ExecutionEvent::Complete(result) => {
+            assert_eq!(result.stdout, "Alice Example\ndone\n");
+            break;
+        }
+    }
+}
+let _bash = execution.into_bash().expect("execution completed");
+# Ok(())
+# }
+```
+
+`HostCallRequest` owns the command arguments, exported environment, virtual
+working directory, and exact pipeline stdin. Resume with `ExecResult` to supply
+stdout, stderr, and exit status. `start_execution_with_options` preserves the
+normal streaming callback, extensions, positional parameters, and stdin.
+
+This is live-future suspension only. `ExecutionHandle` owns its `Bash` while
+the execution is active; after completion, call `into_bash()` to recover the
+session. Dropping a suspended handle drops the session so partially unwound
+interpreter state cannot be reused. Neither the handle nor a pending request is
+serializable. Execution limits, including wall-clock timeout, remain active
+while the host call is parked. Calling an event-backed command through ordinary
+`exec()` fails immediately because no execution driver is present.
+
+## BuiltinRegistry, Runtime-Mutable Builtins
+
+`BashBuilder::builtin` and `Extension` are both *build-time*: the set of
+builtins is frozen when `Bash::builder().build()` returns. For embedders
+that need to register or remove builtins after construction without
+rebuilding the interpreter, use `BuiltinRegistry`.
+
+```rust,ignore
+use bashkit::{Bash, Builtin, BuiltinContext, BuiltinRegistry, ExecResult, async_trait};
+use std::sync::Arc;
+
+struct Greet;
+
+#[async_trait]
+impl Builtin for Greet {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        let who = ctx.args.first().map(String::as_str).unwrap_or("world");
+        Ok(ExecResult::ok(format!("hello {}\n", who)))
+    }
+}
+
+// Keep a clone of the registry handle so the embedder can mutate it later.
+let registry = BuiltinRegistry::new();
+let mut bash = Bash::builder()
+    .builtin_registry(registry.clone())
+    .build();
+
+// Run something first — VFS state accumulates.
+bash.exec("mkdir -p /scratch && echo seed > /scratch/seed.txt").await?;
+
+// Register a builtin after the interpreter is live. No rebuild, no VFS reset.
+registry.insert("greet", Arc::new(Greet));
+let r = bash.exec("greet Alice").await?;
+assert_eq!(r.stdout, "hello Alice\n");
+
+// Pre-existing files are still there.
+let r = bash.exec("cat /scratch/seed.txt").await?;
+assert_eq!(r.stdout, "seed\n");
+```
+
+The registry handle is `Clone`; clones share the same underlying storage,
+so mutations made via any clone are visible to all others (including the
+interpreter that owns one).
+
+**Resolution order**: shell function → POSIX special builtin → registry
+entry → baked-in builtin → `$PATH`. Registry entries can override
+baked-in commands (e.g. wrap `cat` with tracing) but shell functions
+still win, matching standard bash precedence.
+
+The registry is host-owned: not part of interpreter state, so it survives
+`exec()` calls automatically and is not serialized by `Bash::snapshot()`.
+Re-attach the handle after restoring from a snapshot.
+
+`BuiltinRegistry::insert` uses the same execution-scoped facilities as builder
+builtins. A trusted embedder that deliberately needs a retained, session-lived
+VFS handle must opt in with `insert_trusted`; do not use it for tenant/plugin code.
+
+### Arguments
+
+Arguments are passed as a slice of strings, excluding the command name itself:
+
+```rust,ignore
+// For "mycommand arg1 arg2", ctx.args = ["arg1", "arg2"]
+let first_arg = ctx.args.first().map(|s| s.as_str()).unwrap_or("default");
+```
+
+For custom builtins with richer flags, options, or subcommands, implement
+`ClapBuiltin` with a `#[derive(clap::Parser)]` argument type. See the
+`clap_builtins_guide` rustdoc module for tested examples.
+
+### Environment Variables
+
+Read-only access to environment variables set via `BashBuilder::env()` or `export`:
+
+```rust,ignore
+let home = ctx.env.get("HOME").map(|s| s.as_str()).unwrap_or("/");
+```
+
+### Shell Variables
+
+Mutable access to shell variables allows builtins to set variables:
+
+```rust,ignore
+ctx.variables.insert("RESULT".to_string(), "computed_value".to_string());
+```
+
+### Filesystem Access
+
+The virtual filesystem supports all standard operations:
+
+```rust,ignore
+// Read a file
+let content = ctx.fs.read_file(Path::new("/data/input.txt")).await?;
+
+// Write a file
+ctx.fs.write_file(Path::new("/output/result.txt"), b"output").await?;
+
+// Check existence
+if ctx.fs.exists(Path::new("/config")).await? {
+    // ...
+}
+```
+
+### Standard Input
+
+When the builtin is invoked in a pipeline, stdin contains the output from the
+previous command:
+
+```rust,ignore
+// echo "hello" | mycommand
+let input = ctx.stdin.expect("pipeline input");
+let exact_bytes = input.as_bytes();
+let processed = input.text_lossy().to_uppercase(); // explicit text boundary
+```
+
+## Return Values
+
+Builtins return `Result<ExecResult>`:
+
+```rust,ignore
+pub struct ExecResult {
+    pub stdout: StreamData,
+    pub stderr: StreamData,
+    pub exit_code: i32,
+}
+```
+
+`StreamData` preserves exact bytes. Use `ExecResult::ok_bytes` for binary
+output, `as_bytes()`/`into_bytes()` for byte consumers, and `text()` or
+`text_lossy()` only for text-oriented consumers. Shell variables and command
+substitution are text-only; command substitution removes NUL bytes.
+
+Helper constructors:
+
+```rust
+# use bashkit::ExecResult;
+// Success with output
+ExecResult::ok("output\n".to_string());
+
+// Error with message and exit code
+ExecResult::err("error message\n".to_string(), 1);
+```
+
+## Examples
+
+### Database Query Builtin
+
+```rust,ignore
+use bashkit::{Bash, Builtin, BuiltinContext, ExecResult, async_trait};
+use sqlx::PgPool;
+use std::sync::Arc;
+
+struct Psql {
+    pool: Arc<PgPool>,
+}
+
+#[async_trait]
+impl Builtin for Psql {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        // Parse -c "query" argument
+        let query = match ctx.args.iter().position(|a| a == "-c") {
+            Some(i) => ctx.args.get(i + 1).map(|s| s.as_str()).unwrap_or(""),
+            None => return Ok(ExecResult::err("Usage: psql -c 'query'\n".into(), 1)),
+        };
+
+        // Execute query (simplified - real impl would format results)
+        match sqlx::query(query).fetch_all(&*self.pool).await {
+            Ok(rows) => Ok(ExecResult::ok(format!("{} rows\n", rows.len()))),
+            Err(e) => Ok(ExecResult::err(format!("ERROR: {}\n", e), 1)),
+        }
+    }
+}
+
+// Usage
+let pool = Arc::new(PgPool::connect("postgres://...").await?);
+let mut bash = Bash::builder()
+    .builtin("psql", Box::new(Psql { pool }))
+    .build();
+
+bash.exec("psql -c 'SELECT * FROM users'").await?;
+```
+
+### HTTP Client Builtin
+
+```rust,ignore
+struct HttpGet {
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl Builtin for HttpGet {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        let url = match ctx.args.first() {
+            Some(url) => url,
+            None => return Ok(ExecResult::err("Usage: httpget <url>\n".into(), 1)),
+        };
+
+        match self.client.get(url).send().await {
+            Ok(resp) => {
+                let body = resp.text().await.unwrap_or_default();
+                Ok(ExecResult::ok(body))
+            }
+            Err(e) => Ok(ExecResult::err(format!("Error: {}\n", e), 1)),
+        }
+    }
+}
+```
+
+### Overriding Default Builtins
+
+Custom builtins can override default builtins by using the same name:
+
+```rust,no_run
+use bashkit::{Bash, Builtin, BuiltinContext, ExecResult, async_trait};
+
+struct SecureEcho;
+
+#[async_trait]
+impl Builtin for SecureEcho {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        // Redact sensitive patterns
+        let output: Vec<_> = ctx.args.iter()
+            .map(|s| if s.contains("password") { "[REDACTED]" } else { s.as_str() })
+            .collect();
+        Ok(ExecResult::ok(format!("{}\n", output.join(" "))))
+    }
+}
+
+# fn main() {
+let bash = Bash::builder()
+    .builtin("echo", Box::new(SecureEcho))  // Overrides default echo
+    .build();
+# }
+```
+
+## Best Practices
+
+1. **Return proper exit codes**: Use 0 for success, non-zero for errors
+2. **Include newlines**: Output should end with `\n` for proper formatting
+3. **Handle missing args gracefully**: Provide usage messages for incorrect invocations
+4. **Use stderr for errors**: Write error messages to `ExecResult::stderr`
+5. **Keep builtins stateless when possible**: Use `Arc` for shared state that needs mutation
+
+## Thread Safety
+
+The `Builtin` trait requires `Send + Sync`. For builtins with mutable state, use
+appropriate synchronization:
+
+```rust
+use bashkit::{Builtin, BuiltinContext, ExecResult, async_trait};
+use std::sync::Arc;
+
+struct Counter {
+    count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[async_trait]
+impl Builtin for Counter {
+    async fn execute(&self, _ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        let n = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ExecResult::ok(format!("{}\n", n)))
+    }
+}
+```
+
+## Integration with Scripts
+
+Custom builtins integrate smoothly with bash scripting:
+
+```bash
+# Variables work
+NAME="Alice"
+greet $NAME
+
+# Pipelines work
+echo "hello world" | upper | head -1
+
+# Conditionals work
+if mycheck; then
+    echo "passed"
+else
+    echo "failed"
+fi
+
+# Loops work
+for item in a b c; do
+    process $item
+done
+```

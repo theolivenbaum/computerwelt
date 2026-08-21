@@ -1,0 +1,607 @@
+"""Tests for custom `AbstractOS` implementations.
+
+These tests verify that `AbstractOS` can be subclassed to provide a
+virtual filesystem plus other host-backed operations that Monty code can
+interact with through the `os=` callback surface.
+"""
+
+import datetime
+from pathlib import PurePosixPath
+
+import pytest
+from conftest import RunMonty
+from inline_snapshot import snapshot
+
+import pydantic_monty
+from pydantic_monty import NOT_HANDLED, AbstractOS, MontyFileHandle, StatResult
+from pydantic_monty.os_access import path_from_arg
+
+
+class TestOS(AbstractOS):
+    """A simple in-memory filesystem for testing."""
+
+    __test__ = False
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.directories: set[str] = {'/'}
+
+    def _ensure_parent_exists(self, path: str) -> None:
+        """Ensure all parent directories exist."""
+        parts = path.rstrip('/').split('/')
+        for i in range(1, len(parts)):
+            parent = '/'.join(parts[:i]) or '/'
+            self.directories.add(parent)
+
+    def path_exists(self, path: PurePosixPath) -> bool:
+        p = str(path)
+        return p in self.files or p in self.directories
+
+    def path_is_file(self, path: PurePosixPath) -> bool:
+        return str(path) in self.files
+
+    def path_is_dir(self, path: PurePosixPath) -> bool:
+        return str(path) in self.directories
+
+    def path_is_symlink(self, path: PurePosixPath) -> bool:
+        return False  # No symlink support in this simple implementation
+
+    def path_read_text(self, path: PurePosixPath | MontyFileHandle) -> str:
+        p = str(path_from_arg(path))
+        if p not in self.files:
+            raise FileNotFoundError(f'No such file: {p}')
+        return self.files[p].decode('utf-8')
+
+    def path_read_bytes(self, path: PurePosixPath | MontyFileHandle) -> bytes:
+        p = str(path_from_arg(path))
+        if p not in self.files:
+            raise FileNotFoundError(f'No such file: {p}')
+        return self.files[p]
+
+    def path_write_text(self, path: PurePosixPath | MontyFileHandle, data: str) -> int:
+        p = str(path_from_arg(path))
+        self._ensure_parent_exists(p)
+        self.files[p] = data.encode('utf-8')
+        return len(data)
+
+    def path_write_bytes(self, path: PurePosixPath | MontyFileHandle, data: bytes) -> int:
+        p = str(path_from_arg(path))
+        self._ensure_parent_exists(p)
+        self.files[p] = data
+        return len(data)
+
+    def path_append_text(self, path: PurePosixPath | MontyFileHandle, data: str) -> int:
+        p = str(path_from_arg(path))
+        self._ensure_parent_exists(p)
+        self.files[p] = self.files.get(p, b'') + data.encode('utf-8')
+        return len(data)
+
+    def path_append_bytes(self, path: PurePosixPath | MontyFileHandle, data: bytes) -> int:
+        p = str(path_from_arg(path))
+        self._ensure_parent_exists(p)
+        self.files[p] = self.files.get(p, b'') + data
+        return len(data)
+
+    def path_mkdir(self, path: PurePosixPath, parents: bool, exist_ok: bool) -> None:
+        p = str(path)
+        if p in self.directories:
+            if not exist_ok:
+                raise FileExistsError(f'Directory exists: {p}')
+            return
+        if parents:
+            self._ensure_parent_exists(p)
+        self.directories.add(p)
+
+    def path_unlink(self, path: PurePosixPath) -> None:
+        p = str(path)
+        if p not in self.files:
+            raise FileNotFoundError(f'No such file: {p}')
+        del self.files[p]
+
+    def path_rmdir(self, path: PurePosixPath) -> None:
+        p = str(path)
+        if p not in self.directories:
+            raise FileNotFoundError(f'No such directory: {p}')
+        # Check if directory is empty
+        for f in self.files:
+            if f.startswith(p + '/'):
+                raise OSError(f'Directory not empty: {p}')
+        for d in self.directories:
+            if d != p and d.startswith(p + '/'):
+                raise OSError(f'Directory not empty: {p}')
+        self.directories.remove(p)
+
+    def path_iterdir(self, path: PurePosixPath) -> list[PurePosixPath]:
+        p = str(path)
+        if p not in self.directories:
+            raise FileNotFoundError(f'No such directory: {p}')
+        result: list[PurePosixPath] = []
+        prefix = p.rstrip('/') + '/'
+        seen: set[str] = set()
+        for f in self.files:
+            if f.startswith(prefix):
+                # Get immediate child name
+                rest = f[len(prefix) :]
+                child = rest.split('/')[0]
+                if child and child not in seen:
+                    seen.add(child)
+                    result.append(PurePosixPath(prefix + child))
+        for d in self.directories:
+            if d.startswith(prefix) and d != p:
+                rest = d[len(prefix) :]
+                child = rest.split('/')[0]
+                if child and child not in seen:
+                    seen.add(child)
+                    result.append(PurePosixPath(prefix + child))
+        return sorted(result)
+
+    def path_stat(self, path: PurePosixPath) -> StatResult:
+        p = str(path)
+        if p in self.files:
+            return StatResult.file_stat(len(self.files[p]), 0o644, 0.0)
+        elif p in self.directories:
+            return StatResult.dir_stat(0o755, 0.0)
+        else:
+            raise FileNotFoundError(f'No such file or directory: {p}')
+
+    def path_rename(self, path: PurePosixPath, target: PurePosixPath) -> None:
+        p = str(path)
+        t = str(target)
+        if p in self.files:
+            self._ensure_parent_exists(t)
+            self.files[t] = self.files.pop(p)
+        elif p in self.directories:
+            self._ensure_parent_exists(t)
+            self.directories.remove(p)
+            self.directories.add(t)
+            # Move all files under this directory
+            prefix = p.rstrip('/') + '/'
+            to_move = [(f, t + f[len(p) :]) for f in self.files if f.startswith(prefix)]
+            for old, new in to_move:
+                self.files[new] = self.files.pop(old)
+        else:
+            raise FileNotFoundError(f'No such file or directory: {p}')
+
+    def path_resolve(self, path: PurePosixPath) -> str:
+        # Simple implementation: just normalize the path
+        p = str(path)
+        parts: list[str] = []
+        for part in p.split('/'):
+            if part == '..':
+                if parts:
+                    parts.pop()
+            elif part and part != '.':
+                parts.append(part)
+        return '/' + '/'.join(parts)
+
+    def path_absolute(self, path: PurePosixPath) -> str:
+        p = str(path)
+        if p.startswith('/'):
+            return p
+        return '/' + p
+
+    def getenv(self, key: str, default: str | None = None) -> str | None:
+        # Simple virtual environment for testing
+        env = {
+            'TEST_VAR': 'test_value',
+            'HOME': '/test/home',
+        }
+        return env.get(key, default)
+
+    def get_environ(self) -> dict[str, str]:
+        return {
+            'TEST_VAR': 'test_value',
+            'HOME': '/test/home',
+        }
+
+    def date_today(self) -> datetime.date:
+        return datetime.date(2024, 1, 15)
+
+    def datetime_now(self, tz: datetime.tzinfo | None = None) -> datetime.datetime:
+        if tz is None:
+            return datetime.datetime(2024, 1, 15, 10, 30, 5, 123456)
+        return datetime.datetime(2024, 1, 15, 10, 30, 5, 123456, tzinfo=tz)
+
+
+# =============================================================================
+# Basic AbstractOS tests
+# =============================================================================
+
+
+def test_abstract_filesystem_exists(monty_run: RunMonty):
+    """AbstractOS.path_exists() works with os."""
+    fs = TestOS()
+    fs.files['/test.txt'] = b'hello'
+
+    result = monty_run('from pathlib import Path; Path("/test.txt").exists()', os=fs)
+
+    assert result is True
+
+
+def test_abstract_filesystem_exists_missing(monty_run: RunMonty):
+    """AbstractOS.path_exists() returns False for missing files."""
+    fs = TestOS()
+
+    result = monty_run('from pathlib import Path; Path("/missing.txt").exists()', os=fs)
+
+    assert result is False
+
+
+def test_abstract_os_date_today(monty_run: RunMonty):
+    """AbstractOS.date_today() is dispatched through the os callback."""
+    fs = TestOS()
+
+    result = monty_run('from datetime import date; date.today()', os=fs)
+
+    assert (type(result).__name__, repr(result)) == snapshot(('date', 'datetime.date(2024, 1, 15)'))
+
+
+def test_abstract_os_datetime_now_with_timezone(monty_run: RunMonty):
+    """AbstractOS.datetime_now() receives the requested timezone."""
+    fs = TestOS()
+
+    result = monty_run('from datetime import datetime, timezone; datetime.now(timezone.utc)', os=fs)
+
+    assert (type(result).__name__, repr(result)) == snapshot(
+        (
+            'datetime',
+            'datetime.datetime(2024, 1, 15, 10, 30, 5, 123456, tzinfo=datetime.timezone.utc)',
+        )
+    )
+
+
+def test_abstract_os_dispatch():
+    """AbstractOS.dispatch() routes built-in OS operations to the matching method."""
+    fs = TestOS()
+    fs.files['/test.txt'] = b'hello'
+
+    result = fs.dispatch('Path.read_text', (PurePosixPath('/test.txt'),), {})
+    assert result == snapshot('hello')
+
+
+def test_abstract_os_dispatch_not_handled():
+    """AbstractOS.dispatch() returns NOT_HANDLED when a handler raises NotImplementedError."""
+
+    class PartialOS(TestOS):
+        def path_exists(self, path: PurePosixPath) -> bool:
+            raise NotImplementedError
+
+    fs = PartialOS()
+    result = fs('Path.exists', (PurePosixPath('/tmp'),), {})
+
+    assert result is NOT_HANDLED
+
+
+def test_abstract_os_dispatch_not_handled_falls_back_in_run(monty_run: RunMonty):
+    """Returning NOT_HANDLED from dispatch() uses Monty's default fallback error."""
+
+    class PartialOS(TestOS):
+        def dispatch(
+            self,
+            function_name: pydantic_monty.OsFunction,
+            args: tuple[object, ...],
+            kwargs: dict[str, object] | None = None,
+        ) -> object:
+            if function_name == 'Path.exists':
+                return NOT_HANDLED
+            return super().dispatch(function_name, args, kwargs)
+
+    fs = PartialOS()
+    code = """
+from pathlib import Path
+message = None
+try:
+    Path('/tmp').exists()
+except PermissionError as exc:
+    message = str(exc)
+message
+"""
+    result = monty_run(code, os=fs)
+    assert result == snapshot("Permission denied: '/tmp'")
+
+
+def test_abstract_filesystem_is_file(monty_run: RunMonty):
+    """AbstractOS.path_is_file() distinguishes files from directories."""
+    fs = TestOS()
+    fs.files['/file.txt'] = b'content'
+    fs.directories.add('/mydir')
+
+    code = """
+from pathlib import Path
+(Path('/file.txt').is_file(), Path('/mydir').is_file())
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot((True, False))
+
+
+def test_abstract_filesystem_is_dir(monty_run: RunMonty):
+    """AbstractOS.path_is_dir() distinguishes directories from files."""
+    fs = TestOS()
+    fs.files['/file.txt'] = b'content'
+    fs.directories.add('/mydir')
+
+    code = """
+from pathlib import Path
+(Path('/file.txt').is_dir(), Path('/mydir').is_dir())
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot((False, True))
+
+
+def test_abstract_filesystem_read_text(monty_run: RunMonty):
+    """AbstractOS.path_read_text() returns file contents."""
+    fs = TestOS()
+    fs.files['/hello.txt'] = b'Hello, World!'
+
+    result = monty_run('from pathlib import Path; Path("/hello.txt").read_text()', os=fs)
+
+    assert result == snapshot('Hello, World!')
+
+
+def test_abstract_filesystem_read_text_missing(monty_run: RunMonty):
+    """AbstractOS.path_read_text() raises FileNotFoundError for missing files."""
+    fs = TestOS()
+
+    with pytest.raises(pydantic_monty.MontyRuntimeError) as exc_info:
+        monty_run('from pathlib import Path; Path("/missing.txt").read_text()', os=fs)
+    assert str(exc_info.value) == snapshot('FileNotFoundError: No such file: /missing.txt')
+    assert isinstance(exc_info.value.exception(), FileNotFoundError)
+
+
+def test_abstract_filesystem_read_bytes(monty_run: RunMonty):
+    """AbstractOS.path_read_bytes() returns raw bytes."""
+    fs = TestOS()
+    fs.files['/data.bin'] = b'\x00\x01\x02\x03'
+
+    result = monty_run('from pathlib import Path; Path("/data.bin").read_bytes()', os=fs)
+
+    assert result == snapshot(b'\x00\x01\x02\x03')
+
+
+def test_abstract_filesystem_open_passes_path_to_read_handler(monty_run: RunMonty):
+    """`open(...).read()` and `Path(...).read_text()` deliver the same shape
+    to the host's `path_read_text` handler — a `PurePosixPath` carrying the
+    virtual path.
+
+    The typed `OsFunctionCall::ReadText` payload only carries the path; the
+    interpreter does not pass the `MontyFileHandle` through to the host
+    because the host already issued the original `path_open` for the
+    handle and can recover any additional state from the path. This is a
+    deliberate simplification of the host boundary versus the older
+    arg-array protocol.
+    """
+
+    class PathRecordingOS(TestOS):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_args: list[tuple[type, str]] = []
+
+        def path_open(self, path: PurePosixPath, mode: str) -> MontyFileHandle:
+            if mode.startswith('r') and str(path) not in self.files:
+                raise FileNotFoundError(f'No such file: {path}')
+            return MontyFileHandle(str(path), mode)
+
+        def path_read_text(self, path: PurePosixPath | MontyFileHandle) -> str:
+            self.read_args.append((type(path), str(path)))
+            return super().path_read_text(path)
+
+    fs = PathRecordingOS()
+    fs.files['/hello.txt'] = b'hi'
+
+    # open() + .read()
+    code = """
+f = open('/hello.txt')
+data = f.read()
+f.close()
+data
+"""
+    assert monty_run(code, os=fs) == snapshot('hi')
+    assert fs.read_args == [(PurePosixPath, '/hello.txt')]
+
+    # Path(...).read_text() — same shape.
+    fs.read_args.clear()
+    assert monty_run('from pathlib import Path; Path("/hello.txt").read_text()', os=fs) == 'hi'
+    assert fs.read_args == [(PurePosixPath, '/hello.txt')]
+
+
+# =============================================================================
+# stat() tests
+# =============================================================================
+
+
+def test_abstract_filesystem_stat_file(monty_run: RunMonty):
+    """AbstractOS.path_stat() returns stat result for files."""
+    fs = TestOS()
+    fs.files['/file.txt'] = b'hello world'
+
+    code = """
+from pathlib import Path
+s = Path('/file.txt').stat()
+(s.st_size, s.st_mode)
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot((11, 0o100644))
+
+
+def test_abstract_filesystem_stat_directory(monty_run: RunMonty):
+    """AbstractOS.path_stat() returns stat result for directories."""
+    fs = TestOS()
+    fs.directories.add('/mydir')
+
+    code = """
+from pathlib import Path
+s = Path('/mydir').stat()
+s.st_mode
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot(0o040755)
+
+
+def test_abstract_filesystem_stat_missing(monty_run: RunMonty):
+    """AbstractOS.path_stat() raises FileNotFoundError for missing paths."""
+    fs = TestOS()
+
+    with pytest.raises(pydantic_monty.MontyRuntimeError) as exc_info:
+        monty_run('from pathlib import Path\nPath("/missing").stat()', os=fs)
+
+    assert str(exc_info.value) == snapshot('FileNotFoundError: No such file or directory: /missing')
+    assert exc_info.value.display() == snapshot("""\
+Traceback (most recent call last):
+  File "<python-input-0>", line 2, in <module>
+    Path("/missing").stat()
+    ~~~~~~~~~~~~~~~~~~~~~~~
+FileNotFoundError: No such file or directory: /missing\
+""")
+
+
+# =============================================================================
+# iterdir() tests
+# =============================================================================
+
+
+def test_abstract_filesystem_iterdir(monty_run: RunMonty):
+    """AbstractOS.path_iterdir() lists directory contents."""
+    fs = TestOS()
+    fs.directories.add('/mydir')
+    fs.files['/mydir/a.txt'] = b'a'
+    fs.files['/mydir/b.txt'] = b'b'
+    fs.directories.add('/mydir/subdir')
+
+    code = """
+from pathlib import Path
+list(Path('/mydir').iterdir())
+"""
+    result = monty_run(code, os=fs)
+
+    # Result is a list of Path objects with child names joined to parent
+    assert len(result) == 3
+    names = sorted(str(p) for p in result)
+    assert names == snapshot(['/mydir/a.txt', '/mydir/b.txt', '/mydir/subdir'])
+
+
+def test_abstract_filesystem_iterdir_empty(monty_run: RunMonty):
+    """AbstractOS.path_iterdir() returns empty list for empty directory."""
+    fs = TestOS()
+    fs.directories.add('/empty')
+
+    code = """
+from pathlib import Path
+list(Path('/empty').iterdir())
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot([])
+
+
+# =============================================================================
+# resolve() and absolute() tests
+# =============================================================================
+
+
+def test_abstract_filesystem_resolve(monty_run: RunMonty):
+    """AbstractOS.path_resolve() normalizes paths."""
+    fs = TestOS()
+
+    code = """
+from pathlib import Path
+str(Path('/foo/bar/../baz').resolve())
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot('/foo/baz')
+
+
+def test_abstract_filesystem_absolute(monty_run: RunMonty):
+    """AbstractOS.path_absolute() returns absolute path."""
+    fs = TestOS()
+
+    code = """
+from pathlib import Path
+str(Path('/already/absolute').absolute())
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot('/already/absolute')
+
+
+def test_abstract_filesystem_getenv(monty_run: RunMonty):
+    """AbstractOS.getenv() returns environment variable value."""
+    fs = TestOS()
+
+    code = """
+import os
+os.getenv('TEST_VAR')
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot('test_value')
+
+
+def test_abstract_filesystem_getenv_missing(monty_run: RunMonty):
+    """AbstractOS.getenv() returns None for missing variable."""
+    fs = TestOS()
+
+    code = """
+import os
+os.getenv('NONEXISTENT')
+"""
+    result = monty_run(code, os=fs)
+
+    assert result is None
+
+
+def test_abstract_filesystem_getenv_default(monty_run: RunMonty):
+    """AbstractOS.getenv() returns default for missing variable."""
+    fs = TestOS()
+
+    code = """
+import os
+os.getenv('NONEXISTENT', 'my_default')
+"""
+    result = monty_run(code, os=fs)
+
+    assert result == snapshot('my_default')
+
+
+# =============================================================================
+# file_stat / dir_stat helper tests
+# =============================================================================
+
+
+def test_file_stat_helper():
+    """file_stat() creates a proper stat result."""
+    stat = StatResult.file_stat(1024, 0o644, 1700000000.0)
+
+    # Check it has the expected structure (10 fields)
+    assert len(stat) == snapshot(10)
+    # Index access: st_mode=0, st_size=6, st_mtime=8
+    assert stat[0] == snapshot(0o100644)  # st_mode - file_stat adds file type bits
+    assert stat[6] == snapshot(1024)  # st_size
+    assert stat[8] == snapshot(1700000000.0)  # st_mtime
+
+
+def test_dir_stat_helper():
+    """dir_stat() creates a proper stat result for directories."""
+    stat = StatResult.dir_stat(0o755, 1700000000.0)
+
+    assert len(stat) == snapshot(10)
+    # Index access: st_mode=0, st_size=6, st_mtime=8
+    assert stat[0] == snapshot(0o040755)  # st_mode - dir_stat adds directory type bits
+    assert stat[6] == snapshot(4096)  # st_size - directories have fixed size
+    assert stat[8] == snapshot(1700000000.0)  # st_mtime
+
+
+def test_path_monty_to_py(monty_run: RunMonty):
+    result = monty_run('from pathlib import Path; Path("/foo/bar/thing.txt")')
+    assert result == PurePosixPath('/foo/bar/thing.txt')
+    assert type(result) is PurePosixPath
+
+
+def test_path_py_to_monty(monty_run: RunMonty):
+    p = PurePosixPath('/foo/bar/thing.txt')
+    result = monty_run('f"type={type(p)} {p=}"', inputs={'p': p})
+    assert result == snapshot("type=<class 'PosixPath'> p=PosixPath('/foo/bar/thing.txt')")

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Computerwelt.Emulation.Bash</RootNamespace>
+    <AssemblyName>Computerwelt.Emulation.Bash</AssemblyName>
+    <PackageId>Computerwelt.Emulation.Bash</PackageId>
+    <Description>Sandboxed, in-process bash interpreter with a virtual filesystem. C# port of the Rust bashkit crate.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Computerwelt.Emulation.Bash.Tests" />
+    <InternalsVisibleTo Include="Computerwelt.Emulation.Bash.SpecTests" />
+  </ItemGroup>
+
+</Project>
