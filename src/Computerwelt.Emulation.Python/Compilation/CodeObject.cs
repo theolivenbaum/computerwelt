@@ -45,6 +45,37 @@ public sealed class CodeObject
     /// <summary>The declared parameters.</summary>
     public Parsing.ParameterList Parameters { get; set; } = Parsing.ParameterList.Empty;
 
+    private int[]? _parameterSlots;
+
+    /// <summary>
+    /// The local slot each declared parameter binds to, in declaration order.
+    /// </summary>
+    /// <remarks>
+    /// Resolved once and kept: binding a call otherwise searched <see cref="LocalNames"/>
+    /// by string for every parameter, on every call, which is quadratic in a function's
+    /// own size and paid per invocation.
+    /// </remarks>
+    internal int[] ParameterSlots
+    {
+        get
+        {
+            if (_parameterSlots is not null)
+            {
+                return _parameterSlots;
+            }
+
+            var declared = Parameters.Parameters;
+            var slots = new int[declared.Count];
+
+            for (var i = 0; i < declared.Count; i++)
+            {
+                slots[i] = LocalNames.IndexOf(declared[i].Name);
+            }
+
+            return _parameterSlots = slots;
+        }
+    }
+
     /// <summary>True when the body contains a <c>yield</c>, making calls produce a generator.</summary>
     public bool IsGenerator { get; set; }
 

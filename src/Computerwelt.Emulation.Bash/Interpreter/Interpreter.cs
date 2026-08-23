@@ -1352,12 +1352,10 @@ public sealed class Interpreter
                     return;
                 }
 
-                if (assignment.Append && variable.IsArray)
-                {
-                    variable.AppendArray([value]);
-                    return;
-                }
-
+                // `x+=z` on an array appends to element 0, not as a new element: bash
+                // reads a scalar assignment as one about `${x[0]}` whatever the variable
+                // holds, so `x=(a b c); x+=z` leaves `az b c`. Appending an element is
+                // what `x+=(z)` is for, and that is the array case above.
                 if (assignment.Append)
                 {
                     variable.AppendScalar(value);

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using System.Text;
 
@@ -14,12 +15,23 @@ namespace Computerwelt.Emulation.Bash.Parsing;
 /// </remarks>
 public static class WordParser
 {
+    // The characters this parser reacts to at all: process substitution, tilde, escapes,
+    // both quotes, backticks and `$`. Raw text containing none of them is one literal part
+    // and can be handed back as it stands — no builder, no copy of the string the lexer
+    // already produced. Most words in a script are of that kind.
+    private static readonly SearchValues<char> WordSyntax = SearchValues.Create("<>~\\'\"`$");
+
     /// <summary>Parses raw word text into a structured word.</summary>
     public static Word Parse(string raw)
     {
         if (raw.Length == 0)
         {
             return Word.Empty;
+        }
+
+        if (!raw.AsSpan().ContainsAny(WordSyntax))
+        {
+            return Word.Literal(raw);
         }
 
         var parts = new List<WordPart>();

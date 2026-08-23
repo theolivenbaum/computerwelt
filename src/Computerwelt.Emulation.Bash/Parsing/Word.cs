@@ -20,7 +20,23 @@ public sealed record Word(IReadOnlyList<WordPart> Parts)
     public static Word Literal(string text) => new([new WordPart.Literal(text)]);
 
     /// <summary>True when every part is literal, so no expansion is needed.</summary>
-    public bool IsLiteral => Parts.All(static p => p is WordPart.Literal);
+    public bool IsLiteral
+    {
+        get
+        {
+            // A loop rather than `Parts.All(...)`: this is asked once per command word,
+            // and the LINQ form boxes an enumerator each time.
+            for (var i = 0; i < Parts.Count; i++)
+            {
+                if (Parts[i] is not WordPart.Literal)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
 
     /// <summary>
     /// The concatenated literal text, valid only when <see cref="IsLiteral"/> is true.

@@ -45,8 +45,15 @@ public enum VariableAttributes
 /// </remarks>
 public sealed class ShellVariable
 {
-    private readonly SortedDictionary<long, string> _indexed = [];
-    private readonly Dictionary<string, string> _associative = new(StringComparer.Ordinal);
+    // Storage is allocated only once the variable needs it. The overwhelmingly common
+    // shape — a scalar, or a one-element array such as FUNCNAME — lives in `_scalar`
+    // alone, which is element 0 of the indexed view; anything that touches another
+    // subscript materialises `_indexed` first. A shell session seeds two dozen variables
+    // and forks the lot on every command substitution, so what a variable costs when it
+    // holds one string is a cost the whole port pays.
+    private SortedDictionary<long, string>? _indexed;
+    private Dictionary<string, string>? _associative;
+    private string? _scalar;
 
     /// <summary>Creates an unset variable with the given attributes.</summary>
     public ShellVariable(VariableAttributes attributes = VariableAttributes.None) =>
@@ -76,8 +83,19 @@ public sealed class ShellVariable
     /// <summary>True when assignment to this variable is an error.</summary>
     public bool IsReadOnly => Attributes.HasFlag(VariableAttributes.ReadOnly);
 
-    /// <summary>True when the variable has never been given a value.</summary>
-    public bool IsUnset { get; private set; } = true;
+    /// <summary>
+    /// True when the variable has no scalar value.
+    /// </summary>
+    /// <remarks>
+    /// The question is about element 0, not about whether the name exists: bash reads
+    /// <c>$x</c> as <c>${x[0]}</c>, so <c>${x+set}</c> and <c>set -u</c> follow that
+    /// element. An array with no element 0 — <c>x=()</c>, or one that starts at
+    /// <c>x[1]</c>, or one whose first element was unset — is therefore unset for those
+    /// purposes even though it is declared, and <c>x=</c> is set even though it is empty.
+    /// </remarks>
+    public bool IsUnset => IsAssociative
+        ? _associative?.ContainsKey("0") is not true
+        : _indexed is null ? _scalar is null : !_indexed.ContainsKey(0);
 
     /// <summary>
     /// The scalar view. For an array this is element 0 (indexed) or the empty string
@@ -89,27 +107,44 @@ public sealed class ShellVariable
         {
             if (IsAssociative)
             {
-                return _associative.TryGetValue("0", out var assoc) ? assoc : string.Empty;
+                return _associative is not null && _associative.TryGetValue("0", out var assoc)
+                    ? assoc
+                    : string.Empty;
+            }
+
+            if (_indexed is null)
+            {
+                return _scalar ?? string.Empty;
             }
 
             return _indexed.TryGetValue(0, out var value) ? value : string.Empty;
         }
     }
 
-    /// <summary>Replaces the variable's value with a scalar.</summary>
+    /// <summary>
+    /// Sets the variable's scalar value.
+    /// </summary>
+    /// <remarks>
+    /// On an array this writes element 0 and leaves the rest, because that is what bash
+    /// does: <c>x=(a b c); x=z</c> leaves <c>z b c</c>, and <c>x+=z</c> appends to the
+    /// first element alone. Only a variable with no array attribute is replaced outright.
+    /// </remarks>
     public void SetScalar(string value)
     {
         if (IsAssociative)
         {
-            _associative["0"] = Transform(value);
-        }
-        else
-        {
-            _indexed.Clear();
-            _indexed[0] = Transform(value);
+            Associative()["0"] = Transform(value);
+            return;
         }
 
-        IsUnset = false;
+        if (Attributes.HasFlag(VariableAttributes.IndexedArray) && _indexed is not null)
+        {
+            _indexed[0] = Transform(value);
+            return;
+        }
+
+        _indexed = null;
+        _scalar = Transform(value);
     }
 
     /// <summary>Appends to the variable's scalar value.</summary>
@@ -124,46 +159,59 @@ public sealed class ShellVariable
         // element rather than creating one at index -1.
         if (index < 0)
         {
-            index += _indexed.Count == 0 ? 0 : _indexed.Keys.Max() + 1;
+            index += IndexedCount == 0 ? 0 : HighestIndex() + 1;
         }
 
-        _indexed[index] = Transform(value);
-        IsUnset = false;
+        if (index == 0 && _indexed is null)
+        {
+            _scalar = Transform(value);
+        }
+        else
+        {
+            Indexed()[index] = Transform(value);
+        }
     }
 
     /// <summary>Sets one element of an associative array.</summary>
     public void SetAssociative(string key, string value)
     {
         Attributes |= VariableAttributes.AssociativeArray;
-        _associative[key] = Transform(value);
-        IsUnset = false;
+        Associative()[key] = Transform(value);
     }
 
     /// <summary>Replaces the whole variable with an indexed array built from <paramref name="values"/>.</summary>
     public void SetArray(IEnumerable<string> values)
     {
         Attributes |= VariableAttributes.IndexedArray;
-        _indexed.Clear();
-        var i = 0L;
-        foreach (var value in values)
-        {
-            _indexed[i++] = Transform(value);
-        }
-
-        IsUnset = false;
+        _indexed = null;
+        _scalar = null;
+        Fill(values, 0);
     }
 
     /// <summary>Appends elements to the end of an indexed array.</summary>
     public void AppendArray(IEnumerable<string> values)
     {
         Attributes |= VariableAttributes.IndexedArray;
-        var next = _indexed.Count == 0 ? 0 : _indexed.Keys.Max() + 1;
+        Fill(values, IndexedCount == 0 ? 0 : HighestIndex() + 1);
+    }
+
+    // Writes values at consecutive subscripts, keeping the one-element shape for as long
+    // as it holds.
+    private void Fill(IEnumerable<string> values, long next)
+    {
         foreach (var value in values)
         {
-            _indexed[next++] = Transform(value);
-        }
+            if (next == 0 && _indexed is null)
+            {
+                _scalar = Transform(value);
+            }
+            else
+            {
+                Indexed()[next] = Transform(value);
+            }
 
-        IsUnset = false;
+            next++;
+        }
     }
 
     /// <summary>Reads one element, or <see langword="null"/> when absent.</summary>
@@ -171,13 +219,24 @@ public sealed class ShellVariable
     {
         if (IsAssociative)
         {
-            return _associative.TryGetValue(subscript, out var value) ? value : null;
+            return _associative is not null && _associative.TryGetValue(subscript, out var value)
+                ? value
+                : null;
         }
 
-        return long.TryParse(subscript, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index)
-            && _indexed.TryGetValue(NormalizeIndex(index), out var element)
-            ? element
-            : null;
+        if (!long.TryParse(subscript, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
+        {
+            return null;
+        }
+
+        index = NormalizeIndex(index);
+
+        if (_indexed is null)
+        {
+            return index == 0 ? _scalar : null;
+        }
+
+        return _indexed.TryGetValue(index, out var element) ? element : null;
     }
 
     /// <summary>Removes one element.</summary>
@@ -185,27 +244,74 @@ public sealed class ShellVariable
     {
         if (IsAssociative)
         {
-            _associative.Remove(subscript);
+            _associative?.Remove(subscript);
             return;
         }
 
-        if (long.TryParse(subscript, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
+        if (!long.TryParse(subscript, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
         {
-            _indexed.Remove(NormalizeIndex(index));
+            return;
         }
+
+        index = NormalizeIndex(index);
+
+        if (_indexed is null)
+        {
+            if (index == 0)
+            {
+                _scalar = null;
+            }
+
+            return;
+        }
+
+        _indexed.Remove(index);
     }
 
     /// <summary>Every element value, in subscript order.</summary>
-    public IReadOnlyList<string> Elements =>
-        IsAssociative ? [.. _associative.Values] : [.. _indexed.Values];
+    public IReadOnlyList<string> Elements
+    {
+        get
+        {
+            if (IsAssociative)
+            {
+                return _associative is null ? [] : [.. _associative.Values];
+            }
+
+            if (_indexed is null)
+            {
+                return _scalar is null ? [] : [_scalar];
+            }
+
+            return [.. _indexed.Values];
+        }
+    }
 
     /// <summary>Every subscript, in order.</summary>
-    public IReadOnlyList<string> Keys => IsAssociative
-        ? [.. _associative.Keys]
-        : [.. _indexed.Keys.Select(static k => k.ToString(CultureInfo.InvariantCulture))];
+    public IReadOnlyList<string> Keys
+    {
+        get
+        {
+            if (IsAssociative)
+            {
+                return _associative is null ? [] : [.. _associative.Keys];
+            }
+
+            if (_indexed is null)
+            {
+                return _scalar is null ? [] : ["0"];
+            }
+
+            return [.. _indexed.Keys.Select(static k => k.ToString(CultureInfo.InvariantCulture))];
+        }
+    }
 
     /// <summary>Number of elements. A scalar counts as one.</summary>
-    public int Count => IsAssociative ? _associative.Count : _indexed.Count;
+    public int Count => IsAssociative ? _associative?.Count ?? 0 : IndexedCount;
+
+    // The indexed view's size, whichever attributes the variable also carries: the
+    // subscript arithmetic below is about indexed storage and nothing else.
+    private int IndexedCount => _indexed?.Count ?? (_scalar is null ? 0 : 1);
 
     // A negative subscript counts back from the end, so `${a[-1]}` is the last element.
     private long NormalizeIndex(long index)
@@ -215,8 +321,54 @@ public sealed class ShellVariable
             return index;
         }
 
-        var highest = _indexed.Count == 0 ? -1 : _indexed.Keys.Max();
+        var highest = IndexedCount == 0 ? -1 : HighestIndex();
         return highest + 1 + index;
+    }
+
+    // The largest subscript in use. Only the sparse form has to look.
+    private long HighestIndex() => _indexed is null ? 0 : _indexed.Keys.Max();
+
+    // Promotes the one-element form to the full map, so a second subscript can be written.
+    private SortedDictionary<long, string> Indexed()
+    {
+        if (_indexed is null)
+        {
+            _indexed = [];
+
+            if (_scalar is not null)
+            {
+                _indexed[0] = _scalar;
+                _scalar = null;
+            }
+        }
+
+        return _indexed;
+    }
+
+    private Dictionary<string, string> Associative() =>
+        _associative ??= new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>Copies the variable, for a subshell that must not share it.</summary>
+    /// <remarks>
+    /// The copy is made from the storage rather than by replaying the setters: replaying
+    /// meant rebuilding every subscript from its string form, and a fork copies every
+    /// variable in scope, which a command substitution does once per call.
+    /// </remarks>
+    internal ShellVariable Clone()
+    {
+        var clone = new ShellVariable(Attributes) { _scalar = _scalar };
+
+        if (_indexed is not null)
+        {
+            clone._indexed = new SortedDictionary<long, string>(_indexed);
+        }
+
+        if (_associative is not null)
+        {
+            clone._associative = new Dictionary<string, string>(_associative, StringComparer.Ordinal);
+        }
+
+        return clone;
     }
 
     private string Transform(string value)

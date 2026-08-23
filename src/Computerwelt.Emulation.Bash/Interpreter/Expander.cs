@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using System.Text;
 using Computerwelt.Emulation.Bash.Parsing;
@@ -41,9 +42,41 @@ public sealed class Expander
         _runCommandSubstitution = runCommandSubstitution;
     }
 
+    // Every character that can make a literal mean something other than itself: a brace to
+    // expand, a glob metacharacter, a quote, an escape, a tilde, or the start of any
+    // substitution. A literal word containing none of them expands to itself, which is the
+    // case for a command name and for most arguments, so it is worth recognising before
+    // the field machinery starts allocating.
+    private static readonly SearchValues<char> ExpansionTriggers =
+        SearchValues.Create("{}\\*?[]()~$`'\"");
+
+    /// <summary>
+    /// True when <paramref name="word"/> is one unquoted literal that expansion would
+    /// hand back unchanged, in which case <paramref name="text"/> is that value.
+    /// </summary>
+    private static bool IsInertLiteral(Word word, out string text)
+    {
+        if (word.Parts.Count == 1
+            && word.Parts[0] is WordPart.Literal { Quoted: false, Text.Length: > 0 } literal
+            && !literal.Text.AsSpan().ContainsAny(ExpansionTriggers))
+        {
+            text = literal.Text;
+            return true;
+        }
+
+        text = string.Empty;
+        return false;
+    }
+
     /// <summary>Expands one word into zero or more fields.</summary>
     public async ValueTask<List<string>> ExpandAsync(Word word, CancellationToken cancellationToken = default)
     {
+        if (IsInertLiteral(word, out var inert))
+        {
+            _budget.ThrowIfExpired();
+            return [inert];
+        }
+
         var fields = await ExpandToFieldsAsync(word, splitting: true, cancellationToken);
         return await GlobFieldsAsync(fields, cancellationToken);
     }
@@ -93,9 +126,19 @@ public sealed class Expander
     /// <summary>Expands every word in a list, concatenating the resulting fields.</summary>
     public async ValueTask<List<string>> ExpandAllAsync(IReadOnlyList<Word> words, CancellationToken cancellationToken = default)
     {
-        var result = new List<string>();
+        var result = new List<string>(words.Count);
         foreach (var word in words)
         {
+            // The inert case is appended directly rather than through a one-element list
+            // per word: a command line is mostly inert words, and this is the hottest
+            // loop in the interpreter.
+            if (IsInertLiteral(word, out var inert))
+            {
+                _budget.ThrowIfExpired();
+                result.Add(inert);
+                continue;
+            }
+
             result.AddRange(await ExpandAsync(word, cancellationToken));
         }
 
@@ -1169,6 +1212,12 @@ public sealed class Expander
 
         public bool IsEmpty => _text.Length == 0;
 
+        // Quoted text keeps its metacharacters as data, so each one is escaped here and
+        // unescaped again once globbing has had its look. The runs between them are the
+        // common case and are copied whole.
+        private static readonly SearchValues<char> PatternMetacharacters =
+            SearchValues.Create("*?[]\\()");
+
         public void Append(string value, bool quoted)
         {
             if (!quoted)
@@ -1179,14 +1228,18 @@ public sealed class Expander
 
             HasQuotedContent = true;
 
-            foreach (var c in value)
+            var remaining = value.AsSpan();
+            while (!remaining.IsEmpty)
             {
-                if (c is '*' or '?' or '[' or ']' or '\\' or '(' or ')')
+                var next = remaining.IndexOfAny(PatternMetacharacters);
+                if (next < 0)
                 {
-                    _text.Append('\\');
+                    _text.Append(remaining);
+                    return;
                 }
 
-                _text.Append(c);
+                _text.Append(remaining[..next]).Append('\\').Append(remaining[next]);
+                remaining = remaining[(next + 1)..];
             }
         }
 

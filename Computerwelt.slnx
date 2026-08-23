@@ -9,6 +9,9 @@
   <Folder Name="/samples/">
     <Project Path="samples/Computerwelt.Sample.Extensibility/Computerwelt.Sample.Extensibility.csproj" />
   </Folder>
+  <Folder Name="/bench/">
+    <Project Path="bench/Computerwelt.Benchmarks/Computerwelt.Benchmarks.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Computerwelt.AgentTests/Computerwelt.AgentTests.csproj" />
     <Project Path="tests/Computerwelt.Emulation.Bash.SpecTests/Computerwelt.Emulation.Bash.SpecTests.csproj" />

@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using Computerwelt.Emulation.Bash.Builtins;
 using Computerwelt.Emulation.Bash.Interpreter;
 
@@ -14,6 +15,10 @@ namespace Computerwelt.Emulation.Bash;
 /// </remarks>
 public sealed class BashBuilder
 {
+    // The standard command set, built once and shared by every session that takes it
+    // unchanged. See BuildRegistry for why that is safe.
+    private static readonly FrozenDictionary<string, IBuiltin> SharedDefaults = CreateSharedDefaults();
+
     private readonly Dictionary<string, IBuiltin> _builtins = new(StringComparer.Ordinal);
     private readonly HashSet<string> _withheld = new(StringComparer.Ordinal);
     private readonly List<ICommandResolver> _resolvers = [];
@@ -227,12 +232,30 @@ public sealed class BashBuilder
 
         SeedEnvironment(state);
 
+        return new Bash(state, fileSystem, _limits, new CommandTable(BuildRegistry(), _resolvers));
+    }
+
+    // A session that takes the standard command set unchanged gets the shared table rather
+    // than a copy of it. That is sound because a builtin is required to be stateless and
+    // thread-safe — the same instance already serves every execution and every subshell of
+    // one session, so serving two sessions is not a new demand on it, and no mutable state
+    // crosses between them. Anything the host altered — a registration, a withheld name, a
+    // clock other than the system one, which `date` reads — builds its own table.
+    private IReadOnlyDictionary<string, IBuiltin> BuildRegistry()
+    {
+        if (_registerDefaults
+            && _builtins.Count == 0
+            && _withheld.Count == 0
+            && ReferenceEquals(_timeProvider, TimeProvider.System))
+        {
+            return SharedDefaults;
+        }
+
         var registry = new Dictionary<string, IBuiltin>(StringComparer.Ordinal);
-        var bash = new Bash(state, fileSystem, _limits, new CommandTable(registry, _resolvers));
 
         if (_registerDefaults)
         {
-            RegisterDefaults(registry);
+            RegisterDefaults(registry, _timeProvider);
         }
 
         foreach (var (name, builtin) in _builtins)
@@ -247,7 +270,14 @@ public sealed class BashBuilder
             registry.Remove(name);
         }
 
-        return bash;
+        return registry;
+    }
+
+    private static FrozenDictionary<string, IBuiltin> CreateSharedDefaults()
+    {
+        var registry = new Dictionary<string, IBuiltin>(StringComparer.Ordinal);
+        RegisterDefaults(registry, TimeProvider.System);
+        return registry.ToFrozenDictionary(StringComparer.Ordinal);
     }
 
     private void SeedEnvironment(ShellState state)
@@ -305,7 +335,7 @@ public sealed class BashBuilder
         }
     }
 
-    private void RegisterDefaults(Dictionary<string, IBuiltin> registry)
+    private static void RegisterDefaults(Dictionary<string, IBuiltin> registry, TimeProvider timeProvider)
     {
         void Register(IBuiltin builtin) => registry[builtin.Name] = builtin;
 
@@ -429,7 +459,7 @@ public sealed class BashBuilder
         Register(new IdentityBuiltin("hostname"));
         Register(new IdentityBuiltin("uname"));
         Register(new SleepBuiltin());
-        Register(new DateBuiltin(_timeProvider));
+        Register(new DateBuiltin(timeProvider));
         Register(new TimeoutBuiltin());
         Register(new DirectoryStackBuiltin("pushd"));
         Register(new DirectoryStackBuiltin("popd"));
