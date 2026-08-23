@@ -95,8 +95,22 @@ public sealed class PyStr : PyObject
     public override bool PyEquals(PyObject other) =>
         other is PyStr text && string.Equals(Value, text.Value, StringComparison.Ordinal);
 
+    // A string is immutable, and the same one is hashed on every dictionary lookup it
+    // takes part in — a global's name is hashed once per read of that global.
+    private int _hash;
+    private bool _hashed;
+
     /// <inheritdoc />
-    public override BigInteger PyHash() => new(StringComparer.Ordinal.GetHashCode(Value));
+    public override BigInteger PyHash()
+    {
+        if (!_hashed)
+        {
+            _hash = StringComparer.Ordinal.GetHashCode(Value);
+            _hashed = true;
+        }
+
+        return new BigInteger(_hash);
+    }
 
     /// <inheritdoc />
     public override int? PyCompare(PyObject other) =>
@@ -323,7 +337,7 @@ public sealed class PyBytes : PyObject
         other is PyBytes bytes ? Value.AsSpan().SequenceCompareTo(bytes.Value) : null;
 
     /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => Value.Select(static b => new PyInt(b));
+    public override IEnumerable<PyObject>? Iterate() => Value.Select(static b => PyInt.From(b));
 
     /// <inheritdoc />
     /// <remarks>
@@ -361,7 +375,7 @@ public sealed class PyBytes : PyObject
         }
 
         // Indexing bytes yields an int, not a one-byte bytes — a classic Python surprise.
-        return new PyInt(Value[PyStr.Normalize(integer.ToIndex(), Value.Length, "index out of range")]);
+        return PyInt.From(Value[PyStr.Normalize(integer.ToIndex(), Value.Length, "index out of range")]);
     }
 
     /// <inheritdoc />

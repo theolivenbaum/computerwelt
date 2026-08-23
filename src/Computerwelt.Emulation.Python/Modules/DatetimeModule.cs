@@ -76,7 +76,7 @@ public static class DatetimeModule
                 return new PyFloat((double)span.Total / (double)divisor.Total);
 
             case ("//", PyDelta span, PyDelta divisor):
-                return new PyInt(Floors(span.Total, divisor.Total));
+                return PyInt.From(Floors(span.Total, divisor.Total));
 
             case ("+", PyDate date, PyDelta span):
                 return PyDate.FromOrdinal(date.Ordinal + Whole(span.Total));

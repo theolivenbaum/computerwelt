@@ -197,6 +197,9 @@ Upstream: `parser/` (~340 KB)
 - [ ] Parse-error messages and exit code 2 parity (`parse-errors.test.sh`)
 - [~] Parse fuel wired; parser wall-clock timeout not yet separate from execution timeout
 - [~] `Span` on nodes; not yet complete or used by analysis
+- [ ] A subscripted assignment inside a substitution does not parse: `$(m[b]=2; echo x)`
+      reports an unmatched `)`, because the scanner that finds the substitution's end does
+      not account for the bracket. Found while benchmarking; predates this work
 
 ## Phase 5 — Interpreter  (`src/Computerwelt.Emulation.Bash/Interpreter/`)
 
@@ -344,18 +347,28 @@ Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 ## Performance
 
 Measured with `bench/Computerwelt.Benchmarks/`, which carries bashkit's own 96-case corpus
-(`crates/bashkit-bench/src/cases.rs`) unedited. The numbers below come from that project on
-one 4-CPU machine and only compare with each other; the corpus row builds a session per
-case, as upstream's in-process runner does.
+(`crates/bashkit-bench/src/cases.rs`) unedited. Every number below is from one 4-CPU
+machine and only compares with the others beside it. The per-case rows are BenchmarkDotNet;
+the corpus row is the stopwatch report, which counts a session built per case as upstream's
+in-process runner does.
 
 | | before | after |
 |---|--:|--:|
-| corpus, 96 cases | 71.0 ms · 45.0 MB | 65.0 ms · 26.8 MB |
-| `Bash.Create()` | 9.0 µs · 27.4 KB | 3.8 µs · 8.9 KB |
-| build a session and `echo hello` | 13.4 µs · 32.3 KB | 5.6 µs · 12.0 KB |
-| `echo hello` on a warm session | 2.5 µs · 4.7 KB | 1.7 µs · 3.1 KB |
-| python: 500 f-strings and a dict tally | 39.0 ms · 2.8 MB | 1.25 ms · 1.1 MB |
-| python: `fib(18)` | 7.0 ms · 9.7 MB | 4.8 ms · 5.0 MB |
+| corpus, 96 cases | 41.7 MB | 20.7 MB |
+| build a session | 9.18 µs · 27.4 KB | 3.70 µs · 8.9 KB |
+| build a session and `echo hello` | 12.5 µs · 32.3 KB | 6.45 µs · 12.1 KB |
+| `echo hello` on a warm session | 2.56 µs · 4.7 KB | 1.86 µs · 3.1 KB |
+| shell `fib 10` (recursive, substitutions) | 4.19 ms · 5.95 MB | 2.85 ms · 2.76 MB |
+| shell `fib 12` | 10.9 ms · 16.2 MB | 7.58 ms · 7.57 MB |
+| python `fib(18)` | 6.73 ms · 9.74 MB | 4.02 ms · 3.23 MB |
+| python: 500 f-strings and a dict tally | 39.0 ms · 2.90 MB | 1.01 ms · 0.93 MB |
+
+Allocation is where the change is: the corpus makes half the garbage it did. Wall-clock
+followed only where allocation was the work — a recursive shell function is 1.4× faster, a
+Python one 1.7×, and standing a session up 2.5× — while the corpus's own total time moved
+less than this machine's run-to-run spread, because most of those cases are bound by
+interpretation rather than by the allocator. The corpus row is therefore given in bytes
+only; a time for it would be reporting noise.
 
 What changed, in the order the measurements pointed at:
 
@@ -368,9 +381,18 @@ What changed, in the order the measurements pointed at:
       built a `SortedDictionary` *and* a `Dictionary`, so a scalar cost four objects. A
       scalar — or a one-element array such as `FUNCNAME` — is now one string field, and the
       map appears when a second subscript does
-- [x] **A fork copies from storage rather than replaying assignments.** `CloneVariable`
-      rebuilt each array through its string subscripts; `ShellVariable.Clone` copies the
-      dictionaries. The scope copy is also pre-sized, which it never was
+- [x] **A subshell borrows its parent's variables instead of copying them.** A fork used to
+      clone every variable in scope; a forked scope now starts empty and keeps a link to
+      the scope it came from, copying a variable in the first time it touches one. Copying
+      on *read* rather than on write is what makes it safe without auditing every caller:
+      no reference to a parent's variable ever leaves `ShellState`, so no path can write
+      through one. `SubshellIsolationTests` states the property in 27 cases, each checked
+      against bash 5.2
+- [x] **A substitution body is parsed once.** `$(...)` re-parsed its text on every
+      execution, so a recursive function re-parsed per call. The parse is kept on the AST
+      node — whose lifetime is exactly the script's, so nothing can grow — and every reuse
+      is charged the parser fuel the first parse cost, because skipping the work must not
+      skip the accounting
 - [x] **An inert literal skips expansion.** A word that is one unquoted literal with no
       expansion trigger in it — a command name, a flag, most arguments — is handed back as
       it stands instead of going through field builders, escaping and an unescape pass.
@@ -379,31 +401,39 @@ What changed, in the order the measurements pointed at:
       `StringBuilder` into a copy of the string the lexer already produced
 - [x] **Quoted text is escaped in runs**, not character by character, again via
       `SearchValues<char>`
+- [x] **A decimal literal in arithmetic is parsed from the span**, not from a substring,
+      and `FUNCNAME` is rebuilt into one buffer rather than a list per function entry and
+      exit
 - [x] **Python's integer→string guard is a constant.** `BigInteger.Pow(10, 4300)` was
       evaluated on *every* integer that became a string — `str(i)`, an f-string, a `print`.
-      Hoisting it made string-producing Python 14–31× faster
+      Hoisting it made string-producing Python 14–39× faster
 - [x] **Python binds an ordinary call directly.** Argument binding allocated a list, a set,
       a dict and two LINQ chains per call and searched `LocalNames` by string per
       parameter. A call with one argument per parameter and nothing to reconcile now fills
       the slots from a table cached on the code object
+- [x] **Python shares its small integers** (CPython's -5..256), which identity here already
+      made indistinguishable: `1 is 1` is true, so sharing changes nothing observable
+- [x] **The Python VM stopped rebuilding what it already knows.** A global's name became a
+      fresh `str` object on every read, write and delete; a string re-hashed on every
+      dictionary lookup; a frame allocated a closure dictionary whether or not anything was
+      captured, and hashed a name against it on every local read. Each is now built once
 
-What the measurements still point at, in value order:
+What the measurements still point at:
 
-- [ ] **Copy-on-write scopes.** A command substitution forks the whole variable set —
-      ~5 KB — to run `$(fib $((n-1)))`, and the corpus's heaviest cases are nothing but
-      that. Sharing until first write is the remaining large win, and the hazard is
-      precise: a caller that obtains a `ShellVariable` and mutates it in place would write
-      through into the parent, so it needs the mutation path narrowed first. Isolation is
-      a security property here, so this is worth doing carefully or not at all
-- [ ] **Parse once per script, not once per evaluation.** A substitution body and an
-      arithmetic expression are re-parsed on every execution, so a loop re-parses per
-      iteration. The cache belongs on the AST node, whose lifetime is exactly the script's;
-      it must keep charging the parse budget on a hit, or it would quietly weaken a limit
-- [ ] **Python's `int` is a `BigInteger` and every result is a fresh `PyInt`.** A small-int
-      cache and a `long` fast path are the standard answers; both are wide changes and the
-      corpus is the check
-- [ ] Per-command work in the interpreter — the argument-list copy, the `FUNCNAME` rebuild
-      on entry *and* exit of every function — is small individually and adds up in loops
+- [ ] **A frame per Python call is five allocations** — the frame, its stack, its block
+      list, its locals and the argument array. Pooling them is the standard answer and the
+      hazard is generators, which keep a frame alive after the call returns
+- [ ] **Arithmetic is still parsed per evaluation.** Unlike a substitution body it has no
+      AST to cache — the evaluator parses and evaluates in one pass — so caching means
+      giving it one. The measurement says the parse is worth about 150 bytes and 0.3 µs of
+      an evaluation's ~370 bytes: a 692-line rewrite of a component this heavily specified
+      is not worth that, so this stays open rather than half-done
+- [ ] **The argument list is copied per command** (`words[1..]`), and `BuiltinContext`
+      could take a segment over the expanded words instead. Worth ~50 bytes a command
+      against a public shape change
+- [ ] **Python's `int` is a `BigInteger`.** A `long` fast path in the arithmetic operators
+      would cut what remains of numeric work; the shared small integers took the allocation
+      out of it, and what is left is BigInteger's own arithmetic
 
 ---
 

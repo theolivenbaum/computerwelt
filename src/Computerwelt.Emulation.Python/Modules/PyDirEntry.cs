@@ -58,7 +58,7 @@ public sealed class PyDirEntry : PyObject
 
         // `inode` has to return something an entry can be identified by; the path is the
         // only stable identity a virtual filesystem has, so its hash is what is reported.
-        "inode" => new PyBuiltinFunction("inode", _ => new PyInt(
+        "inode" => new PyBuiltinFunction("inode", _ => PyInt.From(
             (uint)System.StringComparer.Ordinal.GetHashCode(Path))),
 
         "__fspath__" => new PyBuiltinFunction("__fspath__", _ => new PyStr(Path)),

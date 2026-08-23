@@ -22,6 +22,8 @@ namespace Computerwelt.Benchmarks;
 /// </remarks>
 public static class CorpusReport
 {
+    private const int WarmupIterations = 40;
+
     /// <summary>Runs the corpus and prints a table sorted by cost.</summary>
     /// <param name="args">
     /// <c>--filter &lt;substring&gt;</c> narrows to matching cases, <c>--iterations &lt;n&gt;</c>
@@ -47,10 +49,14 @@ public static class CorpusReport
 
         foreach (var testCase in cases)
         {
-            // Warm the paths this case touches before the timed run: the first execution of
-            // a case pays for JIT of whichever builtins it reaches, which is real but is not
-            // what this table is about.
-            for (var i = 0; i < 3; i++)
+            // Warm the paths this case touches before the timed run: the first executions
+            // pay for JIT of whichever builtins they reach, which is real but is not what
+            // this table is about. Enough of them to reach tiered compilation's second
+            // tier, because the two tiers do not allocate alike — tier 1 keeps objects
+            // that do not escape off the heap entirely, so a half-warm loop reports
+            // allocations the same code does not make once it is hot. Set
+            // DOTNET_TieredCompilation=0 for numbers that do not depend on this at all.
+            for (var i = 0; i < WarmupIterations; i++)
             {
                 await RunOnceAsync(testCase);
             }

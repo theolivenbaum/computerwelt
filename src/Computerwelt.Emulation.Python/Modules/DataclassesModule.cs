@@ -234,7 +234,7 @@ public static class DataclassesModule
         {
             type.SetAttribute("__hash__", new PyBuiltinFunction(
                 $"{type.Name}.__hash__",
-                arguments => new PyInt(HashOf(machine, names, arguments[0]))));
+                arguments => PyInt.From(HashOf(machine, names, arguments[0]))));
         }
 
         _ = order;

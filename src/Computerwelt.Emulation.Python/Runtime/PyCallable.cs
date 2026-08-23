@@ -519,7 +519,7 @@ public sealed class PyInstance : PyObject
 
             try
             {
-                value = GetItem(new PyInt(i));
+                value = GetItem(PyInt.From(i));
             }
             catch (PyRaise raise) when (raise.Exception.IsInstanceOf(PyExceptionType.IndexError))
             {

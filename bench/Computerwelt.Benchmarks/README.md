@@ -22,10 +22,21 @@ dotnet run -c Release --project bench/Computerwelt.Benchmarks -- --filter '*Shel
 dotnet run -c Release --project bench/Computerwelt.Benchmarks -- --soak --filter fibonacci --seconds 30
 ```
 
+```bash
+# Numbers that do not move with the JIT's tiering decisions, for a before/after.
+DOTNET_TieredCompilation=0 dotnet run -c Release --project bench/Computerwelt.Benchmarks -- --report
+```
+
 `--report` is the one to reach for while changing code: it prints µs/op and bytes/op per
 case, sorted by cost, and it checks every case against the output upstream recorded — a
 case that stopped producing the right answer is not a faster case, and the run exits
 non-zero when one does. BenchmarkDotNet is the one to reach for before believing a number.
+
+One caution about comparing runs: tiered compilation's second tier keeps objects that do
+not escape off the heap, so a case measured half-warm reports allocations the same code
+does not make once it is hot. The report warms each case forty times before timing it,
+which is enough for most, and `DOTNET_TieredCompilation=0` removes the question entirely
+at the cost of a slower, less representative run.
 
 ## What is measured
 

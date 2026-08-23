@@ -30,7 +30,7 @@ public static class SysModule
         IReadOnlyList<string> argv = arguments is { Count: > 0 } supplied ? supplied : ["<script>"];
 
         module.Add("platform", new PyStr("monty"));
-        module.Add("maxsize", new PyInt(long.MaxValue));
+        module.Add("maxsize", PyInt.From(long.MaxValue));
         module.Add("argv", new PyList([.. argv.Select(static value => new PyStr(value))]));
         module.Add("path", new PyList());
         module.Add("version", new PyStr("3.14.0 (Monty)"));
@@ -41,7 +41,7 @@ public static class SysModule
                 "sys.version_info",
                 ["major", "minor", "micro", "releaselevel", "serial"],
                 structSeq: true),
-            [new PyInt(3), new PyInt(14), new PyInt(0), new PyStr("final"), new PyInt(0)]));
+            [PyInt.From(3), PyInt.From(14), PyInt.From(0), new PyStr("final"), PyInt.From(0)]));
         module.Add("byteorder", new PyStr(BitConverter.IsLittleEndian ? "little" : "big"));
 
         module.Add("stdout", new StandardStream("stdout", machine.Write));
@@ -58,7 +58,7 @@ public static class SysModule
             throw new PyRaise(new PyException(PyExceptionType.SystemExit, code.Display(), [code]));
         });
 
-        module.Add("getrecursionlimit", _ => new PyInt(machine.RecursionLimit));
+        module.Add("getrecursionlimit", _ => PyInt.From(machine.RecursionLimit));
 
         // A script may lower the limit but not raise it past the sandbox's own cap.
         module.Add("setrecursionlimit", arguments =>
@@ -123,7 +123,7 @@ public static class SysModule
             {
                 var text = arguments.Length > 0 ? arguments[0].Display() : string.Empty;
                 write(text);
-                return new PyInt(text.Length);
+                return PyInt.From(text.Length);
             }),
 
             // Output is buffered until the run ends, so flushing is a no-op that succeeds.

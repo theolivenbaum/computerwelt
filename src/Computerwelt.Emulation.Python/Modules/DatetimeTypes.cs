@@ -122,9 +122,9 @@ public sealed class PyDelta : PyObject
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name) => name switch
     {
-        "days" => new PyInt(Days),
-        "seconds" => new PyInt(Seconds),
-        "microseconds" => new PyInt(Microseconds),
+        "days" => PyInt.From(Days),
+        "seconds" => PyInt.From(Seconds),
+        "microseconds" => PyInt.From(Microseconds),
         "total_seconds" => new PyBuiltinFunction("total_seconds", _ =>
             new PyFloat((double)Total / 1_000_000.0)),
         _ => null,
@@ -362,15 +362,15 @@ public sealed class PyDate : PyObject
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name) => name switch
     {
-        "year" => new PyInt(Year),
-        "month" => new PyInt(Month),
-        "day" => new PyInt(Day),
+        "year" => PyInt.From(Year),
+        "month" => PyInt.From(Month),
+        "day" => PyInt.From(Day),
         "isoformat" => new PyBuiltinFunction("isoformat", _ => new PyStr(Display())),
         "strftime" => new PyBuiltinFunction("strftime", (arguments, keywords) =>
             DatetimeModule.Formatted(arguments, keywords, Parts)),
-        "weekday" => new PyBuiltinFunction("weekday", _ => new PyInt(WeekdayOf(Ordinal))),
-        "isoweekday" => new PyBuiltinFunction("isoweekday", _ => new PyInt(WeekdayOf(Ordinal) + 1)),
-        "toordinal" => new PyBuiltinFunction("toordinal", _ => new PyInt(Ordinal)),
+        "weekday" => new PyBuiltinFunction("weekday", _ => PyInt.From(WeekdayOf(Ordinal))),
+        "isoweekday" => new PyBuiltinFunction("isoweekday", _ => PyInt.From(WeekdayOf(Ordinal) + 1)),
+        "toordinal" => new PyBuiltinFunction("toordinal", _ => PyInt.From(Ordinal)),
         "replace" => new PyBuiltinFunction("replace", (arguments, keywords) =>
             DatetimeModule.Replaced(this, arguments, keywords)),
         _ => null,
@@ -510,13 +510,13 @@ public sealed class PyDateTime : PyObject
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name) => name switch
     {
-        "year" => new PyInt(Parts.Year),
-        "month" => new PyInt(Parts.Month),
-        "day" => new PyInt(Parts.Day),
-        "hour" => new PyInt(Parts.Hour),
-        "minute" => new PyInt(Parts.Minute),
-        "second" => new PyInt(Parts.Second),
-        "microsecond" => new PyInt(Parts.Microsecond),
+        "year" => PyInt.From(Parts.Year),
+        "month" => PyInt.From(Parts.Month),
+        "day" => PyInt.From(Parts.Day),
+        "hour" => PyInt.From(Parts.Hour),
+        "minute" => PyInt.From(Parts.Minute),
+        "second" => PyInt.From(Parts.Second),
+        "microsecond" => PyInt.From(Parts.Microsecond),
         "tzinfo" => TzInfo ?? (PyObject)PyNone.Instance,
 
         "isoformat" => new PyBuiltinFunction("isoformat", _ => new PyStr(Isoformat('T'))),
@@ -525,9 +525,9 @@ public sealed class PyDateTime : PyObject
 
         "date" => new PyBuiltinFunction("date", _ => new PyDate(Parts.Year, Parts.Month, Parts.Day)),
         "weekday" => new PyBuiltinFunction("weekday", _ =>
-            new PyInt(PyDate.WeekdayOf(PyDate.OrdinalOf(Parts.Year, Parts.Month, Parts.Day)))),
+            PyInt.From(PyDate.WeekdayOf(PyDate.OrdinalOf(Parts.Year, Parts.Month, Parts.Day)))),
         "isoweekday" => new PyBuiltinFunction("isoweekday", _ =>
-            new PyInt(PyDate.WeekdayOf(PyDate.OrdinalOf(Parts.Year, Parts.Month, Parts.Day)) + 1)),
+            PyInt.From(PyDate.WeekdayOf(PyDate.OrdinalOf(Parts.Year, Parts.Month, Parts.Day)) + 1)),
 
         // A naive datetime has no offset to apply, so it is read as UTC: the sandbox has no
         // local zone, and inventing one from the host would be neither reproducible nor safe.

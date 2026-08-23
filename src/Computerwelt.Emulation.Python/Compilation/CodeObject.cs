@@ -45,6 +45,24 @@ public sealed class CodeObject
     /// <summary>The declared parameters.</summary>
     public Parsing.ParameterList Parameters { get; set; } = Parsing.ParameterList.Empty;
 
+    private Runtime.PyStr[]? _nameKeys;
+    private Runtime.PyStr[]? _localKeys;
+
+    /// <summary>
+    /// <see cref="Names"/> as dictionary keys, built once.
+    /// </summary>
+    /// <remarks>
+    /// A global read, write or delete looks its name up in a <c>dict</c>, which needs the
+    /// name as a <c>str</c> object. Building that object per execution allocated once per
+    /// instruction — for a name that cannot change between one execution and the next.
+    /// </remarks>
+    internal Runtime.PyStr NameKey(int index) =>
+        (_nameKeys ??= new Runtime.PyStr[Names.Count])[index] ??= new Runtime.PyStr(Names[index]);
+
+    /// <summary>The same, for <see cref="LocalNames"/>.</summary>
+    internal Runtime.PyStr LocalKey(int index) =>
+        (_localKeys ??= new Runtime.PyStr[LocalNames.Count])[index] ??= new Runtime.PyStr(LocalNames[index]);
+
     private int[]? _parameterSlots;
 
     /// <summary>

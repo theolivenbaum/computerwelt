@@ -212,7 +212,7 @@ public static class BraceFormatter
 
                 // An all-digit key is an index; anything else is a mapping key.
                 value = int.TryParse(key, CultureInfo.InvariantCulture, out var position)
-                    ? value.GetItem(new PyInt(position))
+                    ? value.GetItem(PyInt.From(position))
                     : value.GetItem(new PyStr(key));
 
                 i = end + 1;
