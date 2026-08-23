@@ -490,10 +490,12 @@ public sealed class ShellState
         fork._scopes.Clear();
         foreach (var scope in _scopes)
         {
-            var copy = new Dictionary<string, ShellVariable>(StringComparer.Ordinal);
+            // Sized up front: the global scope alone holds the two dozen seeded variables,
+            // and growing a dictionary into that reallocates its table four times.
+            var copy = new Dictionary<string, ShellVariable>(scope.Count, StringComparer.Ordinal);
             foreach (var (name, variable) in scope)
             {
-                copy[name] = CloneVariable(variable);
+                copy[name] = variable.Clone();
             }
 
             fork._scopes.Add(copy);
@@ -501,32 +503,5 @@ public sealed class ShellState
 
         fork.CallStack.AddRange(CallStack);
         return fork;
-    }
-
-    private static ShellVariable CloneVariable(ShellVariable source)
-    {
-        var clone = new ShellVariable(source.Attributes & ~VariableAttributes.ReadOnly);
-
-        if (source.IsAssociative)
-        {
-            foreach (var key in source.Keys)
-            {
-                clone.SetAssociative(key, source.GetElement(key) ?? string.Empty);
-            }
-        }
-        else if (source.IsArray)
-        {
-            foreach (var key in source.Keys)
-            {
-                clone.SetIndexed(long.Parse(key, CultureInfo.InvariantCulture), source.GetElement(key) ?? string.Empty);
-            }
-        }
-        else if (!source.IsUnset)
-        {
-            clone.SetScalar(source.Value);
-        }
-
-        clone.Attributes = source.Attributes;
-        return clone;
     }
 }

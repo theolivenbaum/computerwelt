@@ -414,6 +414,28 @@ public sealed class VirtualMachine
         var code = function.Code;
         var parameters = code.Parameters;
         var locals = new PyObject?[Math.Max(code.LocalNames.Count, 1)];
+        var declaredParameters = parameters.Parameters;
+
+        // The ordinary call: one argument per parameter and nothing to reconcile. What
+        // follows exists for the shapes that need reconciling — defaults, varargs,
+        // keywords, a bound receiver — and none of it says anything about this one, so it
+        // is skipped rather than walked through. A recursive function pays this per call.
+        if (arguments.Length == declaredParameters.Count
+            && keywords is null or { Count: 0 }
+            && function.BoundSelf is null
+            && parameters.VarArgs is null
+            && parameters.KeywordArgs is null
+            && parameters.KeywordOnly.Count == 0)
+        {
+            var slots = code.ParameterSlots;
+
+            for (var i = 0; i < slots.Length; i++)
+            {
+                locals[slots[i]] = arguments[i];
+            }
+
+            return locals;
+        }
 
         var positional = new List<PyObject>(arguments);
 

@@ -224,6 +224,11 @@ Upstream: `interpreter/` (~730 KB — the largest single area)
 - [ ] Command substitution trailing-newline stripping + nested quoting edge cases
 - [x] `[[ ]]` conditional expressions incl. `=~` regex + `BASH_REMATCH`
 - [x] Arrays: indexed, associative, splat, append, slicing, `${!arr[@]}`, `${!prefix*}`
+- [ ] Two array details bash has and this does not, both found while benchmarking and both
+      pre-existing: a scalar assigned over an array replaces element 0 only in bash
+      (`x=(a b c); x=z` leaves `z b c`) where this collapses the array to one element; and
+      an array assigned nothing is *unset* in bash (`x=(); echo ${x+set}` prints nothing)
+      where this reports it as set
 - [~] `trap`: `EXIT` and `ERR` fire; `DEBUG` and `RETURN` do not
 - [ ] Job control simulation (`&`, `jobs`, `wait`, `%1`)
 - [~] `set -e` fires and is suppressed after `&&`/`||`/`!`; the full context list is unverified
@@ -321,7 +326,9 @@ Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 - [ ] Hook interceptors (`before_exec`, `after_exec`, `before_tool`, `on_exit`)
 - [ ] NuGet packaging metadata, symbols, deterministic build
 - [ ] Public API surface tests (`PublicAPI.Shipped.txt`)
-- [ ] Benchmarks (`BenchmarkDotNet`) mirroring `crates/bashkit-bench`
+- [x] Benchmarks (`BenchmarkDotNet`) mirroring `crates/bashkit-bench` — `bench/Computerwelt.Benchmarks/`
+      carries upstream's 96 cases verbatim, plus session, parser, filesystem and Python
+      micro-benchmarks and a stopwatch mode for the edit loop. See *Performance* below
 
 ## Phase 10 — Hardening
 
@@ -329,6 +336,72 @@ Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 - [ ] Property tests for parser/expansion (`proptest_security.rs` equivalent, FsCheck)
 - [ ] Fuzz targets for lexer/parser/arithmetic (`fuzz/`)
 - [x] Fill in the ratchet to 100 % of non-skipped spec cases
+
+---
+
+## Performance
+
+Measured with `bench/Computerwelt.Benchmarks/`, which carries bashkit's own 96-case corpus
+(`crates/bashkit-bench/src/cases.rs`) unedited. The numbers below come from that project on
+one 4-CPU machine and only compare with each other; the corpus row builds a session per
+case, as upstream's in-process runner does.
+
+| | before | after |
+|---|--:|--:|
+| corpus, 96 cases | 71.0 ms · 45.0 MB | 64.8 ms · 26.7 MB |
+| `Bash.Create()` | 9.0 µs · 27.4 KB | 3.8 µs · 8.9 KB |
+| build a session and `echo hello` | 13.4 µs · 32.3 KB | 5.6 µs · 12.0 KB |
+| `echo hello` on a warm session | 2.5 µs · 4.7 KB | 1.7 µs · 3.1 KB |
+| python: 500 f-strings and a dict tally | 39.0 ms · 2.8 MB | 1.25 ms · 1.1 MB |
+| python: `fib(18)` | 7.0 ms · 9.7 MB | 4.8 ms · 5.0 MB |
+
+What changed, in the order the measurements pointed at:
+
+- [x] **The default command table is shared.** Building a session registered ~160 builtin
+      instances into a fresh dictionary; a session that takes the standard set unchanged
+      now gets one shared `FrozenDictionary`. Sound because a builtin is already required
+      to be stateless and thread-safe — the same instance serves every execution and every
+      subshell of one session. Anything the host altered still builds its own table
+- [x] **A variable allocates storage only when it needs it.** Every `ShellVariable` eagerly
+      built a `SortedDictionary` *and* a `Dictionary`, so a scalar cost four objects. A
+      scalar — or a one-element array such as `FUNCNAME` — is now one string field, and the
+      map appears when a second subscript does
+- [x] **A fork copies from storage rather than replaying assignments.** `CloneVariable`
+      rebuilt each array through its string subscripts; `ShellVariable.Clone` copies the
+      dictionaries. The scope copy is also pre-sized, which it never was
+- [x] **An inert literal skips expansion.** A word that is one unquoted literal with no
+      expansion trigger in it — a command name, a flag, most arguments — is handed back as
+      it stands instead of going through field builders, escaping and an unescape pass.
+      `SearchValues<char>` answers "does this contain a trigger" in one vectorised scan
+- [x] **The word parser has the same fast path**, so a plain word is not rebuilt through a
+      `StringBuilder` into a copy of the string the lexer already produced
+- [x] **Quoted text is escaped in runs**, not character by character, again via
+      `SearchValues<char>`
+- [x] **Python's integer→string guard is a constant.** `BigInteger.Pow(10, 4300)` was
+      evaluated on *every* integer that became a string — `str(i)`, an f-string, a `print`.
+      Hoisting it made string-producing Python 14–31× faster
+- [x] **Python binds an ordinary call directly.** Argument binding allocated a list, a set,
+      a dict and two LINQ chains per call and searched `LocalNames` by string per
+      parameter. A call with one argument per parameter and nothing to reconcile now fills
+      the slots from a table cached on the code object
+
+What the measurements still point at, in value order:
+
+- [ ] **Copy-on-write scopes.** A command substitution forks the whole variable set —
+      ~5 KB — to run `$(fib $((n-1)))`, and the corpus's heaviest cases are nothing but
+      that. Sharing until first write is the remaining large win, and the hazard is
+      precise: a caller that obtains a `ShellVariable` and mutates it in place would write
+      through into the parent, so it needs the mutation path narrowed first. Isolation is
+      a security property here, so this is worth doing carefully or not at all
+- [ ] **Parse once per script, not once per evaluation.** A substitution body and an
+      arithmetic expression are re-parsed on every execution, so a loop re-parses per
+      iteration. The cache belongs on the AST node, whose lifetime is exactly the script's;
+      it must keep charging the parse budget on a hit, or it would quietly weaken a limit
+- [ ] **Python's `int` is a `BigInteger` and every result is a fresh `PyInt`.** A small-int
+      cache and a `long` fast path are the standard answers; both are wide changes and the
+      corpus is the check
+- [ ] Per-command work in the interpreter — the argument-list copy, the `FUNCNAME` rebuild
+      on entry *and* exit of every function — is small individually and adds up in loops
 
 ---
 

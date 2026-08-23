@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Computerwelt.Benchmarks</RootNamespace>
+    <AssemblyName>Computerwelt.Benchmarks</AssemblyName>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- BenchmarkDotNet needs the server it launches to be optimised, and refuses to run otherwise. -->
+    <Optimize Condition="'$(Configuration)' == 'Release'">true</Optimize>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Computerwelt/Computerwelt.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -144,6 +144,8 @@ tests/
   spec/                                     shell acceptance corpus (from bashkit)
   monty-spec/                               python acceptance corpus (from monty)
   monty-extensions/                         fixtures for what this port adds beyond monty
+bench/
+  Computerwelt.Benchmarks/                  upstream's benchmark corpus, and micro-benchmarks
 samples/
   Computerwelt.Sample.Extensibility/        a runnable tour of every extension point
 .reference/bashkit/          vendored bashkit source (read-only)
@@ -227,6 +229,23 @@ two ratcheted suites it is absolute: every case must pass.
 
 When adding to it, keep the discipline: an operation goes in because someone performed it,
 not because it would round out a matrix.
+
+## Measuring it
+
+`bench/Computerwelt.Benchmarks/` carries bashkit's own benchmark corpus —
+`crates/bashkit-bench/src/cases.rs`, all 96 cases, case for case — plus micro-benchmarks
+for session construction, parsing, the filesystem and the Python half. Two ways in:
+
+```bash
+dotnet run -c Release --project bench/Computerwelt.Benchmarks -- --report   # stopwatch, seconds
+dotnet run -c Release --project bench/Computerwelt.Benchmarks -- --filter '*Session*'  # BenchmarkDotNet
+```
+
+`--report` is for the edit loop: µs/op and bytes/op per case, and it checks each case
+against the output upstream recorded, because a case that stopped producing the right
+answer is not a faster case. BenchmarkDotNet is for before you believe a number. Nothing
+here is a ratchet — these are measurements, not acceptance criteria, and `todo.md` records
+what the last round of them changed and what they still point at.
 
 ## Building and publishing
 

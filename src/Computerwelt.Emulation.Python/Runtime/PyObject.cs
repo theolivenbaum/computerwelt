@@ -216,11 +216,15 @@ public class PyInt : PyObject
     /// <inheritdoc />
     public override string Repr() => Decimal(Value);
 
+    // The limit as a number, computed once. Raising ten to the four-thousandth power is
+    // not a cheap constant, and every integer that becomes a string is compared against it.
+    private static readonly BigInteger MaxStringValue = BigInteger.Pow(10, MaxStringDigits);
+
     /// <summary>Renders an integer in decimal, refusing one past the digit limit.</summary>
     public static string Decimal(BigInteger value)
     {
         // The bound is checked before formatting, so a huge value costs nothing to reject.
-        if (BigInteger.Abs(value) >= BigInteger.Pow(10, MaxStringDigits))
+        if (BigInteger.Abs(value) >= MaxStringValue)
         {
             throw new PyRaise(PyErrors.ValueError(
                 $"Exceeds the limit ({MaxStringDigits} digits) for integer string conversion: "
