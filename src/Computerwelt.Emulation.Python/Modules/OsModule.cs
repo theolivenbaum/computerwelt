@@ -503,7 +503,7 @@ public static class OsModule
         Add(path, "isdir", 1, 1, (arguments, _) => PyBool.Of(fileSystem.IsDirectory(Text(arguments[0]))));
         Add(path, "islink", 1, 1, (_, _) => PyBool.False);
         Add(path, "lexists", 1, 1, (arguments, _) => PyBool.Of(fileSystem.Exists(Text(arguments[0]))));
-        Add(path, "getsize", 1, 1, (arguments, _) => new PyInt(fileSystem.Size(Text(arguments[0]))));
+        Add(path, "getsize", 1, 1, (arguments, _) => PyInt.From(fileSystem.Size(Text(arguments[0]))));
         Add(path, "getmtime", 1, 1, (arguments, _) => new PyFloat(fileSystem.ModifiedAt(Text(arguments[0]))));
 
         // No filesystem here has symbolic links, so resolving is normalising.
@@ -1173,7 +1173,7 @@ public sealed class PyFile : PyObject
         "readlines" => new PyBuiltinFunction("readlines", _ =>
             new PyList([.. Lines().Select(Piece)])),
 
-        "tell" => new PyBuiltinFunction("tell", _ => new PyInt(_position)),
+        "tell" => new PyBuiltinFunction("tell", _ => PyInt.From(_position)),
 
         "seek" => new PyBuiltinFunction("seek", arguments =>
         {
@@ -1200,7 +1200,7 @@ public sealed class PyFile : PyObject
             }
 
             _position = target;
-            return new PyInt(_position);
+            return PyInt.From(_position);
         }),
 
         "write" => new PyBuiltinFunction("write", arguments =>
@@ -1235,7 +1235,7 @@ public sealed class PyFile : PyObject
             var written = arguments[0] is PyBytes ? payload.Length : arguments[0].Display().Length;
             _position += written;
 
-            return new PyInt(written);
+            return PyInt.From(written);
         }),
 
         "writelines" => new PyBuiltinFunction("writelines", arguments =>

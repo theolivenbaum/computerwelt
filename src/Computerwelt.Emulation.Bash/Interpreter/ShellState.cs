@@ -21,7 +21,7 @@ namespace Computerwelt.Emulation.Bash.Interpreter;
 /// </remarks>
 public sealed class ShellState
 {
-    private readonly List<Dictionary<string, ShellVariable>> _scopes = [new(StringComparer.Ordinal)];
+    private readonly List<Scope> _scopes = [new Scope()];
 
     /// <summary>Creates a state with only the global scope.</summary>
     public ShellState()
@@ -134,7 +134,7 @@ public sealed class ShellState
     public int ScopeDepth => _scopes.Count - 1;
 
     /// <summary>Pushes a new local scope for a function call.</summary>
-    public void PushScope() => _scopes.Add(new Dictionary<string, ShellVariable>(StringComparer.Ordinal));
+    public void PushScope() => _scopes.Add(new Scope());
 
     /// <summary>Pops the innermost local scope.</summary>
     public void PopScope()
@@ -150,7 +150,7 @@ public sealed class ShellState
     {
         for (var i = _scopes.Count - 1; i >= 0; i--)
         {
-            if (_scopes[i].TryGetValue(name, out var variable))
+            if (_scopes[i].TryGet(name, out var variable))
             {
                 // A nameref forwards every read and write to the variable it names, and
                 // that name may carry a subscript: `typeset -n ref='a[2]'`.
@@ -161,6 +161,51 @@ public sealed class ShellState
                     return Lookup(bracket > 0 ? target[..bracket] : target);
                 }
 
+                return variable;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Looks a variable up for writing: the one returned belongs to this state alone.
+    /// </summary>
+    /// <remarks>
+    /// A fork shares its parent's variables until one of them writes, so a caller that
+    /// means to mutate what it finds must ask through here rather than through
+    /// <see cref="Lookup"/>. What comes back is an unshared copy where sharing was in
+    /// force, and the variable itself as it stands where it was not.
+    /// </remarks>
+    public ShellVariable? LookupForWrite(string name)
+    {
+        for (var i = _scopes.Count - 1; i >= 0; i--)
+        {
+            if (!_scopes[i].TryGet(name, out var found))
+            {
+                continue;
+            }
+
+            if (found.Attributes.HasFlag(VariableAttributes.NameRef) && found.Value != name)
+            {
+                var target = found.Value;
+                var bracket = target.IndexOf('[', StringComparison.Ordinal);
+                return LookupForWrite(bracket > 0 ? target[..bracket] : target);
+            }
+
+            return found;
+        }
+
+        return null;
+    }
+
+    /// <summary>Looks a variable up for writing without following a nameref.</summary>
+    public ShellVariable? LookupRawForWrite(string name)
+    {
+        for (var i = _scopes.Count - 1; i >= 0; i--)
+        {
+            if (_scopes[i].TryGet(name, out var variable))
+            {
                 return variable;
             }
         }
@@ -180,7 +225,7 @@ public sealed class ShellState
     {
         for (var i = _scopes.Count - 1; i >= 0; i--)
         {
-            if (_scopes[i].TryGetValue(name, out var variable))
+            if (_scopes[i].TryGet(name, out var variable))
             {
                 return variable;
             }
@@ -235,7 +280,7 @@ public sealed class ShellState
     {
         var target = FindDefiningScope(name) ?? _scopes[0];
 
-        if (target.TryGetValue(name, out var existing))
+        if (target.TryGet(name, out var existing))
         {
             if (existing.IsReadOnly)
             {
@@ -252,17 +297,17 @@ public sealed class ShellState
             variable.Attributes |= VariableAttributes.Exported;
         }
 
-        target[name] = variable;
+        target.Define(name, variable);
     }
 
     /// <summary>Assigns a variable, creating it in the innermost scope (<c>local</c>).</summary>
     public ShellVariable SetLocal(string name, string? value)
     {
         var scope = _scopes[^1];
-        if (!scope.TryGetValue(name, out var variable))
+        if (!scope.TryGet(name, out var variable))
         {
             variable = new ShellVariable();
-            scope[name] = variable;
+            scope.Define(name, variable);
         }
 
         if (value is not null)
@@ -276,13 +321,15 @@ public sealed class ShellState
     /// <summary>Gets an existing variable or creates it in the appropriate scope.</summary>
     public ShellVariable GetOrCreate(string name)
     {
-        if (Lookup(name) is { } existing)
+        // A caller asking to create is a caller about to write, so what comes back is
+        // never a variable this state shares with a fork.
+        if (LookupForWrite(name) is { } existing)
         {
             return existing;
         }
 
         var variable = new ShellVariable();
-        (FindDefiningScope(name) ?? _scopes[0])[name] = variable;
+        (FindDefiningScope(name) ?? _scopes[0]).Define(name, variable);
         return variable;
     }
 
@@ -302,7 +349,7 @@ public sealed class ShellState
 
         for (var i = _scopes.Count - 1; i >= 0; i--)
         {
-            if (!_scopes[i].TryGetValue(name, out var variable))
+            if (!_scopes[i].TryGet(name, out var variable))
             {
                 continue;
             }
@@ -325,7 +372,7 @@ public sealed class ShellState
         var seen = new HashSet<string>(StringComparer.Ordinal);
         for (var i = _scopes.Count - 1; i >= 0; i--)
         {
-            foreach (var pair in _scopes[i])
+            foreach (var pair in _scopes[i].Entries)
             {
                 if (seen.Add(pair.Key))
                 {
@@ -448,11 +495,11 @@ public sealed class ShellState
         return flags.ToString();
     }
 
-    private Dictionary<string, ShellVariable>? FindDefiningScope(string name)
+    private Scope? FindDefiningScope(string name)
     {
         for (var i = _scopes.Count - 1; i >= 0; i--)
         {
-            if (_scopes[i].ContainsKey(name))
+            if (_scopes[i].Contains(name))
             {
                 return _scopes[i];
             }
@@ -487,21 +534,165 @@ public sealed class ShellState
             DescriptorBuffers = new Dictionary<int, System.Text.StringBuilder>(DescriptorBuffers),
         };
 
+        // The scopes are shared, not copied: the two dozen seeded variables that a script
+        // never writes are the bulk of them, and a command substitution that only reads is
+        // the common case. Whichever side writes first takes its copy then — see
+        // <see cref="Scope"/>.
         fork._scopes.Clear();
         foreach (var scope in _scopes)
         {
-            // Sized up front: the global scope alone holds the two dozen seeded variables,
-            // and growing a dictionary into that reallocates its table four times.
-            var copy = new Dictionary<string, ShellVariable>(scope.Count, StringComparer.Ordinal);
-            foreach (var (name, variable) in scope)
-            {
-                copy[name] = variable.Clone();
-            }
-
-            fork._scopes.Add(copy);
+            fork._scopes.Add(scope.Share());
         }
 
         fork.CallStack.AddRange(CallStack);
         return fork;
+    }
+
+    /// <summary>
+    /// One variable scope, which a subshell borrows from its parent rather than copying.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Copying every variable on <see cref="Fork"/> was the largest cost a command
+    /// substitution paid, and nearly all of it was waste: the two dozen seeded variables
+    /// are rarely read and almost never written. A forked scope therefore starts empty and
+    /// keeps a link to the scope it came from; a name it has not got is looked up along
+    /// that chain and <i>copied in</i> on first touch, so what a fork hands out is always
+    /// its own.
+    /// </para>
+    /// <para>
+    /// Copying on read rather than on write is what makes this safe without auditing every
+    /// caller: no reference to a parent's variable ever leaves this class, so no path can
+    /// write through one. The chain is only ever read — <see cref="TryPeek"/> never
+    /// modifies the scope it walks into — and it is as deep as the substitutions are
+    /// nested, which the nesting limit bounds.
+    /// </para>
+    /// <para>
+    /// The arrangement rests on a fork running to completion while its parent waits, which
+    /// every caller of <see cref="Fork"/> does: there is no concurrency here, and a
+    /// parent's later writes cannot reach a fork that has already finished.
+    /// </para>
+    /// </remarks>
+    private sealed class Scope
+    {
+        private readonly Dictionary<string, ShellVariable> _own = new(StringComparer.Ordinal);
+        private readonly Scope? _inherited;
+
+        // Names this scope has unset that the chain behind it still defines.
+        private HashSet<string>? _removed;
+
+        public Scope()
+        {
+        }
+
+        private Scope(Scope inherited) => _inherited = inherited;
+
+        /// <summary>Hands a fork a scope that borrows from this one.</summary>
+        public Scope Share() => new(this);
+
+        /// <summary>True when the name is visible here or anywhere along the chain.</summary>
+        public bool Contains(string name) => TryPeek(name, out _);
+
+        /// <summary>
+        /// Gets a variable this scope owns, copying it in from the chain if that is where
+        /// it lives. What comes back may be mutated freely.
+        /// </summary>
+        public bool TryGet(string name, out ShellVariable variable)
+        {
+            if (_own.TryGetValue(name, out variable!))
+            {
+                return true;
+            }
+
+            if (_removed?.Contains(name) == true
+                || _inherited is null
+                || !_inherited.TryPeek(name, out var borrowed))
+            {
+                variable = null!;
+                return false;
+            }
+
+            variable = borrowed.Clone();
+            _own[name] = variable;
+            return true;
+        }
+
+        /// <summary>Puts a variable in the scope, replacing any of the same name.</summary>
+        public void Define(string name, ShellVariable variable)
+        {
+            _own[name] = variable;
+            _removed?.Remove(name);
+        }
+
+        /// <summary>Removes a variable, hiding an inherited one of the same name.</summary>
+        public bool Remove(string name)
+        {
+            var removed = _own.Remove(name);
+
+            if (_inherited is not null && _removed?.Contains(name) != true && _inherited.TryPeek(name, out _))
+            {
+                (_removed ??= new HashSet<string>(StringComparer.Ordinal)).Add(name);
+                removed = true;
+            }
+
+            return removed;
+        }
+
+        /// <summary>
+        /// Every variable visible in this scope. A borrowed one is copied in as it is
+        /// yielded, so an enumeration never hands out a parent's variable either.
+        /// </summary>
+        public IEnumerable<KeyValuePair<string, ShellVariable>> Entries =>
+            _inherited is null ? _own : Materialised();
+
+        // Reads along the chain without touching anything: the scopes behind this one
+        // belong to other states, and a walk must leave them exactly as it found them.
+        private bool TryPeek(string name, out ShellVariable variable)
+        {
+            if (_own.TryGetValue(name, out variable!))
+            {
+                return true;
+            }
+
+            if (_removed?.Contains(name) == true)
+            {
+                variable = null!;
+                return false;
+            }
+
+            return _inherited is not null && _inherited.TryPeek(name, out variable);
+        }
+
+        private void CollectNames(List<string> names, HashSet<string> seen)
+        {
+            foreach (var name in _own.Keys)
+            {
+                if (seen.Add(name))
+                {
+                    names.Add(name);
+                }
+            }
+
+            if (_removed is { } removed)
+            {
+                seen.UnionWith(removed);
+            }
+
+            _inherited?.CollectNames(names, seen);
+        }
+
+        private IEnumerable<KeyValuePair<string, ShellVariable>> Materialised()
+        {
+            var names = new List<string>(_own.Count);
+            CollectNames(names, new HashSet<string>(StringComparer.Ordinal));
+
+            foreach (var name in names)
+            {
+                if (TryGet(name, out var variable))
+                {
+                    yield return new KeyValuePair<string, ShellVariable>(name, variable);
+                }
+            }
+        }
     }
 }

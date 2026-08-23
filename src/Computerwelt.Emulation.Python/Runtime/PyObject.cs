@@ -193,6 +193,28 @@ public class PyInt : PyObject
     /// <summary>Creates an integer from a 64-bit value.</summary>
     public PyInt(long value) => Value = value;
 
+    // The range CPython interns, and for the same reason: a program's integers are
+    // overwhelmingly small, and one shared object per value keeps counting, indexing and
+    // arithmetic from allocating. Identity here is value-based anyway — `1 is 1` is true —
+    // so sharing changes nothing a program can observe.
+    private const int SmallestShared = -5;
+    private const int LargestShared = 256;
+
+    private static readonly PyInt[] SharedValues =
+        [.. Enumerable.Range(SmallestShared, LargestShared - SmallestShared + 1).Select(static i => new PyInt(i))];
+
+    /// <summary>Returns an integer, shared when the value is a small one.</summary>
+    public static PyInt From(long value) =>
+        value is >= SmallestShared and <= LargestShared
+            ? SharedValues[(int)value - SmallestShared]
+            : new PyInt(value);
+
+    /// <summary>Returns an integer, shared when the value is a small one.</summary>
+    public static PyInt From(BigInteger value) =>
+        value >= SmallestShared && value <= LargestShared
+            ? SharedValues[(int)value - SmallestShared]
+            : new PyInt(value);
+
     /// <summary>The integer value.</summary>
     public BigInteger Value { get; }
 

@@ -326,7 +326,7 @@ public sealed class PyPath : PyObject
                     var text = Text(arguments[0]);
                     Storage().Write(Value, System.Text.Encoding.UTF8.GetBytes(text));
 
-                    return new PyInt(new PyStr(text).Length() ?? text.Length);
+                    return PyInt.From(new PyStr(text).Length() ?? text.Length);
                 });
 
             case "write_bytes":
@@ -345,7 +345,7 @@ public sealed class PyPath : PyObject
                         : throw new PyRaise(PyErrors.TypeError(
                             $"memoryview: a bytes-like object is required, not '{arguments[0].TypeName}'"));
                     Storage().Write(Value, bytes);
-                    return new PyInt(bytes.Length);
+                    return PyInt.From(bytes.Length);
                 });
 
             case "unlink":
@@ -662,8 +662,8 @@ public sealed class PyStat : PyObject
         // mtime, ctime.
         _fields =
         [
-            new PyInt(mode), new PyInt(0), new PyInt(0), new PyInt(1), new PyInt(0), new PyInt(0),
-            new PyInt(size), new PyFloat(modifiedAt), new PyFloat(modifiedAt), new PyFloat(modifiedAt),
+            PyInt.From(mode), PyInt.From(0), PyInt.From(0), PyInt.From(1), PyInt.From(0), PyInt.From(0),
+            PyInt.From(size), new PyFloat(modifiedAt), new PyFloat(modifiedAt), new PyFloat(modifiedAt),
         ];
     }
 
@@ -698,16 +698,16 @@ public sealed class PyStat : PyObject
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name) => name switch
     {
-        "st_mode" => new PyInt(Mode),
-        "st_size" => new PyInt(Size),
+        "st_mode" => PyInt.From(Mode),
+        "st_size" => PyInt.From(Size),
         "st_mtime" => new PyFloat(ModifiedAt),
         "st_atime" => new PyFloat(ModifiedAt),
         "st_ctime" => new PyFloat(ModifiedAt),
-        "st_ino" => new PyInt(0),
-        "st_dev" => new PyInt(0),
-        "st_nlink" => new PyInt(1),
-        "st_uid" => new PyInt(0),
-        "st_gid" => new PyInt(0),
+        "st_ino" => PyInt.From(0),
+        "st_dev" => PyInt.From(0),
+        "st_nlink" => PyInt.From(1),
+        "st_uid" => PyInt.From(0),
+        "st_gid" => PyInt.From(0),
         _ => null,
     };
 }

@@ -27,14 +27,14 @@ public sealed class Expander
     private readonly ShellState _state;
     private readonly IFileSystem _fileSystem;
     private readonly ExecutionBudget _budget;
-    private readonly Func<string, CancellationToken, ValueTask<ExecResult>> _runCommandSubstitution;
+    private readonly Func<WordPart, CancellationToken, ValueTask<ExecResult>> _runCommandSubstitution;
 
     /// <summary>Creates an expander bound to one execution.</summary>
     public Expander(
         ShellState state,
         IFileSystem fileSystem,
         ExecutionBudget budget,
-        Func<string, CancellationToken, ValueTask<ExecResult>> runCommandSubstitution)
+        Func<WordPart, CancellationToken, ValueTask<ExecResult>> runCommandSubstitution)
     {
         _state = state;
         _fileSystem = fileSystem;
@@ -310,7 +310,7 @@ public sealed class Expander
 
             case WordPart.CommandSubstitution substitution:
             {
-                var result = await _runCommandSubstitution(substitution.Script, cancellationToken);
+                var result = await _runCommandSubstitution(substitution, cancellationToken);
                 // Command substitution strips every trailing newline.
                 return [result.Stdout.ToString().TrimEnd('\n')];
             }
@@ -353,7 +353,7 @@ public sealed class Expander
             return path.Value;
         }
 
-        var result = await _runCommandSubstitution(substitution.Script, cancellationToken);
+        var result = await _runCommandSubstitution(substitution, cancellationToken);
         await _fileSystem.WriteFileAsync(path, result.Stdout.Memory, cancellationToken);
         return path.Value;
     }

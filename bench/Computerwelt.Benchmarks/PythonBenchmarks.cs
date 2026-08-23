@@ -35,6 +35,21 @@ public class PythonBenchmarks
         top = sorted(counts.items(), key=lambda kv: -kv[1])[:5]
         """;
 
+    private const string NumericLoop = """
+        total = 0
+        for i in range(5000):
+            total += i * 2 % 7
+        """;
+
+    private const string Calls = """
+        def add(a, b):
+            return a + b
+
+        total = 0
+        for i in range(2000):
+            total = add(total, i)
+        """;
+
     private const string Startup = "x = 1\n";
 
     [Benchmark]
@@ -45,6 +60,12 @@ public class PythonBenchmarks
 
     [Benchmark]
     public bool RunTextProcessing() => new PythonRunner().Run(TextProcessing).Succeeded;
+
+    [Benchmark]
+    public bool RunNumericLoop() => new PythonRunner().Run(NumericLoop).Succeeded;
+
+    [Benchmark]
+    public bool RunCalls() => new PythonRunner().Run(Calls).Succeeded;
 
     [Benchmark]
     public PyModule ParseTextProcessing() => Parser.Parse(TextProcessing);

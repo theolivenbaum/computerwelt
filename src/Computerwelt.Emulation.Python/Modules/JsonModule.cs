@@ -747,7 +747,7 @@ public static class JsonModule
 
                 if (BigInteger.TryParse(token, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var integer))
                 {
-                    return new PyInt(integer);
+                    return PyInt.From(integer);
                 }
             }
 

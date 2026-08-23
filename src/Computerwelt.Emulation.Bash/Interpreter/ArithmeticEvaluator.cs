@@ -515,7 +515,18 @@ public sealed class ArithmeticEvaluator
             return ParseInBase(baseText, _text[digitStart.._position]);
         }
 
-        var token = _text[start.._position];
+        var span = _text.AsSpan(start, _position - start);
+
+        // A plain decimal literal is the overwhelmingly common one, and it needs neither a
+        // substring nor the base tests below: only a leading zero can mean hex or octal.
+        // Every other shape falls through to the original path, error messages included.
+        if (!(span.Length > 1 && span[0] == '0')
+            && long.TryParse(span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var decimalValue))
+        {
+            return decimalValue;
+        }
+
+        var token = span.ToString();
 
         if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
         {

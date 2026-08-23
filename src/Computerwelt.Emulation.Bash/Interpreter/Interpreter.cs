@@ -1213,17 +1213,22 @@ public sealed class Interpreter
         }
     }
 
+    // Rebuilt on entry to and exit from every function call, so it is one buffer rather
+    // than a list per call. An interpreter belongs to one execution, and `SetArray` copies
+    // what it is given, so nothing outlives the call that filled it.
+    private readonly List<string> _functionNames = [];
+
     /// <summary>Republishes <c>FUNCNAME</c> from the call stack, innermost first.</summary>
     private void UpdateFunctionName()
     {
-        var names = new List<string>(State.CallStack.Count);
+        _functionNames.Clear();
 
         for (var i = State.CallStack.Count - 1; i >= 0; i--)
         {
-            names.Add(State.CallStack[i]);
+            _functionNames.Add(State.CallStack[i]);
         }
 
-        State.GetOrCreate("FUNCNAME").SetArray(names);
+        State.GetOrCreate("FUNCNAME").SetArray(_functionNames);
     }
 
     private async ValueTask<List<(string Name, string? Value, bool Existed)>> ApplyTemporaryAssignmentsAsync(
@@ -1389,12 +1394,57 @@ public sealed class Interpreter
     /// Runs a nested script for command substitution. It shares the parent's variables so
     /// that <c>$(echo $x)</c> sees <c>x</c>, but its own <c>exit</c> does not end the caller.
     /// </summary>
-    private async ValueTask<ExecResult> RunSubstitutionAsync(string script, CancellationToken cancellationToken)
+    /// <summary>
+    /// Parses a substitution's body, or hands back the parse the node already has.
+    /// </summary>
+    /// <remarks>
+    /// The body is the same text on every execution of the node, so a function that
+    /// substitutes parses once rather than once per call. What that first parse cost is
+    /// charged again on every reuse: the work is skipped, the accounting is not, so
+    /// <c>max_parser_fuel</c> bounds a loop exactly as it did before.
+    /// </remarks>
+    private Script ParseSubstitution(WordPart part)
+    {
+        switch (part)
+        {
+            case WordPart.CommandSubstitution command:
+                if (command.Parsed is { } parsedCommand)
+                {
+                    Budget.ChargeParserFuel(command.ParsedFuel);
+                    return parsedCommand;
+                }
+
+                (command.Parsed, command.ParsedFuel) = ParseAndMeasure(command.Script);
+                return command.Parsed;
+
+            case WordPart.ProcessSubstitution process:
+                if (process.Parsed is { } parsedProcess)
+                {
+                    Budget.ChargeParserFuel(process.ParsedFuel);
+                    return parsedProcess;
+                }
+
+                (process.Parsed, process.ParsedFuel) = ParseAndMeasure(process.Script);
+                return process.Parsed;
+
+            default:
+                throw new ArgumentException($"{part.GetType().Name} carries no script", nameof(part));
+        }
+    }
+
+    private (Script Parsed, long Fuel) ParseAndMeasure(string script)
+    {
+        var before = Budget.ParserFuel;
+        var parsed = Parser.Parse(script, Budget);
+        return (parsed, Budget.ParserFuel - before);
+    }
+
+    private async ValueTask<ExecResult> RunSubstitutionAsync(WordPart part, CancellationToken cancellationToken)
     {
         Budget.ThrowIfExpired();
         using var nesting = Budget.EnterNesting();
 
-        var parsed = Parser.Parse(script, Budget);
+        var parsed = ParseSubstitution(part);
 
         // A substitution is a subshell: assignments, function definitions and traps made
         // inside it are discarded, which is what keeps `x=$(myvar=inside; ...)` from

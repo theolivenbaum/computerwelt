@@ -215,7 +215,7 @@ public sealed class PyDeque : PyObject
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name) => name switch
     {
-        "maxlen" => MaxLength is { } bound ? new PyInt(bound) : PyNone.Instance,
+        "maxlen" => MaxLength is { } bound ? PyInt.From(bound) : PyNone.Instance,
 
         "append" => Method(name, 1, arguments =>
         {
@@ -279,7 +279,7 @@ public sealed class PyDeque : PyObject
         "count" => new PyBoundMethod(name, this, (_, arguments, _) =>
         {
             Check("count", arguments, 1, 1);
-            return new PyInt(Items.Count(item => SameOrEqual(item, arguments[0])));
+            return PyInt.From(Items.Count(item => SameOrEqual(item, arguments[0])));
         }),
 
         "index" => new PyBoundMethod(name, this, (_, arguments, _) => Index(arguments)),
@@ -527,7 +527,7 @@ public sealed class PyDeque : PyObject
         {
             if (SameOrEqual(Items[i], arguments[0]))
             {
-                return new PyInt(i);
+                return PyInt.From(i);
             }
         }
 

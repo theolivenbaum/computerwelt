@@ -171,7 +171,7 @@ public sealed class PyMemoryStream : PyObject
                 var overwritten = Math.Min(text.Length, _buffer.Length - _position);
                 _buffer.Remove(_position, overwritten).Insert(_position, text);
                 _position += text.Length;
-                return new PyInt(text.Length);
+                return PyInt.From(text.Length);
             }),
 
             "writelines" => new PyBuiltinFunction("writelines", arguments =>
@@ -187,7 +187,7 @@ public sealed class PyMemoryStream : PyObject
                 return PyNone.Instance;
             }),
 
-            "tell" => new PyBuiltinFunction("tell", _ => new PyInt(_position)),
+            "tell" => new PyBuiltinFunction("tell", _ => PyInt.From(_position)),
 
             "seek" => new PyBuiltinFunction("seek", arguments =>
             {
@@ -213,7 +213,7 @@ public sealed class PyMemoryStream : PyObject
                 }
 
                 _position = target;
-                return new PyInt(_position);
+                return PyInt.From(_position);
             }),
 
             "truncate" => new PyBuiltinFunction("truncate", arguments =>
@@ -227,7 +227,7 @@ public sealed class PyMemoryStream : PyObject
                     _buffer.Length = Math.Max(size, 0);
                 }
 
-                return new PyInt(_buffer.Length);
+                return PyInt.From(_buffer.Length);
             }),
 
             // Flushing is a no-op that succeeds: there is nothing between the write and

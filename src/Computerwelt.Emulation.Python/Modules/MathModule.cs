@@ -152,7 +152,7 @@ public static class MathModule
 
             if (value == 0 || double.IsNaN(value) || double.IsInfinity(value))
             {
-                return new PyTuple([new PyFloat(value), new PyInt(0)]);
+                return new PyTuple([new PyFloat(value), PyInt.From(0)]);
             }
 
             var exponent = (int)Math.Floor(Math.Log2(Math.Abs(value))) + 1;
@@ -171,7 +171,7 @@ public static class MathModule
                 exponent--;
             }
 
-            return new PyTuple([new PyFloat(mantissa), new PyInt(exponent)]);
+            return new PyTuple([new PyFloat(mantissa), PyInt.From(exponent)]);
         });
 
         module.Add("modf", static arguments =>
@@ -319,7 +319,7 @@ public static class MathModule
                 result *= i;
             }
 
-            return new PyInt(result);
+            return PyInt.From(result);
         });
 
         module.Add("gcd", static arguments =>
@@ -331,7 +331,7 @@ public static class MathModule
                 result = BigInteger.GreatestCommonDivisor(result, BigInteger.Abs(RequireInt(argument)));
             }
 
-            return new PyInt(result);
+            return PyInt.From(result);
         });
 
         module.Add("lcm", static arguments =>
@@ -344,13 +344,13 @@ public static class MathModule
 
                 if (value.IsZero)
                 {
-                    return new PyInt(0);
+                    return PyInt.From(0);
                 }
 
                 result = result / BigInteger.GreatestCommonDivisor(result, value) * value;
             }
 
-            return new PyInt(result);
+            return PyInt.From(result);
         });
 
         module.Add("isqrt", static arguments =>
@@ -365,7 +365,7 @@ public static class MathModule
             // Newton's method, since a double round-trip loses precision on large values.
             if (value < 2)
             {
-                return new PyInt(value);
+                return PyInt.From(value);
             }
 
             var guess = value;
@@ -377,7 +377,7 @@ public static class MathModule
                 next = (guess + (value / guess)) / 2;
             }
 
-            return new PyInt(guess);
+            return PyInt.From(guess);
         });
 
         module.Add("perm", static arguments =>
@@ -392,7 +392,7 @@ public static class MathModule
 
             if (k > n)
             {
-                return new PyInt(0);
+                return PyInt.From(0);
             }
 
             var permutations = BigInteger.One;
@@ -402,7 +402,7 @@ public static class MathModule
                 permutations *= n - i;
             }
 
-            return new PyInt(permutations);
+            return PyInt.From(permutations);
         });
 
         module.Add("comb", static arguments =>
@@ -417,7 +417,7 @@ public static class MathModule
 
             if (k > n)
             {
-                return new PyInt(0);
+                return PyInt.From(0);
             }
 
             var result = BigInteger.One;
@@ -428,12 +428,12 @@ public static class MathModule
                 result = result * (n - i) / (i + 1);
             }
 
-            return new PyInt(result);
+            return PyInt.From(result);
         });
 
         module.Add("prod", static arguments =>
         {
-            PyObject total = new PyInt(1);
+            PyObject total = PyInt.From(1);
 
             foreach (var item in VirtualMachine.RequireIterable(arguments[0]))
             {
@@ -801,7 +801,7 @@ public static class MathModule
         }
 
         _ = function;
-        return new PyInt(new BigInteger(value));
+        return PyInt.From(new BigInteger(value));
     }
 
     private static double ToDouble(PyObject value) => value switch

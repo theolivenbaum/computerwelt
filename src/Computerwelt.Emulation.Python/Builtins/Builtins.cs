@@ -94,8 +94,8 @@ public static class BuiltinNamespace
         {
             // A range knows its length without materialising it, so `len` reaches as far as
             // an ssize_t does rather than as far as a host int.
-            PyRange range => new PyInt(range.LongCount),
-            var value => new PyInt(value.Length()
+            PyRange range => PyInt.From(range.LongCount),
+            var value => PyInt.From(value.Length()
                 ?? throw new PyRaise(PyErrors.TypeError($"object of type '{value.TypeName}' has no len()"))),
         });
 
@@ -167,7 +167,7 @@ public static class BuiltinNamespace
             var index = given[1] is null ? BigInteger.Zero : RequireInt(given[1]!, "enumerate");
 
             return new PyIterator(
-                () => source.MoveNext() ? new PyTuple([new PyInt(index++), source.Current]) : null,
+                () => source.MoveNext() ? new PyTuple([PyInt.From(index++), source.Current]) : null,
                 "enumerate");
         });
 
@@ -372,7 +372,7 @@ public static class BuiltinNamespace
                 }
             }
 
-            var total = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "start") ?? new PyInt(0);
+            var total = arguments.Length > 1 ? arguments[1] : Keyword(keywords, "start") ?? PyInt.From(0);
 
             // Summing strings is almost always a mistake and quadratic when it is not, so
             // CPython refuses and points at the right tool instead.
@@ -399,7 +399,7 @@ public static class BuiltinNamespace
 
         DefineArity("abs", 1, 1, static arguments => arguments[0] switch
         {
-            PyInt integer => new PyInt(BigInteger.Abs(integer.Value)),
+            PyInt integer => PyInt.From(BigInteger.Abs(integer.Value)),
             PyFloat number => new PyFloat(Math.Abs(number.Value)),
             var other => Operators.Unary("abs", other),
         });
@@ -460,12 +460,12 @@ public static class BuiltinNamespace
             return number switch
             {
                 PyInt integer when digits >= 0 => integer,
-                PyInt when digits <= -400 => new PyInt(BigInteger.Zero),
+                PyInt when digits <= -400 => PyInt.From(BigInteger.Zero),
                 // Python rounds half to even, unlike the usual half-away-from-zero.
                 // .NET only rounds to 15 decimal places; beyond that a double has no
                 // digits left to lose, so the value is already its own rounding.
                 PyFloat value => given is null or PyNone
-                    ? new PyInt(new BigInteger(Math.Round(value.Value, MidpointRounding.ToEven)))
+                    ? PyInt.From(new BigInteger(Math.Round(value.Value, MidpointRounding.ToEven)))
                     : digits > 15 ? value
                     : digits >= 0 ? new PyFloat(Math.Round(value.Value, digits, MidpointRounding.ToEven))
                     // A float rounded away to nothing keeps its sign: -1.5 at a huge
@@ -474,7 +474,7 @@ public static class BuiltinNamespace
                         (double)RoundToMultiple(
                             new BigInteger(value.Value), BigInteger.Pow(10, Math.Min(-digits, 400))),
                         value.Value)),
-                PyInt integer => new PyInt(RoundToMultiple(integer.Value, BigInteger.Pow(10, -digits))),
+                PyInt integer => PyInt.From(RoundToMultiple(integer.Value, BigInteger.Pow(10, -digits))),
                 var other => throw new PyRaise(PyErrors.TypeError(
                     $"type {other.TypeName} doesn't define __round__ method")),
             };
@@ -530,13 +530,13 @@ public static class BuiltinNamespace
             var power = BigInteger.ModPow(((PyInt)arguments[0]).Value, exponent, modulus);
 
             // The result takes the modulus's sign, as `%` does.
-            return new PyInt(power.Sign != 0 && power.Sign != modulus.Sign ? power + modulus : power);
+            return PyInt.From(power.Sign != 0 && power.Sign != modulus.Sign ? power + modulus : power);
         });
 
-        DefineArity("hash", 1, 1, static arguments => new PyInt(arguments[0].PyHash()));
+        DefineArity("hash", 1, 1, static arguments => PyInt.From(arguments[0].PyHash()));
 
         DefineArity("id", 1, 1, static arguments =>
-            new PyInt(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(arguments[0])));
+            PyInt.From(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(arguments[0])));
 
         DefineArity("chr", 1, 1, static arguments =>
             new PyStr(char.ConvertFromUtf32((int)RequireInt(arguments[0], "chr"))));
@@ -546,7 +546,7 @@ public static class BuiltinNamespace
             var text = arguments[0].Display();
 
             return text.Length == 1 || char.IsSurrogatePair(text, 0)
-                ? new PyInt(char.ConvertToUtf32(text, 0))
+                ? PyInt.From(char.ConvertToUtf32(text, 0))
                 : throw new PyRaise(PyErrors.TypeError(
                     $"ord() expected a character, but string of length {text.Length} found"));
         });
@@ -1025,7 +1025,7 @@ public static class Conversions
             // A base with nothing to apply it to is reported before the base itself is
             // looked at, so `int(base='q')` complains about the missing string.
             return given is null
-                ? new PyInt(0)
+                ? PyInt.From(0)
                 : throw new PyRaise(PyErrors.TypeError("int() missing string argument"));
         }
 
@@ -1048,7 +1048,7 @@ public static class Conversions
         switch (arguments[0])
         {
             case PyBool flag:
-                return new PyInt(flag.Value ? 1 : 0);
+                return PyInt.From(flag.Value ? 1 : 0);
 
             case PyInt integer:
                 return integer;
@@ -1060,7 +1060,7 @@ public static class Conversions
                         $"cannot convert float {(double.IsNaN(number.Value) ? "NaN" : "infinity")} to integer"));
                 }
 
-                return new PyInt(new BigInteger(Math.Truncate(number.Value)));
+                return PyInt.From(new BigInteger(Math.Truncate(number.Value)));
 
             // A bytes literal is read as the ASCII text it spells, byte for byte, and only
             // ASCII whitespace pads it: a UTF-8 encoded non-breaking space is data, not
@@ -1104,7 +1104,7 @@ public static class Conversions
         }
 
         return TryParseRadix(trimmed, radix, out var parsed)
-            ? new PyInt(parsed)
+            ? PyInt.From(parsed)
             : throw new PyRaise(PyErrors.ValueError(
                 $"invalid literal for int() with base {radix}: {original.Repr()}"));
     }

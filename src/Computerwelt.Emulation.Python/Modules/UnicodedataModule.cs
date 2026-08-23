@@ -24,7 +24,7 @@ public static class UnicodedataModule
             new PyStr(UnicodeData.Category(Single(arguments, "category")))));
 
         module.Add("combining", new PyBuiltinFunction("combining", static arguments =>
-            new PyInt(UnicodeData.Combining(Single(arguments, "combining")))));
+            PyInt.From(UnicodeData.Combining(Single(arguments, "combining")))));
 
         // `name` takes an optional default, and takes no keywords at all — the arity wording
         // is `PyArg_UnpackTuple`'s range form rather than the clinic's exact count.

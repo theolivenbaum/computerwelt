@@ -20,21 +20,21 @@ public static class ReModule
     {
         var module = new PyModuleObject("re");
 
-        module.Add("NOFLAG", new PyInt(0));
-        module.Add("IGNORECASE", new PyInt(2));
-        module.Add("I", new PyInt(2));
-        module.Add("MULTILINE", new PyInt(8));
-        module.Add("M", new PyInt(8));
-        module.Add("DOTALL", new PyInt(16));
-        module.Add("S", new PyInt(16));
-        module.Add("VERBOSE", new PyInt(64));
-        module.Add("X", new PyInt(64));
-        module.Add("ASCII", new PyInt(256));
-        module.Add("A", new PyInt(256));
+        module.Add("NOFLAG", PyInt.From(0));
+        module.Add("IGNORECASE", PyInt.From(2));
+        module.Add("I", PyInt.From(2));
+        module.Add("MULTILINE", PyInt.From(8));
+        module.Add("M", PyInt.From(8));
+        module.Add("DOTALL", PyInt.From(16));
+        module.Add("S", PyInt.From(16));
+        module.Add("VERBOSE", PyInt.From(64));
+        module.Add("X", PyInt.From(64));
+        module.Add("ASCII", PyInt.From(256));
+        module.Add("A", PyInt.From(256));
 
         // A str pattern is Unicode by definition, so this flag only documents the default.
-        module.Add("UNICODE", new PyInt(32));
-        module.Add("U", new PyInt(32));
+        module.Add("UNICODE", PyInt.From(32));
+        module.Add("U", PyInt.From(32));
 
         // The classes are exposed so a script can name them in `isinstance`.
         module.Add("Pattern", new PyType(
@@ -448,7 +448,7 @@ public static class ReModule
 
             foreach (var (name, number) in _names)
             {
-                index.Set(new PyStr(name), new PyInt(number));
+                index.Set(new PyStr(name), PyInt.From(number));
             }
 
             return index;
@@ -510,8 +510,8 @@ public static class ReModule
         public override PyObject? GetAttribute(string name) => name switch
         {
             "pattern" => new PyStr(Source),
-            "flags" => new PyInt(Flags),
-            "groups" => new PyInt(_count),
+            "flags" => PyInt.From(Flags),
+            "groups" => PyInt.From(_count),
             "groupindex" => GroupIndex(),
 
             "match" => new PyBuiltinFunction("match", arguments => MatchAt(arguments[0].Display(), anchored: true)),
@@ -790,7 +790,7 @@ public static class ReModule
 
             "group" => new PyBuiltinFunction("group", arguments => arguments.Length switch
             {
-                0 => Group(new PyInt(0)),
+                0 => Group(PyInt.From(0)),
                 1 => Group(arguments[0]),
                 _ => new PyTuple([.. arguments.Select(Group)]),
             }),
@@ -845,15 +845,15 @@ public static class ReModule
             // A group that did not participate spans (-1, -1) rather than reporting the
             // zero-length position .NET leaves it at.
             "start" => new PyBuiltinFunction("start", arguments =>
-                new PyInt(Bounds(GroupOf(arguments)).Start)),
+                PyInt.From(Bounds(GroupOf(arguments)).Start)),
 
             "end" => new PyBuiltinFunction("end", arguments =>
-                new PyInt(Bounds(GroupOf(arguments)).End)),
+                PyInt.From(Bounds(GroupOf(arguments)).End)),
 
             "span" => new PyBuiltinFunction("span", arguments =>
             {
                 var (start, end) = Bounds(GroupOf(arguments));
-                return new PyTuple([new PyInt(start), new PyInt(end)]);
+                return new PyTuple([PyInt.From(start), PyInt.From(end)]);
             }),
 
             _ => null,

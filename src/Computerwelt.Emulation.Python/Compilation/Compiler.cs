@@ -1906,8 +1906,8 @@ internal static class Literals
     {
         null => PyNone.Instance,
         bool flag => PyBool.Of(flag),
-        long integer => new PyInt(integer),
-        BigInteger integer => new PyInt(integer),
+        long integer => PyInt.From(integer),
+        BigInteger integer => PyInt.From(integer),
         double number => new PyFloat(number),
         string text => new PyStr(text),
         byte[] bytes => new PyBytes(bytes),

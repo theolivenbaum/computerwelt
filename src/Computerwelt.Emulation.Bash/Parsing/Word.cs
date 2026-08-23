@@ -77,6 +77,7 @@ public abstract record WordPart
     /// </summary>
     public bool Quoted { get; init; }
 
+
     /// <summary>Literal text with no expansion.</summary>
     /// <param name="Text">The literal characters.</param>
     public sealed record Literal(string Text) : WordPart
@@ -114,6 +115,22 @@ public abstract record WordPart
     {
         /// <inheritdoc />
         public override string ToString() => $"$({Script})";
+
+        /// <summary>
+        /// The parsed body, once something has parsed it.
+        /// </summary>
+        /// <remarks>
+        /// The body is text in the AST, and re-parsing it on every execution means a
+        /// function that substitutes re-parses per call and a loop re-parses per
+        /// iteration. It is kept on the node because the node's lifetime is exactly the
+        /// script's — this cannot grow the way a table keyed by text would, and nothing is
+        /// shared between two sessions. <see cref="ParsedFuel"/> is what the first parse
+        /// cost, so every reuse can be charged the same.
+        /// </remarks>
+        internal Script? Parsed { get; set; }
+
+        /// <summary>The parser fuel <see cref="Parsed"/> cost when it was first parsed.</summary>
+        internal long ParsedFuel { get; set; }
     }
 
     /// <summary>An arithmetic expansion, <c>$((...))</c>.</summary>
@@ -139,6 +156,12 @@ public abstract record WordPart
     {
         /// <inheritdoc />
         public override string ToString() => Output ? $">({Script})" : $"<({Script})";
+
+        /// <summary>The parsed body; see <see cref="CommandSubstitution.Parsed"/>.</summary>
+        internal Script? Parsed { get; set; }
+
+        /// <summary>The parser fuel <see cref="Parsed"/> cost when it was first parsed.</summary>
+        internal long ParsedFuel { get; set; }
     }
 }
 

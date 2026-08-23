@@ -88,6 +88,14 @@ public sealed class ExecutionBudget
         }
     }
 
+    /// <summary>The parser fuel charged so far.</summary>
+    /// <remarks>
+    /// Read so that a re-execution which reuses an already-parsed body can charge what
+    /// parsing it cost the first time: skipping the work must not skip the accounting, or
+    /// a loop around a substitution would parse for free after its first pass.
+    /// </remarks>
+    public long ParserFuel => _parserFuel;
+
     /// <summary>Charges parser fuel. Called per token and per production.</summary>
     public void ChargeParserFuel(long units = 1)
     {

@@ -168,11 +168,11 @@ public static class SupportModules
             // being narrowed to integers.
             var start = Argument(arguments, keywords, 0, "start", "count") is { } from
                 ? Number(from)
-                : new PyInt(0);
+                : PyInt.From(0);
 
             var step = Argument(arguments, keywords, 1, "step", "count") is { } by
                 ? Number(by)
-                : new PyInt(1);
+                : PyInt.From(1);
 
             var next = start;
 
@@ -449,7 +449,7 @@ public static class SupportModules
     {
         var module = new PyModuleObject("gc");
 
-        module.Add("collect", new PyBuiltinFunction("collect", static _ => new PyInt(0)));
+        module.Add("collect", new PyBuiltinFunction("collect", static _ => PyInt.From(0)));
         module.Add("disable", new PyBuiltinFunction("disable", static _ => PyNone.Instance));
         module.Add("enable", new PyBuiltinFunction("enable", static _ => PyNone.Instance));
         module.Add("isenabled", new PyBuiltinFunction("isenabled", static _ => PyBool.True));
@@ -598,7 +598,7 @@ public static class SupportModules
     /// </summary>
     private static PyObject Number(PyObject value) => value switch
     {
-        PyBool flag => new PyInt(flag.Value ? 1 : 0),
+        PyBool flag => PyInt.From(flag.Value ? 1 : 0),
         PyInt or PyFloat => value,
         _ => throw new PyRaise(PyErrors.TypeError("a number is required")),
     };

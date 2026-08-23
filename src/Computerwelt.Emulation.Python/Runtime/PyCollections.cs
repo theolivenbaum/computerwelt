@@ -829,8 +829,8 @@ public sealed class PyRange : PyObject
         return count.IsZero
             ? new PyTuple([]).PyHash()
             : new PyTuple(count.IsOne
-                ? [new PyInt(count), new PyInt(Start)]
-                : [new PyInt(count), new PyInt(Start), new PyInt(Step)]).PyHash();
+                ? [PyInt.From(count), PyInt.From(Start)]
+                : [PyInt.From(count), PyInt.From(Start), PyInt.From(Step)]).PyHash();
     }
 
     /// <summary>
@@ -946,7 +946,7 @@ public sealed class PyRange : PyObject
 
         for (BigInteger i = 0; i < count; i++)
         {
-            yield return new PyInt(Start + (i * Step));
+            yield return PyInt.From(Start + (i * Step));
         }
     }
 
@@ -978,7 +978,7 @@ public sealed class PyRange : PyObject
             throw new PyRaise(PyErrors.IndexError("range object index out of range"));
         }
 
-        return new PyInt(Start + (position * Step));
+        return PyInt.From(Start + (position * Step));
     }
 }
 

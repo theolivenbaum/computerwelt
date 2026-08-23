@@ -66,6 +66,16 @@ public static class Operators
 
     private static PyObject Apply(string op, PyObject left, PyObject right)
     {
+        // Two plain integers, which is most of the arithmetic a program does. Answering
+        // here skips the container, instance and datetime questions below — none of which
+        // an integer can answer yes to — and the numeric helpers' widening to double.
+        // Bools are excluded by the exact type test: `True | False` is a bool, not 1.
+        if (left.GetType() == typeof(PyInt) && right.GetType() == typeof(PyInt)
+            && Integers(op, ((PyInt)left).Value, ((PyInt)right).Value) is { } answer)
+        {
+            return answer;
+        }
+
         if (left is PyDeque deque)
         {
             if (op == "+")
@@ -159,8 +169,8 @@ public static class Operators
             PyCounter counter => PyCounter.Negate(counter, negate: true),
             PyInstance instance when instance.Dunder("__neg__") is { } negate =>
                 instance.Invoke(negate, []),
-            PyBool flag => new PyInt(flag.Value ? -1 : 0),
-            PyInt integer => new PyInt(-integer.Value),
+            PyBool flag => PyInt.From(flag.Value ? -1 : 0),
+            PyInt integer => PyInt.From(-integer.Value),
             PyFloat number => new PyFloat(-number.Value),
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary -: '{operand.TypeName}'")),
         },
@@ -170,7 +180,7 @@ public static class Operators
             PyCounter counter => PyCounter.Negate(counter, negate: false),
             PyInstance instance when instance.Dunder("__pos__") is { } plus =>
                 instance.Invoke(plus, []),
-            PyBool flag => new PyInt(flag.Value ? 1 : 0),
+            PyBool flag => PyInt.From(flag.Value ? 1 : 0),
             PyInt or PyFloat => operand,
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary +: '{operand.TypeName}'")),
         },
@@ -179,7 +189,7 @@ public static class Operators
         {
             PyInstance instance when instance.Dunder("__invert__") is { } invert =>
                 instance.Invoke(invert, []),
-            PyInt integer => new PyInt(-integer.Value - 1),
+            PyInt integer => PyInt.From(-integer.Value - 1),
             _ => throw new PyRaise(PyErrors.TypeError($"bad operand type for unary ~: '{operand.TypeName}'")),
         },
 
@@ -322,11 +332,28 @@ public static class Operators
 
     private static bool IsNaN(PyObject value) => value is PyFloat number && double.IsNaN(number.Value);
 
+    /// <summary>
+    /// The integer operators whose result is an integer and whose rules are
+    /// <see cref="BigInteger"/>'s own, or <see langword="null"/> for one that needs the
+    /// full path — division and modulo differ from truncation for negatives, a power may
+    /// be fractional, and a shift count may be negative.
+    /// </summary>
+    private static PyObject? Integers(string op, BigInteger left, BigInteger right) => op switch
+    {
+        "+" => PyInt.From(left + right),
+        "-" => PyInt.From(left - right),
+        "*" => PyInt.From(left * right),
+        "&" => PyInt.From(left & right),
+        "|" => PyInt.From(left | right),
+        "^" => PyInt.From(left ^ right),
+        _ => null,
+    };
+
     private static PyObject Add(PyObject left, PyObject right)
     {
         if (TryNumbers(left, right, out var a, out var b, out var useFloat))
         {
-            return useFloat ? new PyFloat(a + b) : new PyInt(AsInt(left) + AsInt(right));
+            return useFloat ? new PyFloat(a + b) : PyInt.From(AsInt(left) + AsInt(right));
         }
 
         switch (left, right)
@@ -360,7 +387,7 @@ public static class Operators
     {
         if (TryNumbers(left, right, out var a, out var b, out var useFloat))
         {
-            return useFloat ? new PyFloat(a - b) : new PyInt(AsInt(left) - AsInt(right));
+            return useFloat ? new PyFloat(a - b) : PyInt.From(AsInt(left) - AsInt(right));
         }
 
         if (AsSet(left) is { } x && AsSet(right) is { } y)
@@ -376,7 +403,7 @@ public static class Operators
     {
         if (TryNumbers(left, right, out var a, out var b, out var useFloat))
         {
-            return useFloat ? new PyFloat(a * b) : new PyInt(AsInt(left) * AsInt(right));
+            return useFloat ? new PyFloat(a * b) : PyInt.From(AsInt(left) * AsInt(right));
         }
 
         // Sequence repetition: `'ab' * 3`, `[0] * 4`. A negative count yields empty.
@@ -538,7 +565,7 @@ public static class Operators
             quotient -= 1;
         }
 
-        return new PyInt(quotient);
+        return PyInt.From(quotient);
     }
 
     private static PyObject Modulo(PyObject left, PyObject right)
@@ -586,7 +613,7 @@ public static class Operators
             remainder += y;
         }
 
-        return new PyInt(remainder);
+        return PyInt.From(remainder);
     }
 
     private static PyObject Power(PyObject left, PyObject right)
@@ -609,7 +636,7 @@ public static class Operators
                 // no size guard: `(-1) ** 2**63` is 1, not a refusal.
                 if (BigInteger.Abs(baseValue) <= BigInteger.One)
                 {
-                    return new PyInt(baseValue.Sign switch
+                    return PyInt.From(baseValue.Sign switch
                     {
                         0 => exponent.IsZero ? BigInteger.One : BigInteger.Zero,
                         1 => BigInteger.One,
@@ -624,7 +651,7 @@ public static class Operators
                     throw new PyRaise(new PyException(PyExceptionType.OverflowError, "exponent too large"));
                 }
 
-                return new PyInt(BigInteger.Pow(AsInt(left), (int)exponent));
+                return PyInt.From(BigInteger.Pow(AsInt(left), (int)exponent));
             }
 
             // A negative integer exponent produces a float, as `2 ** -1 == 0.5` — so both
@@ -662,7 +689,7 @@ public static class Operators
             return PyBool.Of(left.IsTruthy() && right.IsTruthy());
         }
 
-        return new PyInt(RequireInt(left, "&", left, right) & RequireInt(right, "&", left, right));
+        return PyInt.From(RequireInt(left, "&", left, right) & RequireInt(right, "&", left, right));
     }
 
     /// <summary>
@@ -868,7 +895,7 @@ public static class Operators
             return PyBool.Of(left.IsTruthy() || right.IsTruthy());
         }
 
-        return new PyInt(RequireInt(left, "|", left, right) | RequireInt(right, "|", left, right));
+        return PyInt.From(RequireInt(left, "|", left, right) | RequireInt(right, "|", left, right));
     }
 
     private static PyObject BitwiseXor(PyObject left, PyObject right)
@@ -892,7 +919,7 @@ public static class Operators
             return PyBool.Of(left.IsTruthy() ^ right.IsTruthy());
         }
 
-        return new PyInt(RequireInt(left, "^", left, right) ^ RequireInt(right, "^", left, right));
+        return PyInt.From(RequireInt(left, "^", left, right) ^ RequireInt(right, "^", left, right));
     }
 
     private static PyObject ShiftLeft(PyObject left, PyObject right)
@@ -910,12 +937,12 @@ public static class Operators
         // is only a problem when there is something to move.
         if (value.IsZero)
         {
-            return new PyInt(BigInteger.Zero);
+            return PyInt.From(BigInteger.Zero);
         }
 
         return shift > 1_000_000
             ? throw new PyRaise(new PyException(PyExceptionType.OverflowError, "shift count too large"))
-            : new PyInt(value << (int)shift);
+            : PyInt.From(value << (int)shift);
     }
 
     private static PyObject ShiftRight(PyObject left, PyObject right)
@@ -932,8 +959,8 @@ public static class Operators
         // Shifting past the last bit leaves the sign behind: 0 for a positive value, -1 for
         // a negative one, whatever the count.
         return shift > 1_000_000
-            ? new PyInt(value.Sign < 0 ? BigInteger.MinusOne : BigInteger.Zero)
-            : new PyInt(value >> (int)shift);
+            ? PyInt.From(value.Sign < 0 ? BigInteger.MinusOne : BigInteger.Zero)
+            : PyInt.From(value >> (int)shift);
     }
 
     /// <summary>

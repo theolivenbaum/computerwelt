@@ -241,7 +241,7 @@ public sealed class PyCounter : PyDict
             {
                 foreach (var item in VirtualMachine.RequireIterable(arguments[0]))
                 {
-                    Bump(item, new PyInt(1), op);
+                    Bump(item, PyInt.From(1), op);
                 }
             }
         }

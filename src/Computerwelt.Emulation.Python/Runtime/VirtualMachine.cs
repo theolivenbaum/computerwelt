@@ -113,7 +113,7 @@ public sealed class VirtualMachine
     {
         ArgumentNullException.ThrowIfNull(globals);
 
-        var frame = new Frame(code, globals, [], []);
+        var frame = new Frame(code, globals, [], null);
         return Execute(frame);
     }
 
@@ -331,9 +331,16 @@ public sealed class VirtualMachine
         }
     }
 
-    private Dictionary<string, PyCell> BuildCells(PyFunction function, PyObject?[] locals)
+    private Dictionary<string, PyCell>? BuildCells(PyFunction function, PyObject?[] locals)
     {
         var code = function.Code;
+
+        // Nothing captured either way: the frame gets no cell dictionary at all.
+        if (function.Closure.Count == 0 && code.CellNames.Count == 0)
+        {
+            return null;
+        }
+
         var cells = new Dictionary<string, PyCell>(StringComparer.Ordinal);
 
         // The inherited cells are the free variables this function reads. A name it binds
@@ -577,14 +584,16 @@ public sealed class VirtualMachine
     /// <summary>One activation record.</summary>
     internal sealed class Frame
     {
-        public Frame(CodeObject code, PyDict globals, PyObject?[] locals, Dictionary<string, PyCell> cells)
+        private Dictionary<string, PyCell>? _cells;
+
+        public Frame(CodeObject code, PyDict globals, PyObject?[] locals, Dictionary<string, PyCell>? cells)
         {
             Code = code;
             Globals = globals;
             Locals = locals.Length >= code.LocalNames.Count
                 ? locals
                 : [.. locals, .. new PyObject?[code.LocalNames.Count - locals.Length]];
-            Cells = cells;
+            _cells = cells;
         }
 
         public CodeObject Code { get; }
@@ -593,7 +602,28 @@ public sealed class VirtualMachine
 
         public PyObject?[] Locals { get; }
 
-        public Dictionary<string, PyCell> Cells { get; }
+        /// <summary>
+        /// The closure cells, made real on first need.
+        /// </summary>
+        /// <remarks>
+        /// A function that neither captures nor is captured has none, which is most of
+        /// them, and a frame is built per call — so the dictionary is not built until
+        /// something writes a cell. <see cref="TryGetCell"/> is the read side, and answers
+        /// without hashing the name when there is nothing to search.
+        /// </remarks>
+        public Dictionary<string, PyCell> Cells =>
+            _cells ??= new Dictionary<string, PyCell>(StringComparer.Ordinal);
+
+        public bool TryGetCell(string name, out PyCell cell)
+        {
+            if (_cells is null)
+            {
+                cell = null!;
+                return false;
+            }
+
+            return _cells.TryGetValue(name, out cell!);
+        }
 
         public List<PyObject> Stack { get; } = [];
 
@@ -851,7 +881,7 @@ public sealed class VirtualMachine
                 // A captured local lives in its cell, which a nested function may have
                 // written since the slot was last set. The cell is therefore always at
                 // least as fresh as the slot, so it wins whenever one exists.
-                if (frame.Cells.TryGetValue(name, out var cell))
+                if (frame.TryGetCell(name, out var cell))
                 {
                     if (cell.Value is { } cellValue)
                     {
@@ -879,7 +909,7 @@ public sealed class VirtualMachine
                     return false;
                 }
 
-                var key = new PyStr(name);
+                var key = code.LocalKey(instruction.Operand);
 
                 if (frame.Globals.TryGetValue(key, out var global))
                 {
@@ -901,7 +931,7 @@ public sealed class VirtualMachine
 
                 // Keep a captured local's cell in step, so closures see the new value.
                 var name = code.LocalNames[instruction.Operand];
-                if (frame.Cells.TryGetValue(name, out var cell))
+                if (frame.TryGetCell(name, out var cell))
                 {
                     cell.Value = value;
                 }
@@ -915,7 +945,7 @@ public sealed class VirtualMachine
 
                 // Keep a captured local's cell in step, as StoreLocal does: a closure that
                 // reads the deleted name must see it unbound, not the stale value.
-                if (frame.Cells.TryGetValue(code.LocalNames[instruction.Operand], out var cell))
+                if (frame.TryGetCell(code.LocalNames[instruction.Operand], out var cell))
                 {
                     cell.Value = null;
                 }
@@ -926,7 +956,7 @@ public sealed class VirtualMachine
             case OpCode.LoadGlobal:
             {
                 var name = code.Names[instruction.Operand];
-                var key = new PyStr(name);
+                var key = code.NameKey(instruction.Operand);
 
                 if (frame.Globals.TryGetValue(key, out var value))
                 {
@@ -944,11 +974,11 @@ public sealed class VirtualMachine
             }
 
             case OpCode.StoreGlobal:
-                frame.Globals.Set(new PyStr(code.Names[instruction.Operand]), frame.Pop());
+                frame.Globals.Set(code.NameKey(instruction.Operand), frame.Pop());
                 return false;
 
             case OpCode.DeleteGlobal:
-                if (!frame.Globals.Remove(new PyStr(code.Names[instruction.Operand])))
+                if (!frame.Globals.Remove(code.NameKey(instruction.Operand)))
                 {
                     throw new PyRaise(PyErrors.NameError(code.Names[instruction.Operand]));
                 }
@@ -959,7 +989,7 @@ public sealed class VirtualMachine
             {
                 var name = code.CellNames[instruction.Operand];
 
-                if (!frame.Cells.TryGetValue(name, out var cell) || cell.Value is null)
+                if (!frame.TryGetCell(name, out var cell) || cell.Value is null)
                 {
                     // The frame that owns the variable reports it as its own unassigned
                     // local; one that merely captured the cell names it a free variable.
@@ -976,7 +1006,7 @@ public sealed class VirtualMachine
             {
                 var name = code.CellNames[instruction.Operand];
 
-                if (frame.Cells.TryGetValue(name, out var cell))
+                if (frame.TryGetCell(name, out var cell))
                 {
                     cell.Value = null;
                 }
@@ -988,7 +1018,7 @@ public sealed class VirtualMachine
             {
                 var name = code.CellNames[instruction.Operand];
 
-                if (!frame.Cells.TryGetValue(name, out var cell))
+                if (!frame.TryGetCell(name, out var cell))
                 {
                     cell = new PyCell();
                     frame.Cells[name] = cell;

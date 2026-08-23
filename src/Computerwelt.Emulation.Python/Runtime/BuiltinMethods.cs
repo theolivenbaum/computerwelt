@@ -343,7 +343,7 @@ public static class BuiltinMethods
                         throw new PyRaise(PyErrors.ValueError("substring not found"));
                     }
 
-                    return new PyInt(found < 0 ? -1 : found + start);
+                    return PyInt.From(found < 0 ? -1 : found + start);
                 });
 
             case "count":
@@ -356,7 +356,7 @@ public static class BuiltinMethods
 
                     if (needle.Length == 0)
                     {
-                        return new PyInt(text.Length + 1);
+                        return PyInt.From(text.Length + 1);
                     }
 
                     var count = 0;
@@ -368,7 +368,7 @@ public static class BuiltinMethods
                         position += needle.Length;
                     }
 
-                    return new PyInt(count);
+                    return PyInt.From(count);
                 });
 
             case "format":
@@ -777,13 +777,13 @@ public static class BuiltinMethods
                     var index = IndexOf(items, arguments);
 
                     return index >= 0
-                        ? new PyInt(index)
+                        ? PyInt.From(index)
                         : throw new PyRaise(PyErrors.ValueError("list.index(x): x not in list"));
                 });
 
             case "count":
                 return Method(name, receiver, 1, static (self, arguments, _) =>
-                    new PyInt(((PyList)self).Items.Count(item => PyObject.SameOrEqual(item, arguments[0]))));
+                    PyInt.From(((PyList)self).Items.Count(item => PyObject.SameOrEqual(item, arguments[0]))));
 
             case "reverse":
                 return Method(name, receiver, static (self, _, _) =>
@@ -1240,14 +1240,14 @@ public static class BuiltinMethods
     private static PyObject? BindTuple(PyObject receiver, string name) => name switch
     {
         "count" => Method(name, receiver, 1, static (self, arguments, _) =>
-            new PyInt(((PyTuple)self).Items.Count(item => PyObject.SameOrEqual(item, arguments[0])))),
+            PyInt.From(((PyTuple)self).Items.Count(item => PyObject.SameOrEqual(item, arguments[0])))),
 
         "index" => Method(name, receiver, 1, 3, static (self, arguments, _) =>
         {
             var index = IndexOf(((PyTuple)self).Items, arguments);
 
             return index >= 0
-                ? new PyInt(index)
+                ? PyInt.From(index)
                 : throw new PyRaise(PyErrors.ValueError("tuple.index(x): x not in tuple"));
         }),
 
@@ -1522,7 +1522,7 @@ public static class BuiltinMethods
                 bits++;
             }
 
-            return new PyInt(bits);
+            return PyInt.From(bits);
         }),
 
         "to_bytes" => Method(name, receiver, static (self, arguments, _) =>
