@@ -83,8 +83,19 @@ public sealed class ShellVariable
     /// <summary>True when assignment to this variable is an error.</summary>
     public bool IsReadOnly => Attributes.HasFlag(VariableAttributes.ReadOnly);
 
-    /// <summary>True when the variable has never been given a value.</summary>
-    public bool IsUnset { get; private set; } = true;
+    /// <summary>
+    /// True when the variable has no scalar value.
+    /// </summary>
+    /// <remarks>
+    /// The question is about element 0, not about whether the name exists: bash reads
+    /// <c>$x</c> as <c>${x[0]}</c>, so <c>${x+set}</c> and <c>set -u</c> follow that
+    /// element. An array with no element 0 — <c>x=()</c>, or one that starts at
+    /// <c>x[1]</c>, or one whose first element was unset — is therefore unset for those
+    /// purposes even though it is declared, and <c>x=</c> is set even though it is empty.
+    /// </remarks>
+    public bool IsUnset => IsAssociative
+        ? _associative?.ContainsKey("0") is not true
+        : _indexed is null ? _scalar is null : !_indexed.ContainsKey(0);
 
     /// <summary>
     /// The scalar view. For an array this is element 0 (indexed) or the empty string
@@ -110,20 +121,30 @@ public sealed class ShellVariable
         }
     }
 
-    /// <summary>Replaces the variable's value with a scalar.</summary>
+    /// <summary>
+    /// Sets the variable's scalar value.
+    /// </summary>
+    /// <remarks>
+    /// On an array this writes element 0 and leaves the rest, because that is what bash
+    /// does: <c>x=(a b c); x=z</c> leaves <c>z b c</c>, and <c>x+=z</c> appends to the
+    /// first element alone. Only a variable with no array attribute is replaced outright.
+    /// </remarks>
     public void SetScalar(string value)
     {
         if (IsAssociative)
         {
             Associative()["0"] = Transform(value);
-        }
-        else
-        {
-            _indexed = null;
-            _scalar = Transform(value);
+            return;
         }
 
-        IsUnset = false;
+        if (Attributes.HasFlag(VariableAttributes.IndexedArray) && _indexed is not null)
+        {
+            _indexed[0] = Transform(value);
+            return;
+        }
+
+        _indexed = null;
+        _scalar = Transform(value);
     }
 
     /// <summary>Appends to the variable's scalar value.</summary>
@@ -149,8 +170,6 @@ public sealed class ShellVariable
         {
             Indexed()[index] = Transform(value);
         }
-
-        IsUnset = false;
     }
 
     /// <summary>Sets one element of an associative array.</summary>
@@ -158,7 +177,6 @@ public sealed class ShellVariable
     {
         Attributes |= VariableAttributes.AssociativeArray;
         Associative()[key] = Transform(value);
-        IsUnset = false;
     }
 
     /// <summary>Replaces the whole variable with an indexed array built from <paramref name="values"/>.</summary>
@@ -168,7 +186,6 @@ public sealed class ShellVariable
         _indexed = null;
         _scalar = null;
         Fill(values, 0);
-        IsUnset = false;
     }
 
     /// <summary>Appends elements to the end of an indexed array.</summary>
@@ -176,7 +193,6 @@ public sealed class ShellVariable
     {
         Attributes |= VariableAttributes.IndexedArray;
         Fill(values, IndexedCount == 0 ? 0 : HighestIndex() + 1);
-        IsUnset = false;
     }
 
     // Writes values at consecutive subscripts, keeping the one-element shape for as long
@@ -340,11 +356,7 @@ public sealed class ShellVariable
     /// </remarks>
     internal ShellVariable Clone()
     {
-        var clone = new ShellVariable(Attributes)
-        {
-            IsUnset = IsUnset,
-            _scalar = _scalar,
-        };
+        var clone = new ShellVariable(Attributes) { _scalar = _scalar };
 
         if (_indexed is not null)
         {

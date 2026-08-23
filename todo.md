@@ -224,11 +224,13 @@ Upstream: `interpreter/` (~730 KB — the largest single area)
 - [ ] Command substitution trailing-newline stripping + nested quoting edge cases
 - [x] `[[ ]]` conditional expressions incl. `=~` regex + `BASH_REMATCH`
 - [x] Arrays: indexed, associative, splat, append, slicing, `${!arr[@]}`, `${!prefix*}`
-- [ ] Two array details bash has and this does not, both found while benchmarking and both
-      pre-existing: a scalar assigned over an array replaces element 0 only in bash
-      (`x=(a b c); x=z` leaves `z b c`) where this collapses the array to one element; and
-      an array assigned nothing is *unset* in bash (`x=(); echo ${x+set}` prints nothing)
-      where this reports it as set
+- [x] A scalar operation on an array addresses element 0, both ways round: `x=(a b c); x=z`
+      leaves `z b c` and `x+=z` leaves `az b c` (appending an element is what `x+=(z)` is
+      for), while `${x+set}`, `${x-…}` and `[ -v x ]` ask whether element 0 exists — so
+      `x=()`, an array starting at `x[1]`, and an associative array with no `[0]` are all
+      unset although they are declared. Found while benchmarking, when the fork rewrite
+      needed the shapes pinned; `VariableStorageTests` covers it, every case checked
+      against bash 5.2
 - [~] `trap`: `EXIT` and `ERR` fire; `DEBUG` and `RETURN` do not
 - [ ] Job control simulation (`&`, `jobs`, `wait`, `%1`)
 - [~] `set -e` fires and is suppressed after `&&`/`||`/`!`; the full context list is unverified
@@ -348,7 +350,7 @@ case, as upstream's in-process runner does.
 
 | | before | after |
 |---|--:|--:|
-| corpus, 96 cases | 71.0 ms · 45.0 MB | 64.8 ms · 26.7 MB |
+| corpus, 96 cases | 71.0 ms · 45.0 MB | 65.0 ms · 26.8 MB |
 | `Bash.Create()` | 9.0 µs · 27.4 KB | 3.8 µs · 8.9 KB |
 | build a session and `echo hello` | 13.4 µs · 32.3 KB | 5.6 µs · 12.0 KB |
 | `echo hello` on a warm session | 2.5 µs · 4.7 KB | 1.7 µs · 3.1 KB |

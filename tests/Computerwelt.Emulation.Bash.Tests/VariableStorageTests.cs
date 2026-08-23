@@ -51,4 +51,48 @@ public sealed class VariableStorageTests
     [InlineData("x=(); echo $(x+=(a); echo ${x[0]})-${#x[@]}", "a-0\n")]
     public async Task IsolatesSubshells(string script, string expected) =>
         Assert.Equal(expected, await RunAsync(script));
+
+    /// <summary>
+    /// A scalar operation on an array is about element 0.
+    /// </summary>
+    /// <remarks>
+    /// bash reads <c>$x</c> as <c>${x[0]}</c> whatever <c>x</c> holds, and the rule runs
+    /// both ways: assigning a scalar writes that element and leaves the rest, and asking
+    /// whether the variable is set asks whether that element exists — so an array with no
+    /// element 0 is unset although it is declared. Every case here was checked against
+    /// bash 5.2.
+    /// </remarks>
+    [Theory]
+    // Assigning a scalar over an array writes element 0 only.
+    [InlineData("x=(a b c); x=z; echo ${x[@]}", "z b c\n")]
+    [InlineData("x=(a b c); x=z; echo ${#x[@]}", "3\n")]
+    [InlineData("x=(a b c); x=; echo \"[${x[@]}]\"", "[ b c]\n")]
+    [InlineData("x=(a b c); x[5]=f; x=z; echo ${x[@]}", "z b c f\n")]
+    [InlineData("declare -a x; x=z; echo ${x[@]}", "z\n")]
+    [InlineData("x=a; x=z; echo $x", "z\n")]
+    // Appending a scalar appends to that element; appending a list adds one.
+    [InlineData("x=(a b c); x+=z; echo ${x[@]}", "az b c\n")]
+    [InlineData("x=(a b c); x+=(z); echo ${x[@]}", "a b c z\n")]
+    [InlineData("x=(); x+=z; echo ${x[@]}", "z\n")]
+    [InlineData("declare -A m; m[k]=v; m+=z; echo ${m[0]}-${m[k]}", "z-v\n")]
+    // An array with no element 0 is unset, however it came to be that way.
+    [InlineData("x=(); echo \"[${x+set}]\"", "[]\n")]
+    [InlineData("x=(); x[1]=b; echo \"[${x+set}]\"", "[]\n")]
+    [InlineData("x=(a b c); unset 'x[0]'; echo \"[${x+set}]\"", "[]\n")]
+    [InlineData("declare -A m; m[k]=v; echo \"[${m+set}]\"", "[]\n")]
+    [InlineData("x=(); echo ${x-fallback}", "fallback\n")]
+    [InlineData("x=(); [ -v x ] && echo yes || echo no", "no\n")]
+    // ...and one that has it is set, empty string included.
+    [InlineData("x=(a b); echo \"[${x+set}]\"", "[set]\n")]
+    [InlineData("x=; echo \"[${x+set}]\"", "[set]\n")]
+    [InlineData("declare -A m; m[0]=v; echo \"[${m+set}]\"", "[set]\n")]
+    [InlineData("x=(a); [ -v x ] && echo yes || echo no", "yes\n")]
+    // The splat asks about the whole array instead, so a gap at 0 does not hide it.
+    [InlineData("x=(); x[1]=b; echo \"[${x[@]+set}]\"", "[set]\n")]
+    [InlineData("x=(); echo \"[${x[@]+set}]\"", "[]\n")]
+    // `${x=v}` fills element 0 when it is missing, and leaves a filled one alone.
+    [InlineData("x=(); echo ${x=d}; echo ${x[@]}", "d\nd\n")]
+    [InlineData("x=(a b c); echo ${x=d}; echo ${x[@]}", "a\na b c\n")]
+    public async Task ScalarOperationsAddressElementZero(string script, string expected) =>
+        Assert.Equal(expected, await RunAsync(script));
 }
