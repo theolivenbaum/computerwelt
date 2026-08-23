@@ -83,6 +83,32 @@ public sealed class BuiltinContext
     /// <summary>Standard input decoded as text, or an empty string.</summary>
     public string StdinText => Stdin?.ToString() ?? string.Empty;
 
+    /// <summary>The environment a child of this command would inherit.</summary>
+    public IReadOnlyDictionary<string, string> Environment => State.ExportedEnvironment();
+
+    /// <summary>Reads a file from the sandbox, decoded as UTF-8, resolving a relative path.</summary>
+    /// <exception cref="ShellException">Thrown when there is no such file.</exception>
+    public async ValueTask<string> ReadTextAsync(string path, CancellationToken cancellationToken = default) =>
+        System.Text.Encoding.UTF8.GetString(await FileSystem.ReadFileAsync(ResolvePath(path), cancellationToken));
+
+    /// <summary>Writes a file to the sandbox as UTF-8, replacing it if it exists.</summary>
+    public ValueTask WriteTextAsync(string path, string text, CancellationToken cancellationToken = default) =>
+        FileSystem.WriteFileAsync(ResolvePath(path), System.Text.Encoding.UTF8.GetBytes(text), cancellationToken);
+
+    /// <summary>Reads a file if it is there, or returns null — the shape most commands want.</summary>
+    /// <remarks>
+    /// A store a command creates on first use does not exist until then, and treating that
+    /// as an error rather than as emptiness is where such commands usually go wrong.
+    /// </remarks>
+    public async ValueTask<string?> ReadTextIfExistsAsync(string path, CancellationToken cancellationToken = default)
+    {
+        var resolved = ResolvePath(path);
+
+        return await FileSystem.ExistsAsync(resolved, cancellationToken)
+            ? System.Text.Encoding.UTF8.GetString(await FileSystem.ReadFileAsync(resolved, cancellationToken))
+            : null;
+    }
+
     /// <summary>
     /// Reads the operands as input: each named file in turn, or standard input when there
     /// are none. This is the <c>cat</c>/<c>wc</c>/<c>grep</c> convention, and centralizing it

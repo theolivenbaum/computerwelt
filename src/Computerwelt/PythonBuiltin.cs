@@ -76,9 +76,16 @@ public sealed class PythonBuiltin : IBuiltin
             runner.Modules[name] = module;
         }
 
+        runner.Libraries.AddRange(_options.Libraries);
+
         foreach (var (name, function) in _options.ExternalFunctions)
         {
             runner.ExternalFunctions[name] = function;
+        }
+
+        foreach (var (name, function) in _options.HostFunctions)
+        {
+            runner.HostFunctions[name] = function;
         }
 
         // `sys.argv` is the invocation as written, so `python script.py --flag value` reads
@@ -224,11 +231,41 @@ public sealed record PythonOptions
     /// </remarks>
     public int MaxDirectoryDepth { get; init; } = 64;
 
-    /// <summary>Extra modules the host makes importable from Python.</summary>
+    /// <summary>
+    /// Extra libraries the host makes importable from Python.
+    /// </summary>
+    /// <remarks>
+    /// The route to add a Python library to the sandbox: each is built afresh for every
+    /// <c>python</c> invocation and only if that invocation imports it, so a library may hold
+    /// module-level state without one command's state leaking into the next. See
+    /// <see cref="PythonLibrary"/>.
+    /// </remarks>
+    public IReadOnlyList<PythonLibrary> Libraries { get; init; } = [];
+
+    /// <summary>
+    /// Extra modules the host makes importable from Python.
+    /// </summary>
+    /// <remarks>
+    /// One object, shared by every invocation of the command. Use it for a module with no
+    /// state of its own; anything else belongs in <see cref="Libraries"/>, or one script's
+    /// data becomes the next one's.
+    /// </remarks>
     public Dictionary<string, PyObject> AdditionalModules { get; init; } = new(StringComparer.Ordinal);
 
     /// <summary>Extra functions the host exposes to Python.</summary>
     public Dictionary<string, Func<PyObject[], PyObject>> ExternalFunctions { get; init; } =
+        new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Extra functions the host exposes to Python, each receiving the sandbox environment.
+    /// </summary>
+    /// <remarks>
+    /// The context's filesystem is the shell's, and its working directory and environment are
+    /// the shell's as they stand when the call is made — so host C# invoked from a Python
+    /// program reads and writes exactly the files the surrounding script does. See
+    /// <see cref="PythonHostContext"/>.
+    /// </remarks>
+    public Dictionary<string, Func<PythonHostContext, PyObject[], PyObject>> HostFunctions { get; init; } =
         new(StringComparer.Ordinal);
 }
 

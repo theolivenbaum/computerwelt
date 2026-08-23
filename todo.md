@@ -310,6 +310,15 @@ Upstream: `lib.rs`, `tool.rs`, `tool_def.rs`, `tool_registry.rs`
 ## Phase 9 — Hosting surfaces
 
 - [x] `Computerwelt.Cli` — run a script, `-c`, REPL, with `python` available
+- [x] Host commands — `IShellExtension` for a set granted as one unit, `ICommandResolver`
+      for a name space too large to enumerate, `DelegateBuiltin` for the one-liner, and
+      `WithoutBuiltin` for a deny-list. See *Extending the sandbox* below
+- [x] Host commands reach the environment — `BuiltinContext` gained `Environment`,
+      `ReadTextAsync`, `WriteTextAsync` and `ReadTextIfExistsAsync`, so custom functionality
+      written in C# is a few lines over the sandbox's own filesystem
+- [ ] `BuiltinRegistry` — a host-owned registry that can be mutated after `Build()`, for a
+      REPL or an FFI binding that registers callbacks at runtime (upstream has one)
+- [ ] Hook interceptors (`before_exec`, `after_exec`, `before_tool`, `on_exit`)
 - [ ] NuGet packaging metadata, symbols, deterministic build
 - [ ] Public API surface tests (`PublicAPI.Shipped.txt`)
 - [ ] Benchmarks (`BenchmarkDotNet`) mirroring `crates/bashkit-bench`
@@ -463,7 +472,14 @@ Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.
 - [x] External functions — the only route to anything outside the sandbox, mirroring how
       Monty blocks filesystem, environment and network by default
 - [x] `PyDataclass` — the record shape the host boundary passes structured values in
-- [ ] Host object model: converting between .NET values and Monty objects
+- [x] Host libraries — `PythonLibrary`, built per run and on first import, written in C#
+      (`FromFactory`, `FromFunctions`) or in Python (`FromSource`). See *Extending the
+      sandbox* below
+- [x] Host functions with the environment — `PythonHostContext` carries the run's
+      filesystem, working directory, environment, limits and clock, so custom functionality
+      implemented in C# runs *inside* the sandbox rather than beside it
+- [ ] Host object model: converting between .NET values and Monty objects — host code still
+      builds its `PyObject`s by hand
 - [ ] Async external functions (`async_call`, `async_fail`)
 - [ ] Snapshot and resume at an external-call boundary
 - [x] Wire the `python` builtin into the shell, sharing the VFS — the payoff for porting
@@ -472,3 +488,63 @@ Upstream: `crates/monty-types/`, `crates/monty-fs/`, bashkit's `builtins/python.
       tests covering both directions plus the isolation guarantees.
 - [ ] Share the *budget* too: Python currently gets its own instruction limit rather than
       drawing on the shell's `ExecutionBudget`
+
+
+---
+
+## Extending the sandbox
+
+Both halves take host extensions, and the two APIs are shaped by the same rule: a host adds
+*vocabulary*, never *authority*. Nothing registered here gets a capability the sandbox did
+not already have — host code runs under the same limits, against the same virtual
+filesystem, with no process, no host disk and no network of its own.
+
+| Point | Shape | Where |
+|---|---|---|
+| `WithBuiltin` | `IBuiltin`, or a delegate | `src/Computerwelt.Emulation.Bash/Extensibility/DelegateBuiltin.cs` |
+| `WithExtension` | `IShellExtension` | `.../Extensibility/IShellExtension.cs` |
+| `WithCommandResolver` | `ICommandResolver` | `.../Extensibility/ICommandResolver.cs` |
+| `WithoutBuiltin` | a name | `src/Computerwelt.Emulation.Bash/BashBuilder.cs` |
+| `PythonRunner.Libraries`, `PythonOptions.Libraries` | `PythonLibrary` | `src/Computerwelt.Emulation.Python/Extensibility/` |
+| `PythonRunner.HostFunctions`, `PythonOptions.HostFunctions` | `Func<PythonHostContext, PyObject[], PyObject>` | `.../Extensibility/PythonHostContext.cs` |
+
+### The four decisions worth recording
+
+**A resolver is consulted last.** After shell functions, after registered commands, and
+after the search for a script in the virtual filesystem — the same order upstream's
+`CommandResolver` uses. It can therefore fill an open-ended name space without being able to
+shadow anything that already exists, and the cost is that its names are not enumerable:
+`type`, `command -v` and `Bash.BuiltinNames` do not list them. That is the honest report,
+since the host cannot enumerate the space either.
+
+**Withholding is applied after every registration.** `WithoutBuiltin` runs last in `Build()`,
+so the order the host called things in cannot matter and an extension cannot re-grant a name
+the host took away. The name ends up absent rather than present-and-refusing, which is the
+posture the rest of the sandbox takes: a capability that was never registered is a much
+stronger property than one that is registered and guarded.
+
+**A Python library is a recipe, not a module.** `PythonRunner.Modules` hands one object to
+every run; that is right for a constant table and wrong for anything a program can mutate,
+because one tenant's state would become the next one's. `Libraries` asks for a fresh module
+on first import of each run — which is also the only moment at which a library *written in
+Python* can be built, since running its source needs the machine that is asking. Lazy
+resolution goes through `VirtualMachine.ModuleResolver`; a name no library claims is still
+`ModuleNotFoundError`, so the importable set stays the closed list the host wrote.
+
+**Host C# is handed the environment, not a way to find one.** `BuiltinContext` and
+`PythonHostContext` carry the same set — the virtual filesystem, the working directory, the
+environment, the limits, the clock — and both read it live, so a `cd` the script performed
+is where host code finds itself. `PythonHostContext.RequireFileSystem` turns "there is no
+storage" into a Python `OSError`, because a host exception reaching a sandboxed program is
+the sandbox leaking rather than an error the program can handle. Nothing compiles C# from
+inside a script: host code is registered by the host, before the session is built.
+
+### Coverage
+
+| Suite | Cases |
+|---|---|
+| `Computerwelt.Emulation.Bash.Tests/ExtensibilityTests` | 22 — dispatch, override, withholding, resolver ordering, budget charging, the context helpers, two sessions sharing one command |
+| `Computerwelt.Emulation.Python.Tests/ExtensibilityTests` | 27 — host and source libraries, host functions over a filesystem, per-run freshness, laziness, cycles, a library that will not compile, limits |
+| `Computerwelt.Tests/ExtensibilityTests` | 12 — a host command, a host library and a host function over one filesystem |
+
+`samples/Computerwelt.Sample.Extensibility/` is every point in one runnable program.

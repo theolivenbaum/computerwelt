@@ -21,18 +21,18 @@ namespace Computerwelt.Emulation.Bash;
 /// </remarks>
 public sealed class Bash
 {
-    private readonly IReadOnlyDictionary<string, IBuiltin> _builtins;
+    private readonly CommandTable _commands;
 
     internal Bash(
         ShellState state,
         IFileSystem fileSystem,
         ExecutionLimits limits,
-        IReadOnlyDictionary<string, IBuiltin> builtins)
+        CommandTable commands)
     {
         State = state;
         FileSystem = fileSystem;
         Limits = limits;
-        _builtins = builtins;
+        _commands = commands;
     }
 
     /// <summary>Creates a session with the default configuration.</summary>
@@ -53,8 +53,14 @@ public sealed class Bash
     /// <summary>The current working directory.</summary>
     public VPath WorkingDirectory => State.WorkingDirectory;
 
-    /// <summary>The names of every registered command.</summary>
-    public IReadOnlyCollection<string> BuiltinNames => (IReadOnlyCollection<string>)_builtins.Keys;
+    /// <summary>
+    /// The names of every registered command.
+    /// </summary>
+    /// <remarks>
+    /// Names an <see cref="ICommandResolver"/> answers for are not listed: a resolver is
+    /// asked about one name at a time and is never enumerated.
+    /// </remarks>
+    public IReadOnlyCollection<string> BuiltinNames => _commands.Names;
 
     /// <summary>Runs <paramref name="script"/> and returns its result.</summary>
     public ValueTask<ExecResult> ExecAsync(string script, CancellationToken cancellationToken = default) =>
@@ -103,7 +109,7 @@ public sealed class Bash
                 return ExecResult.Success;
             }
 
-            var interpreter = new Interpreter.Interpreter(State, FileSystem, budget, _builtins);
+            var interpreter = new Interpreter.Interpreter(State, FileSystem, budget, _commands);
 
             try
             {

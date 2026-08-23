@@ -51,6 +51,109 @@ await bash.ExecAsync("""
 Each project's root namespace is its package name, so a type's namespace says which package
 it ships in.
 
+## Extending it
+
+Everything a session can reach is decided when it is built and cannot be widened
+afterwards. There are four extension points, and each of them adds vocabulary without
+adding authority — a host command runs under the same limits and against the same virtual
+filesystem as everything else.
+
+```csharp
+var bash = Bash.CreateBuilder()
+
+    // A related set of commands, granted as one unit.
+    .WithExtension(new TicketsExtension())
+
+    // One command, straight from a delegate.
+    .WithBuiltin("greet", context => ExecResult.Ok($"Hello, {context.Arguments[0]}!\n"))
+
+    // A name space too large to enumerate, answered one name at a time and consulted last.
+    .WithCommandResolver(new RunbookResolver(catalogue))
+
+    // Withheld: the session has no such command, and no script can discover one.
+    .WithoutBuiltins("tar", "curl")
+
+    // Python libraries, importable from the `python` command.
+    .WithPython(new PythonOptions
+    {
+        Libraries =
+        [
+            PythonLibrary.FromFactory("tickets", context => …),      // written in C#
+            PythonLibrary.FromSource("formatting", "def table(…): …") // written in Python
+        ],
+    })
+
+    .Build();
+```
+
+| Point | Shape | For |
+|---|---|---|
+| `WithBuiltin` | `IBuiltin`, or a delegate | one command |
+| `WithExtension` | `IShellExtension` | a domain vocabulary, granted or withheld as a unit |
+| `WithCommandResolver` | `ICommandResolver` | an open-ended name space, resolved on demand |
+| `WithoutBuiltin` | a name | taking a command away |
+| `PythonOptions.Libraries` | `PythonLibrary` | a Python module, written in C# or in Python |
+| `PythonOptions.HostFunctions` | `Func<PythonHostContext, PyObject[], PyObject>` | a C# function a Python program calls without importing anything |
+
+### Implementing functionality in C#
+
+Host code is handed the sandbox's environment, so "write it in C#" means writing it
+*inside* the sandbox rather than beside it. A shell command gets a `BuiltinContext`; C#
+called from Python gets a `PythonHostContext`. Both carry the same things — the virtual
+filesystem, the working directory as it stands right now, the environment the script
+exported, the run's limits and its clock — and nothing else. There is no host disk, no
+process and no network behind either of them.
+
+```csharp
+// A command, in C#.
+.WithBuiltin("upper", async (context, token) =>
+{
+    var text = await context.ReadTextAsync(context.Arguments[0], token);
+    await context.WriteTextAsync(context.Arguments[1], text.ToUpperInvariant(), token);
+    return ExecResult.Success;
+})
+
+// A function Python can call, in C#.
+.WithPython(new PythonOptions
+{
+    HostFunctions = new()
+    {
+        ["disk_usage"] = (context, args) => new PyInt(Total(context.RequireFileSystem(), args)),
+    },
+})
+```
+
+```bash
+echo hi > /a.txt && upper /a.txt /b.txt     # the C# command
+python -c "print(disk_usage('/'))"          # the C# function, same filesystem
+```
+
+Because the context reads the environment rather than a snapshot of it, a `cd` earlier in
+the script is where host code finds itself too. And because the sandbox has no ambient
+anything, host code that needs storage where there is none says so: `RequireFileSystem()`
+raises a Python `OSError` the program can catch, rather than letting a host exception
+escape into it.
+
+Two rules matter more than the rest. A **builtin is shared** by every execution of every
+session it is registered with, so it must be stateless and thread-safe — everything one
+invocation can see arrives in its `BuiltinContext`. A **library is built per run**, so
+module-level state cannot ride from one `python` invocation to the next, or from one tenant
+to another; that is the difference between `Libraries` and putting an object in
+`PythonRunner.Modules`.
+
+A resolver is consulted last — after shell functions, registered commands and the search
+for a script — so it can extend the vocabulary but never shadow it, and its names are not
+enumerable. `WithoutBuiltin` is applied after every registration, so a withheld name loses
+to nothing, and it is absent rather than refusing: `type`, `command -v` and
+`Bash.BuiltinNames` do not report it.
+
+[`samples/Computerwelt.Sample.Extensibility/`](samples/Computerwelt.Sample.Extensibility)
+is all four points in one runnable program:
+
+```bash
+dotnet run --project samples/Computerwelt.Sample.Extensibility
+```
+
 ## What "sandboxed" means here
 
 - **No process spawning.** Every command is a managed implementation. There is no `PATH`
@@ -83,6 +186,7 @@ behaves identically on Linux, macOS and Windows.
 | `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
 | `tests/monty-spec/` | 568 Python fixtures carried over from monty |
 | `tests/monty-extensions/` | fixtures for behaviour monty does **not** have, kept apart on purpose |
+| `samples/Computerwelt.Sample.Extensibility/` | a runnable tour of the four extension points |
 | `.reference/` | the vendored Rust sources, read-only, used as the specification |
 
 ## Building and testing

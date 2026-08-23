@@ -21,21 +21,21 @@ namespace Computerwelt.Emulation.Bash.Interpreter;
 /// </remarks>
 public sealed class Interpreter
 {
-    private readonly IReadOnlyDictionary<string, IBuiltin> _builtins;
+    private readonly CommandTable _commands;
     private readonly StringBuilder _stderr = new();
     private int _loopDepth;
 
-    /// <summary>Creates an interpreter over the given state, filesystem and builtin table.</summary>
+    /// <summary>Creates an interpreter over the given state, filesystem and command table.</summary>
     public Interpreter(
         ShellState state,
         IFileSystem fileSystem,
         ExecutionBudget budget,
-        IReadOnlyDictionary<string, IBuiltin> builtins)
+        CommandTable commands)
     {
         State = state;
         FileSystem = fileSystem;
         Budget = budget;
-        _builtins = builtins;
+        _commands = commands;
         Expander = new Expander(state, fileSystem, budget, RunSubstitutionAsync);
     }
 
@@ -56,7 +56,7 @@ public sealed class Interpreter
         RunFragment: RunFragmentAsync,
         RunCommand: RunBuiltinDirectlyAsync,
         IsBuiltin: HasBuiltin,
-        BuiltinNames: () => _builtins.Keys)
+        BuiltinNames: () => _commands.Names)
     {
         RunIsolated = RunIsolatedAsync,
         SetStandardInput = data => _standardInput = data is { } value ? new InputStream(value.ToString()) : null,
@@ -866,7 +866,7 @@ public sealed class Interpreter
         // changes are discarded when it finishes. The filesystem is deliberately shared:
         // a subshell writing a file is visible outside, exactly as with a real fork.
         var fork = State.Fork();
-        var nested = new Interpreter(fork, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
+        var nested = new Interpreter(fork, FileSystem, Budget, _commands) { _standardInput = _standardInput };
         var result = await nested.ExecuteAsync(subshell.Body, stdin, cancellationToken);
 
         // The subshell exits when its body ends, so its own EXIT trap fires here — the
@@ -901,7 +901,7 @@ public sealed class Interpreter
     private async ValueTask<ExecResult> ExecuteCoprocessAsync(CoprocessCommand command, CancellationToken cancellationToken)
     {
         var fork = State.Fork();
-        var nested = new Interpreter(fork, FileSystem, Budget, _builtins);
+        var nested = new Interpreter(fork, FileSystem, Budget, _commands);
         var result = await nested.ExecuteAsync(command.Body, null, cancellationToken);
 
         // bash numbers a coprocess's descriptors from the top of the table downwards.
@@ -1146,9 +1146,9 @@ public sealed class Interpreter
             return await CallFunctionAsync(function, arguments, assignments, stdin, cancellationToken);
         }
 
-        if (!_builtins.TryGetValue(name, out var builtin))
+        if (!_commands.TryGet(name, out var builtin))
         {
-            return await RunScriptFileAsync(name, arguments, assignments, stdin, cancellationToken);
+            return await RunScriptFileAsync(name, arguments, assignments, stdin, inheritsShellInput, cancellationToken);
         }
 
         // Assignments preceding a command apply only for that command's duration.
@@ -1405,7 +1405,7 @@ public sealed class Interpreter
 
         // It does inherit the shell's standard input, so `x=$(cat)` in a script fed from a
         // pipe reads that pipe — the file descriptor a real shell would have handed down.
-        var nested = new Interpreter(fork, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
+        var nested = new Interpreter(fork, FileSystem, Budget, _commands) { _standardInput = _standardInput };
         var result = await nested.RunAsync(parsed, _standardInput?.Remaining, cancellationToken);
 
         // The subshell exits when the substitution ends, so its EXIT trap fires here and
@@ -1429,7 +1429,8 @@ public sealed class Interpreter
 
     /// <summary>Runs a script fragment in the current shell, as <c>eval</c> and <c>source</c> do.</summary>
     /// <summary>
-    /// Runs a name that is not a builtin or a function as a script from the filesystem.
+    /// Runs a name that is not a builtin or a function as a script from the filesystem,
+    /// falling back to a host <see cref="ICommandResolver"/> when there is no such script.
     /// </summary>
     /// <remarks>
     /// This is the closest the sandbox comes to <c>exec</c>, and it deliberately stops well
@@ -1442,6 +1443,7 @@ public sealed class Interpreter
         List<string> arguments,
         IReadOnlyList<Assignment> assignments,
         StreamData? stdin,
+        bool inheritsShellInput,
         CancellationToken cancellationToken)
     {
         var saved = await ApplyTemporaryAssignmentsAsync(assignments, cancellationToken);
@@ -1452,6 +1454,23 @@ public sealed class Interpreter
 
             if (path is null)
             {
+                // Nothing else answered for the name, so a host resolver gets the last
+                // word. It is asked here rather than alongside the registered commands
+                // precisely so that it cannot shadow one, or a script on `PATH`.
+                if (_commands.ResolveUnknown(name) is { } resolved)
+                {
+                    Budget.ChargeCommand();
+
+                    var input = inheritsShellInput
+                        ? _standardInput
+                        : stdin is { } data ? new InputStream(data.ToString()) : null;
+
+                    var resolvedContext =
+                        new BuiltinContext(name, arguments, State, FileSystem, Budget, stdin, Hooks) { Input = input };
+
+                    return await resolved.ExecuteAsync(resolvedContext, cancellationToken);
+                }
+
                 return ExecResult.Error($"bash: {name}: command not found\n", ExitCodes.NotFound);
             }
 
@@ -1567,7 +1586,7 @@ public sealed class Interpreter
             return ExecResult.Success;
         }
 
-        var nested = new Interpreter(child, FileSystem, Budget, _builtins);
+        var nested = new Interpreter(child, FileSystem, Budget, _commands);
         var result = await nested.RunAsync(parsed, request.Stdin, cancellationToken);
         return result with { ControlFlow = ControlFlow.None };
     }
@@ -1577,7 +1596,7 @@ public sealed class Interpreter
     {
         using var nesting = Budget.EnterNesting();
         var parsed = Parser.Parse(script, Budget);
-        var nested = new Interpreter(State, FileSystem, Budget, _builtins) { _standardInput = _standardInput };
+        var nested = new Interpreter(State, FileSystem, Budget, _commands) { _standardInput = _standardInput };
         return await nested.RunAsync(parsed, stdin, cancellationToken);
     }
 
@@ -1591,7 +1610,7 @@ public sealed class Interpreter
         StreamData? stdin,
         CancellationToken cancellationToken)
     {
-        if (words.Count == 0 || !_builtins.TryGetValue(words[0], out var builtin))
+        if (words.Count == 0 || !_commands.TryGet(words[0], out var builtin))
         {
             return ExecResult.Error($"bash: {(words.Count > 0 ? words[0] : string.Empty)}: command not found\n", ExitCodes.NotFound);
         }
@@ -1602,8 +1621,8 @@ public sealed class Interpreter
     }
 
     /// <summary>True when <paramref name="name"/> resolves to a registered builtin.</summary>
-    public bool HasBuiltin(string name) => _builtins.ContainsKey(name);
+    public bool HasBuiltin(string name) => _commands.Contains(name);
 
     /// <summary>The names of every registered builtin.</summary>
-    public IEnumerable<string> BuiltinNames => _builtins.Keys;
+    public IEnumerable<string> BuiltinNames => _commands.Names;
 }

@@ -68,6 +68,26 @@ public sealed class VirtualMachine
     /// <summary>Modules the host has made importable.</summary>
     public Dictionary<string, PyObject> Modules { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Consulted when an import names a module <see cref="Modules"/> does not hold.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is how a host library is built on first use rather than for every run that
+    /// might not import it — and, for a library written in Python, the only moment at which
+    /// it <i>can</i> be built, since running its source needs the machine that is asking.
+    /// </para>
+    /// <para>
+    /// It resolves a name to a module; it does not search anywhere. A name no resolver
+    /// claims is still <c>ModuleNotFoundError</c>, so the importable set stays the closed
+    /// list the host wrote.
+    /// </para>
+    /// </remarks>
+    public Func<string, PyObject?>? ModuleResolver { get; set; }
+
+    /// <summary>Module names currently being resolved, so a cycle is reported rather than run.</summary>
+    private readonly HashSet<string> _resolving = new(StringComparer.Ordinal);
+
     /// <summary>Frames currently executing, innermost last. Used to build tracebacks.</summary>
     internal List<Frame> CallStack { get; } = [];
 
@@ -77,11 +97,64 @@ public sealed class VirtualMachine
     /// <summary>Writes to the captured standard error.</summary>
     public void WriteError(string text) => _stderr.Append(text);
 
-    /// <summary>Runs a module's code object.</summary>
-    public PyObject RunModule(CodeObject code)
+    /// <summary>Runs a module's code object in the program's own namespace.</summary>
+    public PyObject RunModule(CodeObject code) => RunModule(code, Globals);
+
+    /// <summary>
+    /// Runs a module's code object in <paramref name="globals"/>.
+    /// </summary>
+    /// <remarks>
+    /// A library written in Python is run this way, in a namespace of its own: functions it
+    /// defines capture the namespace of the frame that made them, so its globals are the
+    /// module's own and the importing program cannot reach into them except through the
+    /// names the module ends up with.
+    /// </remarks>
+    public PyObject RunModule(CodeObject code, PyDict globals)
     {
-        var frame = new Frame(code, Globals, [], []);
+        ArgumentNullException.ThrowIfNull(globals);
+
+        var frame = new Frame(code, globals, [], []);
         return Execute(frame);
+    }
+
+    /// <summary>
+    /// Builds a module the host registered but has not yet needed, and remembers it.
+    /// </summary>
+    /// <remarks>
+    /// The result is cached in <see cref="Modules"/>, so importing the same library twice in
+    /// one run yields one object — module state a program mutates is seen by every importer
+    /// of it, as in CPython — while a fresh run starts from a fresh module.
+    /// </remarks>
+    private PyObject? ResolveModule(string name)
+    {
+        if (ModuleResolver is not { } resolver)
+        {
+            return null;
+        }
+
+        // A library that imports itself would otherwise recurse until the host's stack ran
+        // out, which is a crash rather than an error a program can see.
+        if (!_resolving.Add(name))
+        {
+            throw new PyRaise(new PyException(
+                PyExceptionType.ImportError,
+                $"cannot import name '{name}': it is already being imported"));
+        }
+
+        try
+        {
+            if (resolver(name) is not { } module)
+            {
+                return null;
+            }
+
+            Modules[name] = module;
+            return module;
+        }
+        finally
+        {
+            _resolving.Remove(name);
+        }
     }
 
     /// <summary>Calls any callable with positional and keyword arguments.</summary>
@@ -1539,7 +1612,7 @@ public sealed class VirtualMachine
 
                 if (!Modules.TryGetValue(name, out var module))
                 {
-                    throw new PyRaise(PyErrors.ModuleNotFound(name));
+                    module = ResolveModule(name) ?? throw new PyRaise(PyErrors.ModuleNotFound(name));
                 }
 
                 frame.Push(module);
