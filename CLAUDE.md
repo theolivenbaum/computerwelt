@@ -66,6 +66,7 @@ namespace is its assembly name, so a file's namespace names the package it lands
 | `snapshot/`                      | `Snapshot/`               | Serialize/restore shell + VFS state |
 | `network/`                       | `Network/`                | Allowlist, HTTP transport abstraction |
 | `tool.rs`, `tool_def.rs`         | `Tooling/`                | `BashTool` LLM tool contract |
+| `builtins/extension.rs`, `command_resolver` | `Extensibility/` | Host commands: `IShellExtension`, `ICommandResolver`, `DelegateBuiltin`, `CommandTable` |
 | `lib.rs`                         | `Bash.cs`, `BashBuilder.cs` | Public facade |
 
 ### Python — `src/Computerwelt.Emulation.Python/`
@@ -82,6 +83,7 @@ the speed and the snapshot-at-a-call-boundary feature both depend on it.
 | `builtins/` | `Builtins/` | `len`, `range`, `print`, `sorted`, … |
 | `modules/` | `Modules/` | the permitted stdlib subset |
 | `crates/monty-types/` | `Interop/` | host-facing object model and external functions |
+| — | `Extensibility/` | host libraries: `PythonLibrary`, built per run, written in C# or in Python |
 | `crates/monty-fs/` | `Computerwelt/PythonFileSystem` | `os`, `os.path` and `open` over this repo's `IFileSystem`, so both sandboxes share one VFS |
 | `crates/monty-type-checking/` | — | out of scope: wraps `ty`, an external type checker |
 
@@ -142,6 +144,8 @@ tests/
   spec/                                     shell acceptance corpus (from bashkit)
   monty-spec/                               python acceptance corpus (from monty)
   monty-extensions/                         fixtures for what this port adds beyond monty
+samples/
+  Computerwelt.Sample.Extensibility/        a runnable tour of every extension point
 .reference/bashkit/          vendored bashkit source (read-only)
 .reference/monty/            vendored monty source (read-only)
 ```
@@ -253,6 +257,45 @@ The tests are the release gate, and both ratchets carry their weight there:
 `tests/spec/baseline.json` fails the run if any spec file regresses, and
 `Computerwelt.AgentTests` is absolute. A red suite is a package that never gets built, which
 is the only ordering that helps — a package pushed to NuGet cannot be un-published.
+
+## Extending the sandbox
+
+A host adds vocabulary; it never adds authority. Everything registered runs under the same
+limits, against the same virtual filesystem, with no route to the host that the sandbox did
+not already have.
+
+| Point | Shape | Notes |
+|---|---|---|
+| `BashBuilder.WithBuiltin` | `IBuiltin`, or a delegate | replaces a default of the same name |
+| `BashBuilder.WithExtension` | `IShellExtension` | a set of commands granted as one unit |
+| `BashBuilder.WithCommandResolver` | `ICommandResolver` | consulted **last**, so it can never shadow a function, a command or a script; its names are not enumerable |
+| `BashBuilder.WithoutBuiltin` | a name | applied after every registration, so it loses to nothing; the name is absent, not refusing |
+| `PythonRunner.Libraries` / `PythonOptions.Libraries` | `PythonLibrary` | built **per run**, on first import; written in C# (`FromFactory`, `FromFunctions`) or in Python (`FromSource`) |
+| `PythonRunner.HostFunctions` / `PythonOptions.HostFunctions` | `Func<PythonHostContext, PyObject[], PyObject>` | a C# function in the program's globals, handed the run's environment |
+| `PythonRunner.ExternalFunctions` | `Func<PyObject[], PyObject>` | the same, for host code that needs no environment |
+| `PythonRunner.Modules` | a `PyObject` | one object shared by every run — for a module with no state |
+
+Host code written in C# is handed the environment rather than reaching for one:
+`BuiltinContext` on the shell side, `PythonHostContext` on the Python side. Both carry the
+virtual filesystem, the working directory, the environment and the run's limits and clock,
+and both read them live — a `cd` the script performed is where host code finds itself. The
+Python context translates the absence of storage into a Python `OSError`
+(`RequireFileSystem`), because a host exception reaching a sandboxed program is the sandbox
+leaking, not an error the program can handle.
+
+There is deliberately no way to *compile* C# from inside a script. Host code is registered
+by the host, in the host's own assembly, before the session is built — which is what keeps
+the reachable surface a list somebody wrote.
+
+Two invariants show up here, and both are load-bearing:
+
+- A builtin instance is shared by every execution of every session it was registered with,
+  so it must be stateless and thread-safe. Per-invocation data arrives in `BuiltinContext`.
+- A library is a recipe, not a module. `PythonRunner.Modules` hands one object to every run,
+  which is fine for a constant table and wrong for anything a program can mutate: that would
+  be one tenant's state becoming another's. `Libraries` builds a fresh module per run, and a
+  library written in Python has module-level state by construction — which is why it is the
+  route those get added by.
 
 ## Working rules
 

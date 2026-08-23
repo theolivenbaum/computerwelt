@@ -10,9 +10,9 @@ namespace Computerwelt.Emulation.Python;
 /// </summary>
 /// <remarks>
 /// The sandbox has no filesystem, no environment and no network of its own. Anything a
-/// script can reach was handed to it by the host through <see cref="Modules"/> or an
-/// external function — which is the same posture the shell half of this repository takes,
-/// and the reason the two can share one virtual filesystem later.
+/// script can reach was handed to it by the host — through <see cref="Libraries"/>,
+/// <see cref="Modules"/> or an external function — which is the same posture the shell half
+/// of this repository takes, and the reason the two can share one virtual filesystem later.
 /// </remarks>
 public sealed class PythonRunner
 {
@@ -22,7 +22,14 @@ public sealed class PythonRunner
     /// <summary>The per-run resource caps.</summary>
     public ExecutionLimits Limits { get; }
 
-    /// <summary>Modules the host makes importable, by name.</summary>
+    /// <summary>
+    /// Modules the host makes importable, by name.
+    /// </summary>
+    /// <remarks>
+    /// One object, shared by every run of this runner. That is fine for a module that holds
+    /// no state and wrong for one that does — a counter here is a counter two tenants share.
+    /// Prefer <see cref="Libraries"/>, which builds a module per run.
+    /// </remarks>
     public Dictionary<string, PyObject> Modules { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
@@ -35,6 +42,31 @@ public sealed class PythonRunner
     /// </remarks>
     public Dictionary<string, Func<PyObject[], PyObject>> ExternalFunctions { get; } =
         new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Functions the host exposes to the sandbox, each receiving the run's environment.
+    /// </summary>
+    /// <remarks>
+    /// The same route out as <see cref="ExternalFunctions"/>, for host code that needs to do
+    /// its work <i>in</i> the sandbox rather than beside it: each call is handed the
+    /// <see cref="PythonHostContext">environment</see> of the run that made it — its
+    /// filesystem, working directory, environment and clock. A function that wants none of
+    /// that belongs in <see cref="ExternalFunctions"/>; one that wants a module around it
+    /// belongs in <see cref="Libraries"/>.
+    /// </remarks>
+    public Dictionary<string, Func<PythonHostContext, PyObject[], PyObject>> HostFunctions { get; } =
+        new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Libraries the host adds to the importable set.
+    /// </summary>
+    /// <remarks>
+    /// The recommended way to extend the sandbox's vocabulary. Unlike <see cref="Modules"/>,
+    /// a library is built per run and on first import, so two runs never share one module's
+    /// state and a library nothing imports costs nothing. A library's name wins over a
+    /// standard module of the same name, and over one in <see cref="Modules"/>.
+    /// </remarks>
+    public List<PythonLibrary> Libraries { get; } = [];
 
     /// <summary>
     /// The filesystem the program can reach, or <see langword="null"/> for none.
@@ -120,9 +152,23 @@ public sealed class PythonRunner
             machine.Modules[name] = module;
         }
 
+        RegisterLibraries(machine);
+
         foreach (var (name, implementation) in ExternalFunctions)
         {
             globals.Set(new PyStr(name), new PyBuiltinFunction(name, implementation));
+        }
+
+        foreach (var (name, implementation) in HostFunctions)
+        {
+            // One context per function per run: it reads the environment through the
+            // filesystem rather than copying it, so a call made after a `cd` sees the new
+            // working directory.
+            var context = new PythonHostContext(name, machine, FileSystem, TimeProvider ?? System.TimeProvider.System);
+
+            globals.Set(
+                new PyStr(name),
+                new PyBuiltinFunction(name, arguments => implementation(context, arguments)));
         }
 
         foreach (var (name, value) in Variables)
@@ -191,6 +237,37 @@ public sealed class PythonRunner
                 Globals = globals,
             };
         }
+    }
+
+    /// <summary>
+    /// Arranges for the host's libraries to be built when, and only when, a program imports
+    /// one of them.
+    /// </summary>
+    /// <remarks>
+    /// A library's name is taken off the module table first, so that a host replacing a
+    /// standard module wins the lookup — the eager entry would otherwise be found before the
+    /// resolver was ever asked.
+    /// </remarks>
+    private void RegisterLibraries(VirtualMachine machine)
+    {
+        if (Libraries.Count == 0)
+        {
+            return;
+        }
+
+        var libraries = new Dictionary<string, PythonLibrary>(StringComparer.Ordinal);
+
+        foreach (var library in Libraries)
+        {
+            libraries[library.Name] = library;
+            machine.Modules.Remove(library.Name);
+        }
+
+        var timeProvider = TimeProvider ?? System.TimeProvider.System;
+
+        machine.ModuleResolver = name => libraries.TryGetValue(name, out var library)
+            ? library.Create(new PythonHostContext(name, machine, FileSystem, timeProvider))
+            : null;
     }
 
     /// <summary>

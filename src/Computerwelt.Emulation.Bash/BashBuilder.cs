@@ -15,6 +15,8 @@ namespace Computerwelt.Emulation.Bash;
 public sealed class BashBuilder
 {
     private readonly Dictionary<string, IBuiltin> _builtins = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _withheld = new(StringComparer.Ordinal);
+    private readonly List<ICommandResolver> _resolvers = [];
     private readonly Dictionary<string, string> _environment = new(StringComparer.Ordinal);
     private IFileSystem? _fileSystem;
     private ExecutionLimits _limits = ExecutionLimits.Default;
@@ -85,10 +87,125 @@ public sealed class BashBuilder
     }
 
     /// <summary>Registers a custom command, replacing any builtin of the same name.</summary>
+    /// <remarks>
+    /// The instance is shared by every execution of the session, so it must be thread-safe
+    /// and hold no per-invocation state — see <see cref="IBuiltin"/>.
+    /// </remarks>
     public BashBuilder WithBuiltin(IBuiltin builtin)
     {
         ArgumentNullException.ThrowIfNull(builtin);
         _builtins[builtin.Name] = builtin;
+        return this;
+    }
+
+    /// <summary>Registers a custom command implemented by a delegate.</summary>
+    /// <param name="name">The name the command is typed as.</param>
+    /// <param name="run">The implementation, which must be thread-safe.</param>
+    /// <param name="llmHint">The one-line capability summary, or null to omit it from the prompt.</param>
+    /// <param name="help">The text <c>--help</c> shows, if the command answers it.</param>
+    public BashBuilder WithBuiltin(
+        string name,
+        Func<BuiltinContext, CancellationToken, ValueTask<ExecResult>> run,
+        string? llmHint = null,
+        string? help = null) =>
+        WithBuiltin(new DelegateBuiltin(name, run, llmHint, help));
+
+    /// <summary>Registers a custom command implemented by a synchronous delegate.</summary>
+    /// <param name="name">The name the command is typed as.</param>
+    /// <param name="run">The implementation, which must be thread-safe.</param>
+    /// <param name="llmHint">The one-line capability summary, or null to omit it from the prompt.</param>
+    /// <param name="help">The text <c>--help</c> shows, if the command answers it.</param>
+    public BashBuilder WithBuiltin(
+        string name,
+        Func<BuiltinContext, ExecResult> run,
+        string? llmHint = null,
+        string? help = null) =>
+        WithBuiltin(new DelegateBuiltin(name, run, llmHint, help));
+
+    /// <summary>Registers several custom commands. A later name replaces an earlier one.</summary>
+    public BashBuilder WithBuiltins(params IBuiltin[] builtins) =>
+        WithBuiltins((IEnumerable<IBuiltin>)builtins);
+
+    /// <summary>Registers several custom commands. A later name replaces an earlier one.</summary>
+    public BashBuilder WithBuiltins(IEnumerable<IBuiltin> builtins)
+    {
+        ArgumentNullException.ThrowIfNull(builtins);
+
+        foreach (var builtin in builtins)
+        {
+            WithBuiltin(builtin);
+        }
+
+        return this;
+    }
+
+    /// <summary>
+    /// Registers a related set of commands as one unit.
+    /// </summary>
+    /// <remarks>
+    /// The unit is the point: a host grants a domain vocabulary or withholds it, and the
+    /// grant can be read as one line rather than reconstructed from a pile of individual
+    /// registrations. Its commands override earlier ones of the same name, exactly as
+    /// <see cref="WithBuiltin(IBuiltin)"/> does.
+    /// </remarks>
+    public BashBuilder WithExtension(IShellExtension extension)
+    {
+        ArgumentNullException.ThrowIfNull(extension);
+        return WithBuiltins(extension.Builtins);
+    }
+
+    /// <summary>
+    /// Installs a last-chance resolver for command names nothing else matched.
+    /// </summary>
+    /// <remarks>
+    /// Resolvers are consulted in registration order, and only after shell functions,
+    /// registered commands and the search for a script have all missed — so a resolver
+    /// extends the vocabulary without being able to shadow any of them. See
+    /// <see cref="ICommandResolver"/>.
+    /// </remarks>
+    public BashBuilder WithCommandResolver(ICommandResolver resolver)
+    {
+        ArgumentNullException.ThrowIfNull(resolver);
+        _resolvers.Add(resolver);
+        return this;
+    }
+
+    /// <summary>Installs a last-chance resolver implemented by a delegate.</summary>
+    public BashBuilder WithCommandResolver(Func<string, IBuiltin?> resolve)
+    {
+        ArgumentNullException.ThrowIfNull(resolve);
+        return WithCommandResolver(new DelegateCommandResolver(resolve));
+    }
+
+    /// <summary>
+    /// Withholds one command, so the session has no such name at all.
+    /// </summary>
+    /// <remarks>
+    /// Applied after every registration, including this builder's own defaults and anything
+    /// an extension contributed, and it cannot be undone by a later call. A withheld name is
+    /// absent rather than present and refusing, which is the same posture the rest of the
+    /// sandbox takes — and it stays absent to <c>type</c>, <c>command -v</c> and
+    /// <see cref="Bash.BuiltinNames"/>, so a script cannot discover a capability it does not
+    /// have. It does not bind an <see cref="ICommandResolver"/>: a resolver is the host's own
+    /// answer to a name, so a host that withholds a command must not then resolve it.
+    /// </remarks>
+    public BashBuilder WithoutBuiltin(string name)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        _withheld.Add(name);
+        return this;
+    }
+
+    /// <summary>Withholds several commands.</summary>
+    public BashBuilder WithoutBuiltins(params string[] names)
+    {
+        ArgumentNullException.ThrowIfNull(names);
+
+        foreach (var name in names)
+        {
+            WithoutBuiltin(name);
+        }
+
         return this;
     }
 
@@ -111,7 +228,7 @@ public sealed class BashBuilder
         SeedEnvironment(state);
 
         var registry = new Dictionary<string, IBuiltin>(StringComparer.Ordinal);
-        var bash = new Bash(state, fileSystem, _limits, registry);
+        var bash = new Bash(state, fileSystem, _limits, new CommandTable(registry, _resolvers));
 
         if (_registerDefaults)
         {
@@ -121,6 +238,13 @@ public sealed class BashBuilder
         foreach (var (name, builtin) in _builtins)
         {
             registry[name] = builtin;
+        }
+
+        // Withholding is applied last, so it wins over every registration — including one
+        // an extension made — rather than depending on the order the host called things in.
+        foreach (var name in _withheld)
+        {
+            registry.Remove(name);
         }
 
         return bash;
