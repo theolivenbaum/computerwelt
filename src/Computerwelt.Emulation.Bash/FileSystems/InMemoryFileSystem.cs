@@ -33,7 +33,23 @@ public sealed class InMemoryFileSystem : IFileSystem
         Limits = limits ?? FsLimits.Default;
         _time = timeProvider ?? TimeProvider.System;
         _root = new DirectoryNode(_time.GetUtcNow());
+
+        // Every sandbox has somewhere to put a temporary file. A shell without one turns the
+        // most ordinary line a script can contain — a redirect into /tmp — into "No such file
+        // or directory", and nothing in the sandbox explains why. 1777 is what /tmp carries on
+        // a real system: writable by anyone, with the sticky bit.
+        CreateDirectoryCore(TempDirectory, recursive: true);
+        lock (_gate)
+        {
+            ResolveExisting(TempDirectory).Mode = (0b111_111_111 | StickyBit) & 0xFFF;
+        }
     }
+
+    /// <summary>Where <c>TMPDIR</c> points, and the one directory a fresh filesystem has.</summary>
+    public static readonly VPath TempDirectory = VPath.Parse("/tmp");
+
+    /// <summary>The sticky bit, as `ls` reports it on /tmp.</summary>
+    private const int StickyBit = 1 << 9;
 
     /// <inheritdoc />
     public FsLimits Limits { get; }

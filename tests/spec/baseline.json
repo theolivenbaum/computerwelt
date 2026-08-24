@@ -141,6 +141,6 @@
   "grep/rg.test.sh": 13,
   "jq/jq.test.sh": 123,
   "sed/eval-bugs.test.sh": 2,
-  "sed/sed.test.sh": 78,
+  "sed/sed.test.sh": 86,
   "yq/yq.test.sh": 26
 }
