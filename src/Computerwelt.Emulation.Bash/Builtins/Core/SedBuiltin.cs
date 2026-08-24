@@ -111,6 +111,7 @@ public sealed class SedBuiltin : IBuiltin
         var inputs = await TextHelpers.ReadInputsAsync(context, operands, "sed", errors, cancellationToken);
         var builder = new StringBuilder();
         var exitCode = errors.Length == 0 ? 0 : ExitCodes.Failure;
+        var files = await ResolveFilesAsync(context, program, cancellationToken);
 
         try
         {
@@ -119,7 +120,7 @@ public sealed class SedBuiltin : IBuiltin
                 for (var i = 0; i < inputs.Count; i++)
                 {
                     var output = new StringBuilder();
-                    var code = Run(program, TextHelpers.SplitLines(inputs[i].Content), quiet, output);
+                    var code = Run(program, TextHelpers.SplitLines(inputs[i].Content), quiet, output, files);
 
                     if (inPlace && inputs[i].Name != "-")
                     {
@@ -142,7 +143,7 @@ public sealed class SedBuiltin : IBuiltin
             else
             {
                 var lines = inputs.SelectMany(static i => TextHelpers.SplitLines(i.Content)).ToArray();
-                var code = Run(program, lines, quiet, builder);
+                var code = Run(program, lines, quiet, builder, files);
 
                 if (code != 0)
                 {
@@ -155,6 +156,8 @@ public sealed class SedBuiltin : IBuiltin
             return ExecResult.Usage("sed", e.Message, ExitCodes.Usage);
         }
 
+        await FlushWritesAsync(context, files, cancellationToken);
+
         return new ExecResult
         {
             Stdout = StreamData.FromText(builder.ToString()),
@@ -163,9 +166,58 @@ public sealed class SedBuiltin : IBuiltin
         };
     }
 
+    /// <summary>
+    /// Reads every file the script's <c>r</c> / <c>R</c> commands name, before the run.
+    /// </summary>
+    /// <remarks>
+    /// A file that cannot be read is not an error: GNU treats it as empty, so a script that
+    /// optionally splices in a header still works where the header does not exist.
+    /// </remarks>
+    private static async ValueTask<SedFiles> ResolveFilesAsync(BuiltinContext context, SedProgram program, CancellationToken cancellationToken)
+    {
+        var files = new SedFiles();
+
+        foreach (var command in program.Commands)
+        {
+            if (command.Kind is not (SedKind.ReadFile or SedKind.ReadFileLine)) continue;
+
+            var name = command.Text ?? string.Empty;
+
+            if (name.Length == 0 || files.Reads.ContainsKey(name)) continue;
+
+            try
+            {
+                var bytes = await context.FileSystem.ReadFileAsync(context.ResolvePath(name), cancellationToken);
+                files.Reads[name] = TextHelpers.SplitLines(Encoding.UTF8.GetString(bytes));
+            }
+            catch (ShellException)
+            {
+                files.Reads[name] = [];
+            }
+        }
+
+        return files;
+    }
+
+    /// <summary>Writes what <c>w</c> and <c>W</c> collected, once the run is over.</summary>
+    private static async ValueTask FlushWritesAsync(BuiltinContext context, SedFiles files, CancellationToken cancellationToken)
+    {
+        foreach (var (name, content) in files.Writes)
+        {
+            //`/dev/stdout' is the one name GNU gives a meaning other than a path, and a script
+            //that uses it to tee wants it on stdout, not in a file called /dev/stdout.
+            if (name is "/dev/stdout" or "/dev/stderr") continue;
+
+            await context.FileSystem.WriteFileAsync(
+                context.ResolvePath(name),
+                Encoding.UTF8.GetBytes(content.ToString()),
+                cancellationToken);
+        }
+    }
+
     /// <summary>Runs the parsed program over the input lines.</summary>
     /// <returns>The exit code a <c>q</c> or <c>Q</c> asked for, or zero.</returns>
-    private static int Run(SedProgram program, string[] lines, bool quiet, StringBuilder output)
+    private static int Run(SedProgram program, string[] lines, bool quiet, StringBuilder output, SedFiles files)
     {
         // Ranges are stateful, and `-s` runs the same program over each file in turn.
         program.Reset();
@@ -182,7 +234,7 @@ public sealed class SedBuiltin : IBuiltin
 
             do
             {
-                flow = Execute(program, state, quiet, output);
+                flow = Execute(program, state, quiet, output, files);
             }
             while (flow == SedFlow.Restart);
 
@@ -214,7 +266,7 @@ public sealed class SedBuiltin : IBuiltin
     /// and <c>T</c> can be a plain assignment to the program counter. A block is an
     /// instruction that either falls through into its body or jumps past it.
     /// </remarks>
-    private static SedFlow Execute(SedProgram program, SedState state, bool quiet, StringBuilder output)
+    private static SedFlow Execute(SedProgram program, SedState state, bool quiet, StringBuilder output, SedFiles files)
     {
         var commands = program.Commands;
         var pc = 0;
@@ -369,6 +421,46 @@ public sealed class SedBuiltin : IBuiltin
                     state.PatternSpace = string.Empty;
                     break;
 
+                //`r' queues the whole file to appear after this cycle's output, the same
+                //place `a' text goes - so a missing file is silently nothing, as in GNU.
+                case SedKind.ReadFile:
+                {
+                    var lines = files.LinesOf(command.Text ?? string.Empty);
+
+                    if (lines.Length > 0) state.Appended.Add(string.Join('\n', lines));
+
+                    break;
+                }
+
+                //`R' queues one line per execution, and stops producing when the file runs out.
+                case SedKind.ReadFileLine:
+                {
+                    var name = command.Text ?? string.Empty;
+                    var lines = files.LinesOf(name);
+                    var cursor = files.ReadCursors.TryGetValue(name, out var at) ? at : 0;
+
+                    if (cursor < lines.Length)
+                    {
+                        state.Appended.Add(lines[cursor]);
+                        files.ReadCursors[name] = cursor + 1;
+                    }
+
+                    break;
+                }
+
+                case SedKind.WriteFile:
+                    files.WriterFor(command.Text ?? string.Empty).Append(state.PatternSpace).Append('\n');
+                    break;
+
+                case SedKind.WriteFirstLine:
+                {
+                    var newline = state.PatternSpace.IndexOf('\n', StringComparison.Ordinal);
+                    var first = newline < 0 ? state.PatternSpace : state.PatternSpace[..newline];
+
+                    files.WriterFor(command.Text ?? string.Empty).Append(first).Append('\n');
+                    break;
+                }
+
                 case SedKind.Branch:
                     pc = command.Jump;
                     continue;
@@ -448,6 +540,42 @@ public sealed class SedBuiltin : IBuiltin
     }
 
     /// <summary>The mutable state one input line is processed against.</summary>
+    /// <summary>
+    /// The files an `r'/`R'/`w'/`W' script touches.
+    /// </summary>
+    /// <remarks>
+    /// Reads are resolved once, before the run, and writes are collected and flushed after
+    /// it: the execution loop is synchronous, and threading the filesystem's async surface
+    /// through every command to serve four of them would distort the whole evaluator. A file
+    /// that changes while sed is running over it is not a case a sandbox needs to model.
+    /// </remarks>
+    private sealed class SedFiles
+    {
+        public static readonly SedFiles None = new();
+
+        /// <summary>Lines of each file named by `r' or `R', empty when it could not be read.</summary>
+        public Dictionary<string, string[]> Reads { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>How far `R' has consumed each file it reads a line at a time from.</summary>
+        public Dictionary<string, int> ReadCursors { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>What `w' and `W' produced, per file, to be written when the run ends.</summary>
+        public Dictionary<string, StringBuilder> Writes { get; } = new(StringComparer.Ordinal);
+
+        public string[] LinesOf(string name) => Reads.TryGetValue(name, out var lines) ? lines : [];
+
+        public StringBuilder WriterFor(string name)
+        {
+            if (!Writes.TryGetValue(name, out var writer))
+            {
+                writer = new StringBuilder();
+                Writes[name] = writer;
+            }
+
+            return writer;
+        }
+    }
+
     private sealed class SedState(string[] lines)
     {
         public string[] Lines { get; } = lines;
@@ -498,6 +626,10 @@ public sealed class SedBuiltin : IBuiltin
         BranchIf,
         BranchUnless,
         Block,
+        ReadFile,
+        ReadFileLine,
+        WriteFile,
+        WriteFirstLine,
     }
 
     private sealed record SedCommand(SedKind Kind, SedAddress Address)
@@ -961,10 +1093,58 @@ public sealed class SedBuiltin : IBuiltin
                     return;
                 }
 
+                //`r'/`R'/`w'/`W' take a filename that runs to the end of the line - a `;' in a
+                //path is part of the path, which is why these cannot go through ReadLabel.
+                case 'r' or 'R' or 'w' or 'W':
+                {
+                    var mapped = kind switch
+                    {
+                        'r' => SedKind.ReadFile,
+                        'R' => SedKind.ReadFileLine,
+                        'w' => SedKind.WriteFile,
+                        _   => SedKind.WriteFirstLine,
+                    };
+
+                    var name = ReadFileName(script, ref position);
+
+                    if (name.Length == 0)
+                    {
+                        throw new FormatException($"missing filename in r/R/w/W commands");
+                    }
+
+                    commands.Add(new SedCommand(mapped, address) { Text = name });
+                    return;
+                }
+
                 default:
                     commands.Add(new SedCommand(Simple(kind), address));
                     return;
             }
+        }
+
+        /// <summary>
+        /// Reads the filename argument of <c>r</c> / <c>R</c> / <c>w</c> / <c>W</c>.
+        /// </summary>
+        /// <remarks>
+        /// It runs to the end of the line and nothing terminates it early: GNU treats every
+        /// remaining character as part of the path, so a script that means to do something
+        /// after one has to put it on the next line.
+        /// </remarks>
+        private static string ReadFileName(string script, ref int position)
+        {
+            while (position < script.Length && script[position] == ' ')
+            {
+                position++;
+            }
+
+            var start = position;
+
+            while (position < script.Length && script[position] != '\n')
+            {
+                position++;
+            }
+
+            return script[start..position].TrimEnd();
         }
 
         /// <summary>Maps a command letter that carries no argument.</summary>
@@ -1209,6 +1389,7 @@ public sealed class SedBuiltin : IBuiltin
             var global = false;
             var print = false;
             var ignoreCase = false;
+            var multiline = false;
             var occurrence = 1;
 
             while (position < script.Length)
@@ -1236,6 +1417,13 @@ public sealed class SedBuiltin : IBuiltin
                     continue;
                 }
 
+                if (c is 'm' or 'M')
+                {
+                    multiline = true;
+                    position++;
+                    continue;
+                }
+
                 if (char.IsAsciiDigit(c))
                 {
                     var start = position;
@@ -1251,7 +1439,7 @@ public sealed class SedBuiltin : IBuiltin
                 break;
             }
 
-            return new Substitution(CompileRegex(pattern, extended, ignoreCase), replacement, global, occurrence, print);
+            return new Substitution(CompileRegex(pattern, extended, ignoreCase, multiline), replacement, global, occurrence, print);
         }
 
         private static (string From, string To) ParseTransliteration(string script, ref int position)
@@ -1341,10 +1529,17 @@ public sealed class SedBuiltin : IBuiltin
             return builder.ToString();
         }
 
-        private static Regex CompileRegex(string pattern, bool extended, bool ignoreCase)
+        private static Regex CompileRegex(string pattern, bool extended, bool ignoreCase, bool multiline = false)
         {
             var translated = PosixRegex.Translate(pattern, extended);
-            var options = ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None;
+            var options = RegexOptions.None;
+
+            if (ignoreCase) options |= RegexOptions.IgnoreCase;
+
+            // GNU's `M' flag: ^ and $ match at every embedded newline rather than only at the
+            // ends of the pattern space. It only means anything once N has joined lines into
+            // one pattern space, which is exactly when scripts reach for it.
+            if (multiline) options |= RegexOptions.Multiline;
 
             try
             {

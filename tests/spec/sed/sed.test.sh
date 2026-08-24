@@ -587,3 +587,76 @@ echo "abc" | sed 's/b/\\/'
 ### expect
 a\c
 ### end
+
+### sed_multiline_flag_on_substitute
+# The M flag makes ^ and $ match at embedded newlines, which is what N is for
+printf 'a\nb\n' | sed 'N;s/^b$/BEE/M'
+### expect
+a
+BEE
+### end
+
+### sed_multiline_flag_lowercase
+# GNU accepts m as well as M
+printf 'a\nb\n' | sed 'N;s/^a$/AY/m'
+### expect
+AY
+b
+### end
+
+### sed_read_file
+# r queues the whole file after the cycle's output
+printf 'alpha\nbeta\n' > /tmp/hdr.txt
+printf 'one\ntwo\nthree\n' | sed '2r /tmp/hdr.txt'
+### expect
+one
+two
+alpha
+beta
+three
+### end
+
+### sed_read_file_missing_is_empty
+# A file that is not there reads as nothing rather than failing the run
+printf 'one\ntwo\n' | sed '1r /tmp/definitely-not-here.txt'
+### expect
+one
+two
+### end
+
+### sed_read_file_line
+# R takes one line per cycle and stops when the file runs out
+printf 'alpha\nbeta\n' > /tmp/two.txt
+printf 'one\ntwo\nthree\n' | sed 'R /tmp/two.txt'
+### expect
+one
+alpha
+two
+beta
+three
+### end
+
+### sed_write_file
+# w collects the pattern space of every matching line
+printf 'one\ntwo\nthree\n' | sed -n '/t/w /tmp/matched.txt'
+cat /tmp/matched.txt
+### expect
+two
+three
+### end
+
+### sed_write_first_line
+# W writes only up to the first newline of the pattern space
+printf 'x\ny\n' | sed -n 'N;W /tmp/first.txt'
+cat /tmp/first.txt
+### expect
+x
+### end
+
+### sed_filename_runs_to_end_of_line
+# A filename argument swallows the rest of the line, semicolons included
+printf 'one\n' | sed -n 'w /tmp/a;b.txt'
+cat '/tmp/a;b.txt'
+### expect
+one
+### end

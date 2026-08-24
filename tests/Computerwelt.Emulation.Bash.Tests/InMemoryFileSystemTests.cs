@@ -124,6 +124,22 @@ public sealed class InMemoryFileSystemTests
     }
 
     [Fact]
+    public async Task Starts_with_a_temp_directory()
+    {
+        //A redirect into /tmp is the most ordinary line a script can contain, and a sandbox
+        //without one turns it into "No such file or directory" with nothing to explain it.
+        var fs = new InMemoryFileSystem();
+
+        var stat = await fs.StatAsync(InMemoryFileSystem.TempDirectory);
+
+        Assert.True(stat.IsDirectory);
+
+        await fs.WriteFileAsync("/tmp/scratch", new byte[3]);
+
+        Assert.Equal(3, (await fs.ReadFileAsync("/tmp/scratch")).Length);
+    }
+
+    [Fact]
     public async Task Reports_usage()
     {
         var fs = new InMemoryFileSystem();
@@ -134,7 +150,9 @@ public sealed class InMemoryFileSystemTests
 
         Assert.Equal(100, usage.TotalBytes);
         Assert.Equal(1, usage.FileCount);
-        Assert.Equal(2, usage.DirectoryCount);
+
+        //Root, /tmp (which every filesystem starts with) and the /d this test made.
+        Assert.Equal(3, usage.DirectoryCount);
     }
 
     [Fact]

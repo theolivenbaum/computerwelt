@@ -292,6 +292,7 @@ public sealed class BashBuilder
             ["HOSTNAME"] = _hostname,
             ["PWD"] = _workingDirectory.Value,
             ["SHELL"] = "/bin/bash",
+            ["TMPDIR"] = "/tmp",
             ["PATH"] = "/usr/local/bin:/usr/bin:/bin",
             ["IFS"] = " \t\n",
             ["PS1"] = @"\u@\h:\w\$ ",
