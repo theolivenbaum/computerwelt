@@ -151,6 +151,17 @@ internal sealed class Arguments
     /// <summary>The same, for a positional-or-keyword argument.</summary>
     public IReadOnlyList<string>? Strings(int index, string name) => Sequence(Value(index, name), name);
 
+    /// <summary>An optional positional-or-keyword <c>str | Pattern</c>.</summary>
+    public Matcher? Matcher(int index, string name) =>
+        Interop.Matcher.From(Value(index, name), Name, name);
+
+    /// <summary>An optional keyword-only <c>str | Pattern</c>.</summary>
+    public Matcher? Matcher(string name) => Interop.Matcher.From(Keyword(name), Name, name);
+
+    /// <summary>A required positional-or-keyword <c>str | Pattern | Sequence</c> of either.</summary>
+    public MatcherList Matchers(int index, string name) =>
+        Interop.Matcher.Many(Value(index, name), Name, name);
+
     /// <summary>An optional keyword-only mapping of strings to strings, such as HTTP headers.</summary>
     public IReadOnlyDictionary<string, string>? Headers(string name)
     {

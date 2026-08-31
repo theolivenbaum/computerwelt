@@ -145,16 +145,17 @@ internal sealed class PyPage : PlaywrightObject
 
         "wait_for_url" => Action("wait_for_url", arguments =>
         {
-            var url = arguments.String(0, "url");
+            var url = arguments.Matcher(0, "url")
+                ?? throw new PyRaise(PyErrors.TypeError($"{arguments.Name}() missing required argument: 'url'"));
             var timeout = Bridge.Timeout(arguments.Timeout());
             var waitUntil = Enums.Parse<WaitUntilState>(arguments.String("wait_until"), arguments.Name, "wait_until");
             arguments.Done(1);
 
-            Bridge.Block(() => _page.WaitForURLAsync(url, new PageWaitForURLOptions
-            {
-                Timeout = timeout,
-                WaitUntil = waitUntil,
-            }));
+            var options = new PageWaitForURLOptions { Timeout = timeout, WaitUntil = waitUntil };
+
+            Bridge.Block(() => url.IsPattern
+                ? _page.WaitForURLAsync(url.Pattern!, options)
+                : _page.WaitForURLAsync(url.Text!, options));
         }),
 
         "wait_for_selector" => Method("wait_for_selector", arguments =>
@@ -202,13 +203,7 @@ internal sealed class PyPage : PlaywrightObject
             var options = Locators.FilterOptions(arguments);
             arguments.Done(1);
 
-            return new PyLocator(Bridge, _page.Locator(selector, new PageLocatorOptions
-            {
-                Has = options.Has,
-                HasNot = options.HasNot,
-                HasTextString = options.HasText,
-                HasNotTextString = options.HasNotText,
-            }));
+            return new PyLocator(Bridge, _page.Locator(selector, Locators.ForPage(options)));
         }),
 
         "get_by_role" or "get_by_text" or "get_by_label" or "get_by_placeholder"

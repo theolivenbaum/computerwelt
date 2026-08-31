@@ -159,7 +159,7 @@ internal sealed class PyAssertions : PlaywrightObject
 
         "to_have_text" => Assert(name, (arguments, timeout) =>
         {
-            var expected = Expected(arguments, "expected");
+            var expected = arguments.Matchers(0, "expected");
             var options = new LocatorAssertionsToHaveTextOptions
             {
                 Timeout = timeout,
@@ -169,14 +169,21 @@ internal sealed class PyAssertions : PlaywrightObject
 
             arguments.Done(1);
 
-            return expected.Count == 1
-                ? target.ToHaveTextAsync(expected[0], options)
-                : target.ToHaveTextAsync(expected, options);
+            // A scalar asserts about the element the locator resolves to; a sequence
+            // asserts about the whole list, including how many there are. A one-element
+            // list is therefore still the sequence form.
+            return (expected.IsSequence, expected.ArePatterns) switch
+            {
+                (false, true) => target.ToHaveTextAsync(expected.Single.Pattern!, options),
+                (false, false) => target.ToHaveTextAsync(expected.Single.Text!, options),
+                (true, true) => target.ToHaveTextAsync(expected.Patterns, options),
+                (true, false) => target.ToHaveTextAsync(expected.Strings, options),
+            };
         }),
 
         "to_contain_text" => Assert(name, (arguments, timeout) =>
         {
-            var expected = Expected(arguments, "expected");
+            var expected = arguments.Matchers(0, "expected");
             var options = new LocatorAssertionsToContainTextOptions
             {
                 Timeout = timeout,
@@ -186,29 +193,48 @@ internal sealed class PyAssertions : PlaywrightObject
 
             arguments.Done(1);
 
-            return expected.Count == 1
-                ? target.ToContainTextAsync(expected[0], options)
-                : target.ToContainTextAsync(expected, options);
+            // A scalar asserts about the element the locator resolves to; a sequence
+            // asserts about the whole list, including how many there are. A one-element
+            // list is therefore still the sequence form.
+            return (expected.IsSequence, expected.ArePatterns) switch
+            {
+                (false, true) => target.ToContainTextAsync(expected.Single.Pattern!, options),
+                (false, false) => target.ToContainTextAsync(expected.Single.Text!, options),
+                (true, true) => target.ToContainTextAsync(expected.Patterns, options),
+                (true, false) => target.ToContainTextAsync(expected.Strings, options),
+            };
         }),
 
         "to_have_value" => Assert(name, (arguments, timeout) =>
         {
-            var value = arguments.String(0, "value");
+            var value = Required(arguments, 0, "value");
             arguments.Done(1);
-            return target.ToHaveValueAsync(value, new LocatorAssertionsToHaveValueOptions { Timeout = timeout });
+
+            var options = new LocatorAssertionsToHaveValueOptions { Timeout = timeout };
+
+            return value.IsPattern
+                ? target.ToHaveValueAsync(value.Pattern!, options)
+                : target.ToHaveValueAsync(value.Text!, options);
         }),
 
         "to_have_values" => Assert(name, (arguments, timeout) =>
         {
-            var values = Expected(arguments, "values");
+            var values = arguments.Matchers(0, "values");
             arguments.Done(1);
-            return target.ToHaveValuesAsync(values, new LocatorAssertionsToHaveValuesOptions { Timeout = timeout });
+
+            var options = new LocatorAssertionsToHaveValuesOptions { Timeout = timeout };
+
+            // Always the sequence form: `to_have_values` compares against a `<select>`'s
+            // selected options, which is a list even when it holds one.
+            return values.ArePatterns
+                ? target.ToHaveValuesAsync(values.Patterns, options)
+                : target.ToHaveValuesAsync(values.Strings, options);
         }),
 
         "to_have_attribute" => Assert(name, (arguments, timeout) =>
         {
             var attribute = arguments.String(0, "name");
-            var value = arguments.String(1, "value") ?? string.Empty;
+            var value = arguments.Matcher(1, "value");
             var options = new LocatorAssertionsToHaveAttributeOptions
             {
                 Timeout = timeout,
@@ -216,20 +242,36 @@ internal sealed class PyAssertions : PlaywrightObject
             };
 
             arguments.Done(2);
-            return target.ToHaveAttributeAsync(attribute, value, options);
+
+            // Upstream's value is optional, and leaving it out asserts that the attribute is
+            // *present* whatever it holds. The driver has no overload for that, so it is
+            // expressed as a pattern that matches any value — an attribute that is absent
+            // has no value to match, so it still fails.
+            return value switch
+            {
+                null => target.ToHaveAttributeAsync(attribute, AnyValue, options),
+                { IsPattern: true } pattern => target.ToHaveAttributeAsync(attribute, pattern.Pattern!, options),
+                { } text => target.ToHaveAttributeAsync(attribute, text.Text!, options),
+            };
         }),
 
         "to_have_class" => Assert(name, (arguments, timeout) =>
         {
-            var expected = Expected(arguments, "expected");
+            var expected = arguments.Matchers(0, "expected");
             var options = new LocatorAssertionsToHaveClassOptions { Timeout = timeout };
             arguments.Done(1);
 
-            return expected.Count == 1
-                ? target.ToHaveClassAsync(expected[0], options)
-                : target.ToHaveClassAsync(expected, options);
+            return (expected.IsSequence, expected.ArePatterns) switch
+            {
+                (false, true) => target.ToHaveClassAsync(expected.Single.Pattern!, options),
+                (false, false) => target.ToHaveClassAsync(expected.Single.Text!, options),
+                (true, true) => target.ToHaveClassAsync(expected.Patterns, options),
+                (true, false) => target.ToHaveClassAsync(expected.Strings, options),
+            };
         }),
 
+        // Strings only, and that is upstream's signature rather than a gap here: a class
+        // list is compared token by token, which a pattern has nothing to say about.
         "to_contain_class" => Assert(name, (arguments, timeout) =>
         {
             var expected = Expected(arguments, "expected");
@@ -244,16 +286,26 @@ internal sealed class PyAssertions : PlaywrightObject
         "to_have_css" => Assert(name, (arguments, timeout) =>
         {
             var property = arguments.String(0, "name");
-            var value = arguments.String(1, "value");
+            var value = Required(arguments, 1, "value");
             arguments.Done(2);
-            return target.ToHaveCSSAsync(property, value, new LocatorAssertionsToHaveCSSOptions { Timeout = timeout });
+
+            var options = new LocatorAssertionsToHaveCSSOptions { Timeout = timeout };
+
+            return value.IsPattern
+                ? target.ToHaveCSSAsync(property, value.Pattern!, options)
+                : target.ToHaveCSSAsync(property, value.Text!, options);
         }),
 
         "to_have_id" => Assert(name, (arguments, timeout) =>
         {
-            var id = arguments.String(0, "id");
+            var id = Required(arguments, 0, "id");
             arguments.Done(1);
-            return target.ToHaveIdAsync(id, new LocatorAssertionsToHaveIdOptions { Timeout = timeout });
+
+            var options = new LocatorAssertionsToHaveIdOptions { Timeout = timeout };
+
+            return id.IsPattern
+                ? target.ToHaveIdAsync(id.Pattern!, options)
+                : target.ToHaveIdAsync(id.Text!, options);
         }),
 
         "to_have_js_property" => Assert(name, (arguments, timeout) =>
@@ -280,7 +332,7 @@ internal sealed class PyAssertions : PlaywrightObject
 
         "to_have_accessible_name" => Assert(name, (arguments, timeout) =>
         {
-            var accessible = arguments.String(0, "name");
+            var accessible = Required(arguments, 0, "name");
             var options = new LocatorAssertionsToHaveAccessibleNameOptions
             {
                 Timeout = timeout,
@@ -288,12 +340,15 @@ internal sealed class PyAssertions : PlaywrightObject
             };
 
             arguments.Done(1);
-            return target.ToHaveAccessibleNameAsync(accessible, options);
+
+            return accessible.IsPattern
+                ? target.ToHaveAccessibleNameAsync(accessible.Pattern!, options)
+                : target.ToHaveAccessibleNameAsync(accessible.Text!, options);
         }),
 
         "to_have_accessible_description" => Assert(name, (arguments, timeout) =>
         {
-            var description = arguments.String(0, "description");
+            var description = Required(arguments, 0, "description");
             var options = new LocatorAssertionsToHaveAccessibleDescriptionOptions
             {
                 Timeout = timeout,
@@ -301,7 +356,10 @@ internal sealed class PyAssertions : PlaywrightObject
             };
 
             arguments.Done(1);
-            return target.ToHaveAccessibleDescriptionAsync(description, options);
+
+            return description.IsPattern
+                ? target.ToHaveAccessibleDescriptionAsync(description.Pattern!, options)
+                : target.ToHaveAccessibleDescriptionAsync(description.Text!, options);
         }),
 
         "to_match_aria_snapshot" => Assert(name, (arguments, timeout) =>
@@ -320,14 +378,19 @@ internal sealed class PyAssertions : PlaywrightObject
     {
         "to_have_title" => Assert(name, (arguments, timeout) =>
         {
-            var title = arguments.String(0, "title_or_reg_exp");
+            var title = Required(arguments, 0, "title_or_reg_exp");
             arguments.Done(1);
-            return target.ToHaveTitleAsync(title, new PageAssertionsToHaveTitleOptions { Timeout = timeout });
+
+            var options = new PageAssertionsToHaveTitleOptions { Timeout = timeout };
+
+            return title.IsPattern
+                ? target.ToHaveTitleAsync(title.Pattern!, options)
+                : target.ToHaveTitleAsync(title.Text!, options);
         }),
 
         "to_have_url" => Assert(name, (arguments, timeout) =>
         {
-            var url = arguments.String(0, "url_or_reg_exp");
+            var url = Required(arguments, 0, "url_or_reg_exp");
             var options = new PageAssertionsToHaveURLOptions
             {
                 Timeout = timeout,
@@ -335,7 +398,10 @@ internal sealed class PyAssertions : PlaywrightObject
             };
 
             arguments.Done(1);
-            return target.ToHaveURLAsync(url, options);
+
+            return url.IsPattern
+                ? target.ToHaveURLAsync(url.Pattern!, options)
+                : target.ToHaveURLAsync(url.Text!, options);
         }),
 
         "to_match_aria_snapshot" => Assert(name, (arguments, timeout) =>
@@ -383,5 +449,14 @@ internal sealed class PyAssertions : PlaywrightObject
 
     private static IReadOnlyList<string> Expected(Arguments arguments, string name) =>
         arguments.Strings(0, name)
+        ?? throw new PyRaise(PyErrors.TypeError($"{arguments.Name}() missing required argument: '{name}'"));
+
+    /// <summary>Matches any attribute value, for <c>to_have_attribute</c> with no value.</summary>
+    private static readonly System.Text.RegularExpressions.Regex AnyValue =
+        new("[\\s\\S]*", System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(1));
+
+    /// <summary>A required <c>str | Pattern</c> argument.</summary>
+    private static Matcher Required(Arguments arguments, int index, string name) =>
+        arguments.Matcher(index, name)
         ?? throw new PyRaise(PyErrors.TypeError($"{arguments.Name}() missing required argument: '{name}'"));
 }

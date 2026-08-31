@@ -327,6 +327,7 @@ not already have.
 | `PythonRunner.ExternalFunctions` | `Func<PyObject[], PyObject>` | the same, for host code that needs no environment |
 | `PythonRunner.Modules` | a `PyObject` | one object shared by every run — for a module with no state |
 | `BashBuilder.WithPlaywright` / `PythonOptions.WithPlaywright` | a `PlaywrightSession` | the optional browser package: registers `playwright` and `playwright.sync_api` over a host-launched browser |
+| `VirtualMachine.WhenRunCompleted` | an `Action` | work for the end of the run, however it ends — for a library holding something that has to be handed back |
 
 Host code written in C# is handed the environment rather than reaching for one:
 `BuiltinContext` on the shell side, `PythonHostContext` on the Python side. Both carry the
@@ -349,6 +350,10 @@ Two invariants show up here, and both are load-bearing:
   be one tenant's state becoming another's. `Libraries` builds a fresh module per run, and a
   library written in Python has module-level state by construction — which is why it is the
   route those get added by.
+- A library holding something that must be handed back registers it with
+  `VirtualMachine.WhenRunCompleted`, not with the program's good manners. The callback runs
+  however the run ended — cleanly, on an uncaught exception, or on a limit reached with no
+  program left to run anything — so a resource is not leaked by a script that forgot.
 
 ## Working rules
 

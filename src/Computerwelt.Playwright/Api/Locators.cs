@@ -16,15 +16,79 @@ namespace Computerwelt.Playwright.Api;
 internal static class Locators
 {
     /// <summary>What <c>locator()</c> and <c>filter()</c> narrow by.</summary>
-    internal readonly record struct Filter(ILocator? Has, ILocator? HasNot, string? HasText, string? HasNotText, bool? Visible);
+    internal readonly record struct Filter(
+        ILocator? Has,
+        ILocator? HasNot,
+        Matcher? HasText,
+        Matcher? HasNotText,
+        bool? Visible);
 
     /// <summary>Reads the four narrowing keywords every locator-producing call accepts.</summary>
     public static Filter FilterOptions(Arguments arguments, bool withVisible = false) => new(
         Locator(arguments.Keyword("has"), arguments.Name, "has"),
         Locator(arguments.Keyword("has_not"), arguments.Name, "has_not"),
-        arguments.String("has_text"),
-        arguments.String("has_not_text"),
+        arguments.Matcher("has_text"),
+        arguments.Matcher("has_not_text"),
         withVisible ? arguments.Bool("visible") : null);
+
+    /// <summary>The string half of a <c>has_text=</c>, or null when a pattern was given.</summary>
+    private static string? AsText(Matcher? matcher) => matcher is { IsPattern: false } m ? m.Text : null;
+
+    /// <summary>The pattern half of a <c>has_text=</c>, or null when a string was given.</summary>
+    private static System.Text.RegularExpressions.Regex? AsPattern(Matcher? matcher) =>
+        matcher is { IsPattern: true } m ? m.Pattern : null;
+
+    /// <summary>
+    /// The same filter, in the options type each owner takes.
+    /// </summary>
+    /// <remarks>
+    /// Four types with identical members and no common base, which is why this is written
+    /// out four times rather than once. Everything with behaviour in it — reading the
+    /// arguments, telling a string from a pattern — happened above.
+    /// </remarks>
+    public static PageLocatorOptions ForPage(Filter filter) => new()
+    {
+        Has = filter.Has,
+        HasNot = filter.HasNot,
+        HasTextString = AsText(filter.HasText),
+        HasTextRegex = AsPattern(filter.HasText),
+        HasNotTextString = AsText(filter.HasNotText),
+        HasNotTextRegex = AsPattern(filter.HasNotText),
+    };
+
+    /// <inheritdoc cref="ForPage"/>
+    public static LocatorLocatorOptions ForLocator(Filter filter) => new()
+    {
+        Has = filter.Has,
+        HasNot = filter.HasNot,
+        HasTextString = AsText(filter.HasText),
+        HasTextRegex = AsPattern(filter.HasText),
+        HasNotTextString = AsText(filter.HasNotText),
+        HasNotTextRegex = AsPattern(filter.HasNotText),
+    };
+
+    /// <inheritdoc cref="ForPage"/>
+    public static FrameLocatorLocatorOptions ForFrame(Filter filter) => new()
+    {
+        Has = filter.Has,
+        HasNot = filter.HasNot,
+        HasTextString = AsText(filter.HasText),
+        HasTextRegex = AsPattern(filter.HasText),
+        HasNotTextString = AsText(filter.HasNotText),
+        HasNotTextRegex = AsPattern(filter.HasNotText),
+    };
+
+    /// <inheritdoc cref="ForPage"/>
+    public static LocatorFilterOptions ForFilter(Filter filter) => new()
+    {
+        Has = filter.Has,
+        HasNot = filter.HasNot,
+        HasTextString = AsText(filter.HasText),
+        HasTextRegex = AsPattern(filter.HasText),
+        HasNotTextString = AsText(filter.HasNotText),
+        HasNotTextRegex = AsPattern(filter.HasNotText),
+        Visible = filter.Visible,
+    };
 
     /// <summary>An optional <c>position=</c>, as a driver point.</summary>
     public static Position? Position(Arguments arguments, string name = "position") =>
@@ -235,8 +299,9 @@ internal static class Locators
     /// <summary>The parsed form of a <c>get_by_*</c> call, before it reaches an owner.</summary>
     internal readonly record struct GetByRequest(
         string Kind,
-        string Text,
+        Matcher Text,
         AriaRole Role,
+        Matcher? Name,
         bool? Exact,
         bool? Checked,
         bool? Disabled,
@@ -246,7 +311,14 @@ internal static class Locators
         bool? Pressed,
         bool? Selected);
 
-    /// <summary>Reads a <c>get_by_*</c> call's arguments.</summary>
+    /// <summary>
+    /// Reads a <c>get_by_*</c> call's arguments.
+    /// </summary>
+    /// <remarks>
+    /// The text a locator is built from is <c>str | Pattern</c> upstream and the two mean
+    /// different things — a string matches loosely and by substring, a pattern matches as
+    /// written — so both are read here and the owner picks the overload.
+    /// </remarks>
     public static GetByRequest Parse(string name, Arguments arguments)
     {
         if (name == "get_by_role")
@@ -254,9 +326,10 @@ internal static class Locators
             var role = arguments.String(0, "role");
             var parsed = new GetByRequest(
                 name,
-                arguments.String("name") ?? string.Empty,
+                default,
                 Enums.Parse<AriaRole>(role, arguments.Name, "role")
                 ?? throw new PyRaise(PyErrors.ValueError($"{arguments.Name}: 'role' is required")),
+                arguments.Matcher("name"),
                 arguments.Bool("exact"),
                 arguments.Bool("checked"),
                 arguments.Bool("disabled"),
@@ -270,11 +343,15 @@ internal static class Locators
             return parsed;
         }
 
-        var text = arguments.String(0, name == "get_by_test_id" ? "test_id" : "text");
+        var label = name == "get_by_test_id" ? "test_id" : "text";
+        var text = arguments.Matcher(0, label)
+            ?? throw new PyRaise(PyErrors.TypeError($"{arguments.Name}() missing required argument: '{label}'"));
+
+        // `get_by_test_id` has no `exact=` upstream: a test id is compared whole either way.
         var exact = name == "get_by_test_id" ? null : arguments.Bool("exact");
 
         arguments.Done(1);
-        return new GetByRequest(name, text, AriaRole.Generic, exact, null, null, null, null, null, null, null);
+        return new GetByRequest(name, text, AriaRole.Generic, null, exact, null, null, null, null, null, null, null);
     }
 
     /// <summary>Applies a parsed <c>get_by_*</c> to a page.</summary>
@@ -286,7 +363,8 @@ internal static class Locators
         {
             "get_by_role" => page.GetByRole(request.Role, new PageGetByRoleOptions
             {
-                NameString = request.Text.Length > 0 ? request.Text : null,
+                NameString = request.Name is { IsPattern: false } named ? named.Text : null,
+                NameRegex = request.Name is { IsPattern: true } pattern ? pattern.Pattern : null,
                 Exact = request.Exact,
                 Checked = request.Checked,
                 Disabled = request.Disabled,
@@ -296,16 +374,34 @@ internal static class Locators
                 Pressed = request.Pressed,
                 Selected = request.Selected,
             }),
-            "get_by_text" => page.GetByText(request.Text, new PageGetByTextOptions { Exact = request.Exact }),
-            "get_by_label" => page.GetByLabel(request.Text, new PageGetByLabelOptions { Exact = request.Exact }),
-            "get_by_placeholder" => page.GetByPlaceholder(request.Text, new PageGetByPlaceholderOptions { Exact = request.Exact }),
-            "get_by_alt_text" => page.GetByAltText(request.Text, new PageGetByAltTextOptions { Exact = request.Exact }),
-            "get_by_title" => page.GetByTitle(request.Text, new PageGetByTitleOptions { Exact = request.Exact }),
-            _ => page.GetByTestId(request.Text),
+
+            "get_by_text" => request.Text.IsPattern
+                ? page.GetByText(request.Text.Pattern!, new PageGetByTextOptions { Exact = request.Exact })
+                : page.GetByText(request.Text.Text!, new PageGetByTextOptions { Exact = request.Exact }),
+
+            "get_by_label" => request.Text.IsPattern
+                ? page.GetByLabel(request.Text.Pattern!, new PageGetByLabelOptions { Exact = request.Exact })
+                : page.GetByLabel(request.Text.Text!, new PageGetByLabelOptions { Exact = request.Exact }),
+
+            "get_by_placeholder" => request.Text.IsPattern
+                ? page.GetByPlaceholder(request.Text.Pattern!, new PageGetByPlaceholderOptions { Exact = request.Exact })
+                : page.GetByPlaceholder(request.Text.Text!, new PageGetByPlaceholderOptions { Exact = request.Exact }),
+
+            "get_by_alt_text" => request.Text.IsPattern
+                ? page.GetByAltText(request.Text.Pattern!, new PageGetByAltTextOptions { Exact = request.Exact })
+                : page.GetByAltText(request.Text.Text!, new PageGetByAltTextOptions { Exact = request.Exact }),
+
+            "get_by_title" => request.Text.IsPattern
+                ? page.GetByTitle(request.Text.Pattern!, new PageGetByTitleOptions { Exact = request.Exact })
+                : page.GetByTitle(request.Text.Text!, new PageGetByTitleOptions { Exact = request.Exact }),
+
+            _ => request.Text.IsPattern
+                ? page.GetByTestId(request.Text.Pattern!)
+                : page.GetByTestId(request.Text.Text!),
         };
     }
 
-    /// <summary>Applies a parsed <c>get_by_*</c> to a locator.</summary>
+    /// <inheritdoc cref="GetBy(string, Arguments, IPage)"/>
     public static ILocator GetBy(string name, Arguments arguments, ILocator locator)
     {
         var request = Parse(name, arguments);
@@ -314,7 +410,8 @@ internal static class Locators
         {
             "get_by_role" => locator.GetByRole(request.Role, new LocatorGetByRoleOptions
             {
-                NameString = request.Text.Length > 0 ? request.Text : null,
+                NameString = request.Name is { IsPattern: false } named ? named.Text : null,
+                NameRegex = request.Name is { IsPattern: true } pattern ? pattern.Pattern : null,
                 Exact = request.Exact,
                 Checked = request.Checked,
                 Disabled = request.Disabled,
@@ -324,16 +421,34 @@ internal static class Locators
                 Pressed = request.Pressed,
                 Selected = request.Selected,
             }),
-            "get_by_text" => locator.GetByText(request.Text, new LocatorGetByTextOptions { Exact = request.Exact }),
-            "get_by_label" => locator.GetByLabel(request.Text, new LocatorGetByLabelOptions { Exact = request.Exact }),
-            "get_by_placeholder" => locator.GetByPlaceholder(request.Text, new LocatorGetByPlaceholderOptions { Exact = request.Exact }),
-            "get_by_alt_text" => locator.GetByAltText(request.Text, new LocatorGetByAltTextOptions { Exact = request.Exact }),
-            "get_by_title" => locator.GetByTitle(request.Text, new LocatorGetByTitleOptions { Exact = request.Exact }),
-            _ => locator.GetByTestId(request.Text),
+
+            "get_by_text" => request.Text.IsPattern
+                ? locator.GetByText(request.Text.Pattern!, new LocatorGetByTextOptions { Exact = request.Exact })
+                : locator.GetByText(request.Text.Text!, new LocatorGetByTextOptions { Exact = request.Exact }),
+
+            "get_by_label" => request.Text.IsPattern
+                ? locator.GetByLabel(request.Text.Pattern!, new LocatorGetByLabelOptions { Exact = request.Exact })
+                : locator.GetByLabel(request.Text.Text!, new LocatorGetByLabelOptions { Exact = request.Exact }),
+
+            "get_by_placeholder" => request.Text.IsPattern
+                ? locator.GetByPlaceholder(request.Text.Pattern!, new LocatorGetByPlaceholderOptions { Exact = request.Exact })
+                : locator.GetByPlaceholder(request.Text.Text!, new LocatorGetByPlaceholderOptions { Exact = request.Exact }),
+
+            "get_by_alt_text" => request.Text.IsPattern
+                ? locator.GetByAltText(request.Text.Pattern!, new LocatorGetByAltTextOptions { Exact = request.Exact })
+                : locator.GetByAltText(request.Text.Text!, new LocatorGetByAltTextOptions { Exact = request.Exact }),
+
+            "get_by_title" => request.Text.IsPattern
+                ? locator.GetByTitle(request.Text.Pattern!, new LocatorGetByTitleOptions { Exact = request.Exact })
+                : locator.GetByTitle(request.Text.Text!, new LocatorGetByTitleOptions { Exact = request.Exact }),
+
+            _ => request.Text.IsPattern
+                ? locator.GetByTestId(request.Text.Pattern!)
+                : locator.GetByTestId(request.Text.Text!),
         };
     }
 
-    /// <summary>Applies a parsed <c>get_by_*</c> to a frame locator.</summary>
+    /// <inheritdoc cref="GetBy(string, Arguments, IPage)"/>
     public static ILocator GetBy(string name, Arguments arguments, IFrameLocator frame)
     {
         var request = Parse(name, arguments);
@@ -342,7 +457,8 @@ internal static class Locators
         {
             "get_by_role" => frame.GetByRole(request.Role, new FrameLocatorGetByRoleOptions
             {
-                NameString = request.Text.Length > 0 ? request.Text : null,
+                NameString = request.Name is { IsPattern: false } named ? named.Text : null,
+                NameRegex = request.Name is { IsPattern: true } pattern ? pattern.Pattern : null,
                 Exact = request.Exact,
                 Checked = request.Checked,
                 Disabled = request.Disabled,
@@ -352,12 +468,30 @@ internal static class Locators
                 Pressed = request.Pressed,
                 Selected = request.Selected,
             }),
-            "get_by_text" => frame.GetByText(request.Text, new FrameLocatorGetByTextOptions { Exact = request.Exact }),
-            "get_by_label" => frame.GetByLabel(request.Text, new FrameLocatorGetByLabelOptions { Exact = request.Exact }),
-            "get_by_placeholder" => frame.GetByPlaceholder(request.Text, new FrameLocatorGetByPlaceholderOptions { Exact = request.Exact }),
-            "get_by_alt_text" => frame.GetByAltText(request.Text, new FrameLocatorGetByAltTextOptions { Exact = request.Exact }),
-            "get_by_title" => frame.GetByTitle(request.Text, new FrameLocatorGetByTitleOptions { Exact = request.Exact }),
-            _ => frame.GetByTestId(request.Text),
+
+            "get_by_text" => request.Text.IsPattern
+                ? frame.GetByText(request.Text.Pattern!, new FrameLocatorGetByTextOptions { Exact = request.Exact })
+                : frame.GetByText(request.Text.Text!, new FrameLocatorGetByTextOptions { Exact = request.Exact }),
+
+            "get_by_label" => request.Text.IsPattern
+                ? frame.GetByLabel(request.Text.Pattern!, new FrameLocatorGetByLabelOptions { Exact = request.Exact })
+                : frame.GetByLabel(request.Text.Text!, new FrameLocatorGetByLabelOptions { Exact = request.Exact }),
+
+            "get_by_placeholder" => request.Text.IsPattern
+                ? frame.GetByPlaceholder(request.Text.Pattern!, new FrameLocatorGetByPlaceholderOptions { Exact = request.Exact })
+                : frame.GetByPlaceholder(request.Text.Text!, new FrameLocatorGetByPlaceholderOptions { Exact = request.Exact }),
+
+            "get_by_alt_text" => request.Text.IsPattern
+                ? frame.GetByAltText(request.Text.Pattern!, new FrameLocatorGetByAltTextOptions { Exact = request.Exact })
+                : frame.GetByAltText(request.Text.Text!, new FrameLocatorGetByAltTextOptions { Exact = request.Exact }),
+
+            "get_by_title" => request.Text.IsPattern
+                ? frame.GetByTitle(request.Text.Pattern!, new FrameLocatorGetByTitleOptions { Exact = request.Exact })
+                : frame.GetByTitle(request.Text.Text!, new FrameLocatorGetByTitleOptions { Exact = request.Exact }),
+
+            _ => request.Text.IsPattern
+                ? frame.GetByTestId(request.Text.Pattern!)
+                : frame.GetByTestId(request.Text.Text!),
         };
     }
 

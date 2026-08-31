@@ -88,6 +88,59 @@ public sealed class VirtualMachine
     /// <summary>Module names currently being resolved, so a cycle is reported rather than run.</summary>
     private readonly HashSet<string> _resolving = new(StringComparer.Ordinal);
 
+    /// <summary>Work a host library asked to have done when the run ends.</summary>
+    private readonly List<Action> _completions = [];
+
+    /// <summary>
+    /// Registers work to do when this run ends, however it ends.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A host library is built per run and is otherwise never told the run is over, which is
+    /// fine for a library that only computes and wrong for one holding something that has to
+    /// be given back — a browser context, a handle, a lease. Without this the only thing
+    /// that releases such a resource is the program remembering to, and a program that
+    /// forgot is exactly the case the resource needs protecting from.
+    /// </para>
+    /// <para>
+    /// Callbacks run after the program has finished and after an uncaught exception has been
+    /// turned into a result, so nothing they do can change what the run reported.
+    /// </para>
+    /// </remarks>
+    public void WhenRunCompleted(Action work)
+    {
+        ArgumentNullException.ThrowIfNull(work);
+
+        _completions.Add(work);
+    }
+
+    /// <summary>
+    /// Runs the registered completions. Called once, by whoever started the run.
+    /// </summary>
+    /// <remarks>
+    /// A callback that throws is swallowed, and this is the one place in the port where that
+    /// is right: the program has already ended and its result is already decided, so there
+    /// is no one left to report to — and a failure to hand back a resource must not turn an
+    /// orderly ending into a crash. Each callback is attempted even if an earlier one threw,
+    /// because one library's problem is not another's.
+    /// </remarks>
+    public void CompleteRun()
+    {
+        foreach (var work in _completions)
+        {
+            try
+            {
+                work();
+            }
+            catch (Exception)
+            {
+                // Deliberate: see the remarks above.
+            }
+        }
+
+        _completions.Clear();
+    }
+
     /// <summary>Frames currently executing, innermost last. Used to build tracebacks.</summary>
     internal List<Frame> CallStack { get; } = [];
 
@@ -198,8 +251,69 @@ public sealed class VirtualMachine
             }
 
             default:
-                throw new PyRaise(PyErrors.TypeError($"'{callable.TypeName}' object is not callable"));
+                return CallThroughDunder(callable, arguments, keywords);
         }
+    }
+
+    /// <summary>
+    /// How far a chain of <c>__call__</c> attributes is followed before it is called a
+    /// cycle.
+    /// </summary>
+    /// <remarks>
+    /// Two objects whose <c>__call__</c> is the other would otherwise recurse until the
+    /// host's stack ran out, which is a crash rather than an error a program can catch.
+    /// Nothing legitimate needs more than a hop or two.
+    /// </remarks>
+    private const int MaxCallableChain = 8;
+
+    /// <summary>
+    /// Calls an object through its <c>__call__</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Upstream does not dispatch this dunder — <c>.reference/monty/limitations/classes.md</c>
+    /// lists it among the protocols user-defined instances do not get — so this is an
+    /// addition rather than a port, covered by <c>tests/monty-extensions/class__call.py</c>.
+    /// It contradicts nothing upstream pins: an instance whose class has no <c>__call__</c>
+    /// is still not callable, with the same message.
+    /// </para>
+    /// <para>
+    /// It is what lets a host library expose something that is both callable and a namespace,
+    /// which several real Python APIs are, and it costs one attribute lookup on a path that
+    /// was already about to raise.
+    /// </para>
+    /// </remarks>
+    private PyObject CallThroughDunder(PyObject callable, PyObject[] arguments, PyDict? keywords)
+    {
+        var target = callable;
+
+        // A `__call__` may itself be an object carrying one. The chain is followed in a
+        // bounded loop rather than by recursing back into Call, so a cycle is reported
+        // instead of exhausting the host's stack.
+        for (var hop = 0; hop < MaxCallableChain; hop++)
+        {
+            if (target.GetAttribute("__call__") is not { } implementation
+                || ReferenceEquals(implementation, target))
+            {
+                break;
+            }
+
+            // Everything the switch above knows how to call; anything else is another
+            // object that may carry a `__call__` of its own.
+            if (implementation is PyCallable or PyExceptionType)
+            {
+                return Call(implementation, arguments, keywords);
+            }
+
+            target = implementation;
+        }
+
+        // The message names whatever the chain ended on, which for an object with no
+        // `__call__` at all is the object the program called. That is the rule the rest of
+        // the port already follows for a dunder that is present but is not a function —
+        // `tests/monty-spec/class__contains.py` pins the same shape for `__contains__` —
+        // and it is what CPython reports.
+        throw new PyRaise(PyErrors.TypeError($"'{target.TypeName}' object is not callable"));
     }
 
     private PyObject Instantiate(PyClass type, PyObject[] arguments, PyDict? keywords)

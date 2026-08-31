@@ -74,7 +74,7 @@ written rather than by luck:
 | No ambient network | `AllowedHosts` is empty by default, so a sandbox nobody configured reaches nothing. The check runs on `page.goto` for the error message **and** as a request filter on every context — so a redirect, an iframe, an image or a `fetch()` the page performs cannot reach somewhere the script could not have navigated to itself. `file:` is not an allowed scheme, with or without a wildcard. |
 | No ambient filesystem | Every path in this API is a virtual one. A screenshot, a PDF and a storage state come back to this process as bytes and go out through the run's `IFileSystem`; an upload or an init script is read from it. The driver is never given a path it could open, so a traversal has nothing to reach. `record_video_dir`, `record_har_path` and `downloads_path` are refused. |
 | Deterministic limits | `MaxContexts`, `MaxPagesPerContext` and `MaxTransferBytes` are enforced and raise when reached. `DefaultTimeout` is a ceiling, not a default: a script may wait for less and never for more, including through `set_default_timeout` and `wait_for_timeout`. |
-| Multi-tenant isolation | One browser, one **context** per script — which is the unit Playwright isolates cookies, storage and cache on. Two tenants over one session share nothing they can observe. `browser.close()` closes what the calling script opened and leaves the browser running for everyone else. |
+| Multi-tenant isolation | One browser, one **context** per script — which is the unit Playwright isolates cookies, storage and cache on. Two tenants over one session share nothing they can observe. `browser.close()` closes what the calling script opened and leaves the browser running for everyone else, and the run's contexts go back at the end of the run whether the script asked or not — a clean finish, an uncaught exception and a limit reached all release them. |
 | No host exception reaches a script | Every driver call is translated: a Playwright failure becomes `playwright.sync_api.Error`, a wait that ran out becomes `TimeoutError`, and anything else becomes `Error` with the type name kept in the message. Neither class is a builtin, so an unregistered sandbox cannot even name them. |
 
 ## What is implemented
@@ -89,6 +89,21 @@ Keyword arguments are read by name and **anything left over is a `TypeError`**, 
 gives you. That is deliberate: silently dropping `wait_until="networkidle"` would leave a
 program believing it waited.
 
+Arguments upstream types as `str | Pattern` take either, and the distinction is kept because
+the two mean different things — a string matches loosely, case-insensitively and by
+substring, a pattern matches as written:
+
+```python
+import re
+
+page.get_by_role("button", name=re.compile(r"^Save"))
+page.locator("p").filter(has_text=re.compile(r"\d+"))
+expect(page).to_have_url(re.compile(r"^https://example\.com/orders/\d+$"))
+```
+
+A sequence mixing strings and patterns is refused by name: the driver has an overload for a
+sequence of each and none for a mixture, and flattening one would pick a meaning silently.
+
 ### What is not, and why
 
 | Absent | Why |
@@ -99,6 +114,7 @@ program believing it waited.
 | `expose_function`, `expose_binding`, `add_locator_handler` | The same reason as events: they call back from the browser's thread. |
 | `launch_persistent_context`, `connect`, `connect_over_cdp` | A profile on the host's disk, and a browser the host did not launch. |
 | `expect.set_options(...)` | The driver holds that default in a process-wide static, so one script setting it would change another tenant's assertions. Per-call `timeout=` does the same job for one caller. |
+| A callable where upstream accepts one — `wait_for_url(lambda url: …)` | It would have to run on the driver's thread while the interpreter is blocked, which is the same obstacle the event API hits. A string or a pattern covers it. |
 | Frames, workers, tracing, CDP | Not modelled. `page.frame_locator(selector)` covers reaching into an `iframe`. |
 
 Each of these reports what was asked for and why it is unavailable, rather than being
@@ -106,10 +122,12 @@ missing and looking like a typo.
 
 ## Testing it
 
-`tests/Computerwelt.Playwright.Tests/` has two halves. `NavigationPolicyTests` covers the
+`tests/Computerwelt.Playwright.Tests/` has three parts. `NavigationPolicyTests` covers the
 security boundary with no browser at all. `ScenarioTests` is a corpus of Python programs run
 through the shell's `python` command against a real Chromium — written as fixtures, because
 the thing under test is a Python API and the test should be the Python a caller would write.
+`LifetimeTests` covers what happens to a context when the script that opened it stops caring:
+no `close()`, an uncaught exception, a limit reached.
 
 No scenario reaches the network: the pages are `set_content` and `data:` URLs, and the one
 that names a real host is asserting that it is refused. The fixture installs a browser with

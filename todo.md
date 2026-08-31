@@ -30,13 +30,14 @@ corpus does not reach. No host exception escapes to a script.
 `tests/Computerwelt.AgentTests/` — 153 covering the shell and Python operations a caller
 actually performs, plus upstream's 57 `python` command cases.
 
-**Extensions:** 11 fixtures in `tests/monty-extensions/` cover behaviour upstream does not
+**Extensions:** 12 fixtures in `tests/monty-extensions/` cover behaviour upstream does not
 have. They are kept apart from upstream's corpus deliberately — see below.
 
 **Current state — browser:** `Computerwelt.Playwright` is a separate, optional package that
 makes Playwright's Python `sync_api` importable inside the sandbox over Microsoft's .NET
-driver. 34 tests: the navigation policy on its own, and 21 browser scenarios written as
-Python and run through the shell's `python` command. See "The browser add-on" below.
+driver. 40 tests: the navigation policy on its own, 22 browser scenarios written as Python
+and run through the shell's `python` command, and 5 covering what happens to a context when
+the script that opened it stops caring. See "The browser add-on" below.
 
 The one remaining fixture is a documented divergence, not a gap — see below.
 
@@ -89,6 +90,7 @@ off, which is the check that the port still stands on upstream's corpus alone.
 | `os.walk(..., max_depth=N)` | not CPython's either — a bound the caller asks for, which ends the walk cleanly | `os__walk_depth.py` |
 | `io` | `io.open`, `StringIO`, `BytesIO`, `UnsupportedOperation` | `io__module.py` |
 | `sys.argv`, `sys.exit`, `input`, `sys.stdin` | the host-facing four from the previous round | `sys__*.py` |
+| `__call__` | an instance whose class defines it is callable, and goes wherever a function goes. Upstream lists the dunder among the protocols it does not dispatch (`limitations/classes.md`) | `class__call.py` |
 
 One engine sits behind `fnmatch`, `glob` and `Path.glob`, because CPython's three agree on
 what a pattern means and differ only in what they match it against. `os.walk` is iterative
@@ -205,19 +207,67 @@ lesson `Computerwelt.AgentTests` keeps teaching: the failures live where the pie
 | `expect.set_options(...)` | The driver holds that default in a process-wide static, so one script setting it would change another tenant's assertions. Per-call `timeout=` does the same job for one caller |
 | Frames, workers, tracing, CDP | Not modelled. `page.frame_locator(selector)` covers reaching into an `iframe` |
 
+### Three things the first round left open, and what closing them took
+
+**A run-end hook.** A script that never called `p.stop()` and never used
+`with sync_playwright()` left its contexts open until the session was disposed — one leaked
+context per careless run, on a browser every tenant shares. `VirtualMachine.WhenRunCompleted`
+now lets a library register work for the end of the run, and `PythonRunner.Run` calls it in a
+`finally`, so it happens however the run ended: a clean finish, an uncaught exception, or a
+limit reached with no program left to run anything. The Playwright library registers one
+callback per run, which closes whatever that run still holds.
+
+The hook is general and belongs to the Python half rather than to this package: a library
+holding a handle, a lease or a connection has the same problem. A callback that throws is
+swallowed, and this is the one place in the port where that is right — the program has ended
+and its result is decided, so there is nobody left to report to, and a failure to hand a
+resource back must not turn an orderly ending into a crash. `RunCompletionTests` covers all
+five endings; `LifetimeTests` covers the browser case, and each of its three release tests
+fails if the callback is not registered.
+
+**`__call__`.** `VirtualMachine.Call` had no arm for it, so an object could not be made
+callable in either language. It now follows the dunder — for a host object and for a
+user-defined instance alike — which upstream does not do:
+`.reference/monty/limitations/classes.md` lists `__call__` among the protocols a user
+instance does not get, so this is an addition and lives in
+`tests/monty-extensions/class__call.py`. It contradicts nothing upstream pins: an instance
+whose class has no `__call__` is still not callable with the same message, which
+`tests/monty-spec/class__type_errors.py` asserts.
+
+The chain is followed in a bounded loop rather than by recursing back into `Call`. Two
+objects whose `__call__` is the other would otherwise spend the host's stack on a shape the
+program chose, which is a crash rather than an error a program can catch. When the chain ends
+on something that is not callable the message names *that* — `'int' object is not callable`
+for `__call__ = 3` — which is both CPython's answer and the rule the port already follows for
+a non-callable `__contains__`.
+
+`expect` stays a plain function despite this, but now for the reason that actually justifies
+it: `expect.set_options` sets a process-wide static in the driver, so one tenant calling it
+would change another's assertions.
+
+**Regular expressions.** `get_by_text`, `filter(has_text=)`, `to_have_text`, `to_have_url`
+and a dozen others are `str | Pattern` upstream, and the two mean different things — a string
+matches loosely, case-insensitively and by substring; a pattern matches as written. Reading
+only the string form would have silently turned one into the other. `Matcher` now reads
+either, and `ReModule.PyPattern` exposes its compiled .NET form, so the translation from
+Python's regular-expression syntax happens once, in the module that owns it, rather than
+again here.
+
+Two edges worth recording. A sequence mixing strings and patterns is refused by name, because
+the driver has an overload for a sequence of each and none for a mixture — flattening it
+would have picked one silently. And `to_have_attribute(name)` with no value asserts that the
+attribute is *present*, which the driver cannot express directly, so it is sent as a pattern
+matching any value; an absent attribute has no value to match and still fails.
+
 ### Still open
 
-- **A run-end hook.** A script that never calls `p.stop()` and never uses
-  `with sync_playwright()` leaves its contexts open until the session is disposed. The caps
-  bound it and the idiomatic form closes it, but a hook on the end of a `PythonRunner.Run`
-  would let the package close them itself.
-- **`__call__` on a host object.** `VirtualMachine.Call` has no arm for it, which is why
-  `expect` is a plain function rather than an object with `set_options` on it. Adding one
-  would also give user-defined classes a callable protocol — worth doing, but it is a change
-  to the interpreter rather than to this package.
-- **Regular expressions where upstream accepts one.** `get_by_text`, `to_have_text` and
-  friends take `str | Pattern` upstream; only `str` is read here. A pattern would need the
-  `re` module's compiled object translated into a .NET `Regex`.
+- **A callable protocol for the remaining dunders.** `__call__` is now dispatched;
+  `__getitem__`, `__setitem__` and the arithmetic dunders on user classes are not, and
+  upstream does not dispatch them either. Adding one is the same shape of work as this was.
+- **A predicate where upstream accepts one.** `page.wait_for_url` and `page.frame` take
+  `str | Pattern | Callable[[str], bool]`; the first two are read. A callable would have to
+  run on the driver's thread while the interpreter is blocked, which is the same obstacle
+  the event API hits.
 
 ## Known divergences
 
@@ -713,6 +763,7 @@ filesystem, with no process, no host disk and no network of its own.
 | `PythonRunner.Libraries`, `PythonOptions.Libraries` | `PythonLibrary` | `src/Computerwelt.Emulation.Python/Extensibility/` |
 | `PythonRunner.HostFunctions`, `PythonOptions.HostFunctions` | `Func<PythonHostContext, PyObject[], PyObject>` | `.../Extensibility/PythonHostContext.cs` |
 | `WithPlaywright` | a `PlaywrightSession` | `src/Computerwelt.Playwright/PlaywrightExtensions.cs` |
+| `VirtualMachine.WhenRunCompleted` | an `Action` | `src/Computerwelt.Emulation.Python/Runtime/VirtualMachine.cs` |
 
 ### The four decisions worth recording
 
@@ -752,6 +803,6 @@ inside a script: host code is registered by the host, before the session is buil
 | `Computerwelt.Emulation.Bash.Tests/ExtensibilityTests` | 22 — dispatch, override, withholding, resolver ordering, budget charging, the context helpers, two sessions sharing one command |
 | `Computerwelt.Emulation.Python.Tests/ExtensibilityTests` | 27 — host and source libraries, host functions over a filesystem, per-run freshness, laziness, cycles, a library that will not compile, limits |
 | `Computerwelt.Tests/ExtensibilityTests` | 12 — a host command, a host library and a host function over one filesystem |
-| `Computerwelt.Playwright.Tests` | 34 — the navigation policy on its own, and 21 browser scenarios written as Python |
+| `Computerwelt.Playwright.Tests` | 40 — the navigation policy on its own, 22 browser scenarios written as Python, and 5 on what happens to a context when the script that opened it stops caring |
 
 `samples/Computerwelt.Sample.Extensibility/` is every point in one runnable program.
