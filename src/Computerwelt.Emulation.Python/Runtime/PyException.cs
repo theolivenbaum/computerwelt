@@ -163,6 +163,25 @@ public sealed class PyExceptionType : PyObject
         return false;
     }
 
+    /// <summary>
+    /// Defines an exception class for a host library.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately <i>not</i> added to <see cref="Registry"/>, and so not a builtin name: a
+    /// program reaches it only through the module that exposes it, exactly as it reaches
+    /// anything else a host registered. <c>except</c> matching, <c>raise</c> and
+    /// <c>isinstance</c> all work on it because they ask this class about its bases rather
+    /// than about its name.
+    /// </remarks>
+    /// <param name="name">The class name, as a traceback and <c>__name__</c> report it.</param>
+    /// <param name="baseType">What it derives from. Defaults to <c>Exception</c>.</param>
+    public static PyExceptionType DefineHostException(string name, PyExceptionType? baseType = null)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+
+        return new PyExceptionType(name, baseType ?? Exception);
+    }
+
     private static PyExceptionType Define(string name, PyExceptionType? baseType, PyExceptionType? secondBase = null)
     {
         var type = new PyExceptionType(name, baseType, secondBase);

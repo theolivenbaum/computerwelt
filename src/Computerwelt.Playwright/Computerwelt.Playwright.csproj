@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Computerwelt.Playwright</RootNamespace>
+    <AssemblyName>Computerwelt.Playwright</AssemblyName>
+    <PackageId>Computerwelt.Playwright</PackageId>
+    <Description>Playwright's Python sync API inside the Computerwelt sandbox, over the .NET Playwright driver.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Computerwelt/Computerwelt.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Playwright" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Computerwelt.Playwright.Tests" />
+  </ItemGroup>
+
+</Project>

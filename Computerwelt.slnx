@@ -5,6 +5,7 @@
     <Project Path="src/Computerwelt/Computerwelt.csproj" />
     <Project Path="src/Computerwelt.Emulation.Python.Cli/Computerwelt.Emulation.Python.Cli.csproj" />
     <Project Path="src/Computerwelt.Emulation.Python/Computerwelt.Emulation.Python.csproj" />
+    <Project Path="src/Computerwelt.Playwright/Computerwelt.Playwright.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/Computerwelt.Sample.Extensibility/Computerwelt.Sample.Extensibility.csproj" />
@@ -19,5 +20,6 @@
     <Project Path="tests/Computerwelt.Tests/Computerwelt.Tests.csproj" />
     <Project Path="tests/Computerwelt.Emulation.Python.SpecTests/Computerwelt.Emulation.Python.SpecTests.csproj" />
     <Project Path="tests/Computerwelt.Emulation.Python.Tests/Computerwelt.Emulation.Python.Tests.csproj" />
+    <Project Path="tests/Computerwelt.Playwright.Tests/Computerwelt.Playwright.Tests.csproj" />
   </Folder>
 </Solution>

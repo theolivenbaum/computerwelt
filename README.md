@@ -47,6 +47,7 @@ await bash.ExecAsync("""
 | `Computerwelt` | both halves, joined over one virtual filesystem |
 | `Computerwelt.Emulation.Bash` | the shell on its own |
 | `Computerwelt.Emulation.Python` | the Python interpreter on its own |
+| `Computerwelt.Playwright` | optional: Playwright's Python `sync_api` over the .NET driver |
 
 Each project's root namespace is its package name, so a type's namespace says which package
 it ships in.
@@ -154,10 +155,57 @@ is all four points in one runnable program:
 dotnet run --project samples/Computerwelt.Sample.Extensibility
 ```
 
+## Driving a browser
+
+`Computerwelt.Playwright` is an optional package that makes Playwright's **Python
+`sync_api`** importable inside the sandbox, backed by Microsoft's .NET Playwright bindings.
+A script writes exactly what it would write anywhere else:
+
+```python
+from playwright.sync_api import sync_playwright, expect
+
+with sync_playwright() as p:
+    page = p.chromium.launch().new_page()
+    page.goto("https://example.com/")
+
+    expect(page.get_by_role("heading")).to_have_text("Example Domain")
+    page.screenshot(path="/report/home.png")
+```
+
+…and `/report/home.png` is a file in the *virtual* filesystem, which the shell around the
+script can `ls`, `cat` and pipe. Nothing reached the host's disk.
+
+```csharp
+await PlaywrightBrowsers.InstallAsync([PlaywrightBrowser.Chromium]);   // once, at start-up
+
+await using var session = await PlaywrightSession.CreateAsync(new PlaywrightOptions
+{
+    Browsers = [PlaywrightBrowser.Chromium],
+    AllowedHosts = ["*.example.com", "localhost:8080"],
+});
+
+var bash = Bash.CreateBuilder().WithPlaywright(session).Build();
+```
+
+The browser is a process, and this repository's first rule is that the sandbox spawns none.
+The rule is not weakened but moved: the **host** starts the browser, before any script runs,
+and `p.chromium.launch()` hands back a handle to what is already running rather than
+starting anything — a launch option a script passes is refused by name rather than ignored.
+Everything else survives intact, and by construction: `AllowedHosts` is empty by default and
+enforced as a request filter on every context (so a redirect, an iframe or a `fetch()` is
+checked too, not only the navigation a script typed); every path in the API is a virtual
+one; contexts, pages and transfers are capped; a context per script is what keeps two
+tenants apart; and no driver exception reaches a program untranslated.
+
+[`src/Computerwelt.Playwright/README.md`](src/Computerwelt.Playwright/README.md) has the
+full mapping, the caps, and the list of what is deliberately absent and why.
+
 ## What "sandboxed" means here
 
 - **No process spawning.** Every command is a managed implementation. There is no `PATH`
-  lookup, no `fork`, no `exec`.
+  lookup, no `fork`, no `exec`. The one exception is the optional
+  `Computerwelt.Playwright` package, where the *host* starts a browser before any script
+  runs — a script still cannot start anything.
 - **No ambient filesystem.** All I/O goes through `IFileSystem`; the default backend is an
   empty in-memory tree with a byte and file-count quota.
 - **No ambient network.** HTTP is denied unless a host configures an allowlist.
@@ -177,12 +225,14 @@ behaves identically on Linux, macOS and Windows.
 | `src/Computerwelt.Emulation.Python/` | the Python library |
 | `src/Computerwelt/` | the two joined: `python` as a shell command over one filesystem |
 | `src/Computerwelt.Emulation.Python.Cli/` | a Python-only runner |
+| `src/Computerwelt.Playwright/` | optional: Playwright's Python `sync_api` over the .NET driver |
 | `tests/Computerwelt.Emulation.Python.Tests/` | Python unit tests |
 | `tests/Computerwelt.Emulation.Python.SpecTests/` | Python conformance runner |
 | `tests/Computerwelt.Tests/` | integration: both interpreters over one filesystem |
 | `tests/Computerwelt.AgentTests/` | the operations a caller performs, end to end, plus upstream's `python` command corpus |
 | `tests/Computerwelt.Emulation.Bash.Tests/` | shell unit tests |
 | `tests/Computerwelt.Emulation.Bash.SpecTests/` | shell conformance runner |
+| `tests/Computerwelt.Playwright.Tests/` | the navigation policy, and browser scenarios written as Python |
 | `tests/spec/` | 2,521 golden shell cases carried over from bashkit |
 | `tests/monty-spec/` | 568 Python fixtures carried over from monty |
 | `tests/monty-extensions/` | fixtures for behaviour monty does **not** have, kept apart on purpose |
@@ -231,6 +281,7 @@ committed anywhere in the repository.
 | python | **557 / 558** | parser, bytecode compiler, VM, types, builtins, the stdlib subset, dunders |
 | joined | **210 / 210** | 153 agent-operation tests plus upstream's 57 `python` command cases |
 | extensions | **11 / 11** | fixtures for what this port adds beyond monty |
+| playwright | **34 / 34** | the navigation policy, and 21 browser scenarios written as Python |
 
 The one Python fixture that does not pass asserts that a temporary's `id()` is handed to
 the next object of the same shape — an artifact of upstream's slot-recycling heap. Object
