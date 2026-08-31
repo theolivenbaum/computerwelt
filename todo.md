@@ -33,6 +33,11 @@ actually performs, plus upstream's 57 `python` command cases.
 **Extensions:** 11 fixtures in `tests/monty-extensions/` cover behaviour upstream does not
 have. They are kept apart from upstream's corpus deliberately — see below.
 
+**Current state — browser:** `Computerwelt.Playwright` is a separate, optional package that
+makes Playwright's Python `sync_api` importable inside the sandbox over Microsoft's .NET
+driver. 34 tests: the navigation policy on its own, and 21 browser scenarios written as
+Python and run through the shell's `python` command. See "The browser add-on" below.
+
 The one remaining fixture is a documented divergence, not a gap — see below.
 
 | suite | passing |
@@ -118,6 +123,101 @@ Recorded, not fixed, because upstream defines the surface and this port follows 
 |---|---|
 | `open(..., newline='')` | Refused, though nothing here translates line endings and it would describe what already happens. `tests/monty-spec/open__fs.py` pins the refusal; binary mode is the way to ask for exact bytes |
 | `shutil`, `argparse`, `textwrap`, `difflib`, `tempfile`, `csv`, `hashlib`, `base64`, `string`, `functools`, … | Not ported. `StandardLibrarySurfaceTests` lists the set in both directions, so adding one is a deliberate edit rather than a silent widening |
+
+## The browser add-on  (`src/Computerwelt.Playwright/`)
+
+A separate package, so a consumer who does not want a browser does not get one, and the
+`Computerwelt` package's dependency graph is unchanged. The specification is
+[playwright-python](https://github.com/microsoft/playwright-python)'s `sync_api` — read the
+same way the Rust trees are read — and the implementation is Microsoft's .NET
+`Microsoft.Playwright` driver. The mapping is method by method; the interesting part is
+everything around it.
+
+### Six decisions worth recording
+
+**The host launches the browser; the script gets a handle.** This is the whole answer to
+"how does a sandbox that spawns no process drive a browser". `PlaywrightSession` starts the
+driver and the browser in host code, before any script is parsed. Inside the sandbox
+`p.chromium.launch()` returns a view onto what is already running, and a launch option a
+script passes — `headless`, `args`, `executable_path`, `proxy` — is **refused by name**.
+Ignoring it would have been easier and would have left a script believing it had asked for
+something. A browser type the host did not list is not launchable at all.
+
+**The allowlist is enforced where the requests are, not where the script is.** Checking
+`page.goto` only would be theatre: a page redirects, loads images, embeds iframes and calls
+`fetch` on its own behalf, and none of that goes through `goto`. So every context the
+sandbox opens carries a `RouteAsync("**/*")` filter that aborts anything
+`PlaywrightOptions.AllowedHosts` does not allow. `goto` is *also* checked, purely so the
+error names the URL the script typed. The default is empty — nothing reachable — and `file:`
+is not an allowed scheme with or without a wildcard, because it would hand the browser the
+host's disk.
+
+**Every path is a virtual path.** Playwright will happily write a screenshot, a PDF or a
+storage state to a host path, and read an upload from one; it is never asked to. The bytes
+come back to this process and go out through the run's `IFileSystem`, and an upload is sent
+as a `FilePayload` the sandbox read. That costs a copy and buys the property that a path
+traversal in a script has nothing to reach. `record_video_dir`, `record_har_path` and
+`downloads_path` are refused rather than redirected, because there is nowhere honest to put
+them.
+
+**A context per script is the isolation unit.** Playwright isolates cookies, storage and
+cache per *context*, not per browser — so one browser shared by every tenant, with a context
+per run, is both the cheap arrangement and the correct one. `browser.close()` therefore
+closes what the calling script opened and leaves the browser running for everyone else,
+which is the one place this port deliberately does less than upstream. `MaxContexts` and
+`MaxPagesPerContext` bound what a script that never closes anything can accumulate.
+
+**Unknown keywords are errors.** The upstream API is almost all keyword arguments, and every
+method here names the ones it understands; anything left over is a `TypeError`, as CPython
+gives you. Silently dropping `wait_until='networkidle'` would leave a program believing it
+waited. The one exception is `no_wait_after`, which the driver itself has turned into a
+no-op and which upstream still accepts.
+
+**The translation is total.** The first version matched `PlaywrightException` and let
+anything else through, and the browser scenarios found the hole immediately: the .NET
+driver raises the framework's own `System.TimeoutException` for a wait that ran out, so a
+timeout escaped into a script as a host exception it could neither catch nor print. Now
+anything that is not already a `PyRaise` becomes `playwright.sync_api.Error`, with the
+exception's type name kept in the message so a genuine host bug is still identifiable rather
+than disguised as a browser failure. A wait that ran out becomes `TimeoutError`, which
+derives from `Error` as upstream's does. Neither class is in `PyExceptionType.Registry`, so
+an unregistered sandbox cannot even name them — which is why `DefineHostException` exists
+alongside the built-in set.
+
+### What it found in the rest of the port
+
+| Found | Was | Now |
+|---|---|---|
+| `open(path, 'rb')` on a file with any byte that is not valid UTF-8 | The file object held its content as a decoded `string`, so a binary read round-tripped through UTF-8: every invalid byte became U+FFFD and the length changed. A screenshot written and read back was not the screenshot. | `read`, `readline`, `readlines`, iteration, `seek(…, 2)` and `writelines` work on bytes when the mode is binary. Covered by `BinaryFileTests`, which uses a byte-backed filesystem — the string-backed one the other tests use could not have caught this |
+
+That defect had been invisible to both corpora, which read and write text. It is the same
+lesson `Computerwelt.AgentTests` keeps teaching: the failures live where the pieces meet.
+
+### Deliberately absent
+
+| Absent | Why |
+|---|---|
+| `playwright.async_api` | The interpreter runs a program to completion synchronously; there is no event loop to await on. The import fails with a sentence saying so, rather than being missing |
+| `page.on(...)`, `expect_event`, `wait_for_event` | Nothing can call into the VM while a script is blocked in it. The pull-based accessors the driver records — `console_messages()`, `requests()`, `page_errors()` — do the same job in a shape a synchronous interpreter can honour |
+| `page.route(...)`, `context.route(...)` | Request filtering is the host's, and it is already installed; a script-installed handler would sit in front of it |
+| `expose_function`, `expose_binding`, `add_locator_handler` | The same reason as events: they call back from the browser's thread |
+| `launch_persistent_context`, `connect`, `connect_over_cdp` | A profile on the host's disk, and a browser the host did not launch |
+| `expect.set_options(...)` | The driver holds that default in a process-wide static, so one script setting it would change another tenant's assertions. Per-call `timeout=` does the same job for one caller |
+| Frames, workers, tracing, CDP | Not modelled. `page.frame_locator(selector)` covers reaching into an `iframe` |
+
+### Still open
+
+- **A run-end hook.** A script that never calls `p.stop()` and never uses
+  `with sync_playwright()` leaves its contexts open until the session is disposed. The caps
+  bound it and the idiomatic form closes it, but a hook on the end of a `PythonRunner.Run`
+  would let the package close them itself.
+- **`__call__` on a host object.** `VirtualMachine.Call` has no arm for it, which is why
+  `expect` is a plain function rather than an object with `set_options` on it. Adding one
+  would also give user-defined classes a callable protocol — worth doing, but it is a change
+  to the interpreter rather than to this package.
+- **Regular expressions where upstream accepts one.** `get_by_text`, `to_have_text` and
+  friends take `str | Pattern` upstream; only `str` is read here. A pattern would need the
+  `re` module's compiled object translated into a .NET `Regex`.
 
 ## Known divergences
 
@@ -612,6 +712,7 @@ filesystem, with no process, no host disk and no network of its own.
 | `WithoutBuiltin` | a name | `src/Computerwelt.Emulation.Bash/BashBuilder.cs` |
 | `PythonRunner.Libraries`, `PythonOptions.Libraries` | `PythonLibrary` | `src/Computerwelt.Emulation.Python/Extensibility/` |
 | `PythonRunner.HostFunctions`, `PythonOptions.HostFunctions` | `Func<PythonHostContext, PyObject[], PyObject>` | `.../Extensibility/PythonHostContext.cs` |
+| `WithPlaywright` | a `PlaywrightSession` | `src/Computerwelt.Playwright/PlaywrightExtensions.cs` |
 
 ### The four decisions worth recording
 
@@ -651,5 +752,6 @@ inside a script: host code is registered by the host, before the session is buil
 | `Computerwelt.Emulation.Bash.Tests/ExtensibilityTests` | 22 — dispatch, override, withholding, resolver ordering, budget charging, the context helpers, two sessions sharing one command |
 | `Computerwelt.Emulation.Python.Tests/ExtensibilityTests` | 27 — host and source libraries, host functions over a filesystem, per-run freshness, laziness, cycles, a library that will not compile, limits |
 | `Computerwelt.Tests/ExtensibilityTests` | 12 — a host command, a host library and a host function over one filesystem |
+| `Computerwelt.Playwright.Tests` | 34 — the navigation policy on its own, and 21 browser scenarios written as Python |
 
 `samples/Computerwelt.Sample.Extensibility/` is every point in one runnable program.

@@ -29,11 +29,20 @@ Bashkit's value is its security posture. The port must preserve all of it:
 
 1. **No process spawning.** Never `Process.Start`, never `fork`/`exec`. Every command is a
    managed implementation. A "builtin" that shells out is a bug, not a shortcut.
+   The one exception is the optional `Computerwelt.Playwright` package, and it is an
+   exception to *where* the rule applies rather than to the rule: the **host** launches a
+   browser, in host code, before any script runs, and `p.chromium.launch()` inside the
+   sandbox hands back a handle to it. A script still cannot start a process, and a launch
+   option a script passes is refused by name rather than honoured. Nothing outside that
+   package may start anything.
 2. **No ambient filesystem access.** All file I/O goes through `IFileSystem`. Never call
    `System.IO.File` / `Directory` outside the `RealFileSystem` backend. A failure crossing
    into Python is translated at the boundary: a `ShellException` reaching a sandboxed
    program is a host exception leaving the sandbox, not an error the program can catch.
-3. **No ambient network access.** HTTP is denied unless an allowlist is configured.
+3. **No ambient network access.** HTTP is denied unless an allowlist is configured. A
+   browser widens that surface rather than changing the rule, because a page fetches on its
+   own behalf: `PlaywrightOptions.AllowedHosts` is empty by default and enforced as a
+   request filter on every browser context, not only on the navigation a script typed.
 4. **Deterministic resource limits.** Command count, loop iterations, function depth,
    output size, filesystem size, directory depth, parser fuel, wall-clock timeout. Limits
    are enforced, not advisory — and never silently: a cap that is reached raises, because
@@ -68,6 +77,27 @@ namespace is its assembly name, so a file's namespace names the package it lands
 | `tool.rs`, `tool_def.rs`         | `Tooling/`                | `BashTool` LLM tool contract |
 | `builtins/extension.rs`, `command_resolver` | `Extensibility/` | Host commands: `IShellExtension`, `ICommandResolver`, `DelegateBuiltin`, `CommandTable` |
 | `lib.rs`                         | `Bash.cs`, `BashBuilder.cs` | Public facade |
+
+### Browser — `src/Computerwelt.Playwright/` (optional package)
+
+No upstream to mirror: this maps [playwright-python](https://github.com/microsoft/playwright-python)'s
+`sync_api` — the specification, in the same sense the Rust trees are — onto Microsoft's .NET
+`Microsoft.Playwright` driver.
+
+| Part | Purpose |
+|---|---|
+| `PlaywrightOptions`, `NavigationPolicy` | what the host decides: browsers, caps, timeouts, the hosts a page may reach |
+| `PlaywrightSession` | the host-owned browser backend; the only thing here that starts a process |
+| `PlaywrightBrowsers` | `playwright install`, wrapped as a method so a host need not shell out |
+| `PlaywrightLibrary`, `PlaywrightExtensions` | the `playwright` / `playwright.sync_api` modules, and `WithPlaywright` at each configuration point |
+| `Interop/` | the async→sync bridge, the keyword-argument reader, value conversion, error translation |
+| `Api/` | one wrapper per Python class, answering attributes by name |
+
+Two rules shape the whole package. Every path a script names is a **virtual** path — bytes
+make the round trip through this process rather than the driver being handed a host path —
+and every driver call is **translated**, so no .NET exception reaches a program.
+`src/Computerwelt.Playwright/README.md` is the full mapping and the list of what is
+deliberately absent.
 
 ### Python — `src/Computerwelt.Emulation.Python/`
 
@@ -131,6 +161,7 @@ Directory.Packages.props     central package versions
 src/
   Computerwelt.Emulation.Bash/          the shell library
   Computerwelt.Emulation.Python/        the Python library
+  Computerwelt.Playwright/              optional: playwright's python sync_api over the .NET driver
   Computerwelt/                         the two joined: `python` as a shell command over one VFS
   Computerwelt.Cli/                     a REPL / script runner over the whole product
   Computerwelt.Emulation.Python.Cli/    a Python-only runner, for isolating that half
@@ -141,6 +172,7 @@ tests/
   Computerwelt.Emulation.Python.SpecTests/  python conformance over `tests/monty-spec/*.py`
   Computerwelt.Tests/                       integration: both interpreters over one filesystem
   Computerwelt.AgentTests/                  the operations a caller performs, end to end
+  Computerwelt.Playwright.Tests/            the navigation policy, and browser scenarios written as Python
   spec/                                     shell acceptance corpus (from bashkit)
   monty-spec/                               python acceptance corpus (from monty)
   monty-extensions/                         fixtures for what this port adds beyond monty
@@ -263,8 +295,9 @@ corpora.
 `.devops/build-nuget.yml` is an Azure DevOps pipeline on a push to `main`, and it is the
 only thing that publishes — there is no other build definition, so nothing releases by
 accident. It restores, builds, runs the whole suite, packs and pushes the three library
-packages (`Computerwelt`, `Computerwelt.Emulation.Bash`, `Computerwelt.Emulation.Python`);
-the two CLIs and the six test projects opt out with `IsPackable`.
+packages (`Computerwelt`, `Computerwelt.Emulation.Bash`, `Computerwelt.Emulation.Python`)
+plus the optional `Computerwelt.Playwright`; the two CLIs and the seven test projects opt
+out with `IsPackable`.
 
 The version is CalVer computed in the pipeline — `yy.M.<build id mod 65536>`, the scheme the
 other packages from this organisation use — so no release version is committed anywhere and
@@ -293,6 +326,7 @@ not already have.
 | `PythonRunner.HostFunctions` / `PythonOptions.HostFunctions` | `Func<PythonHostContext, PyObject[], PyObject>` | a C# function in the program's globals, handed the run's environment |
 | `PythonRunner.ExternalFunctions` | `Func<PyObject[], PyObject>` | the same, for host code that needs no environment |
 | `PythonRunner.Modules` | a `PyObject` | one object shared by every run — for a module with no state |
+| `BashBuilder.WithPlaywright` / `PythonOptions.WithPlaywright` | a `PlaywrightSession` | the optional browser package: registers `playwright` and `playwright.sync_api` over a host-launched browser |
 
 Host code written in C# is handed the environment rather than reaching for one:
 `BuiltinContext` on the shell side, `PythonHostContext` on the Python side. Both carry the

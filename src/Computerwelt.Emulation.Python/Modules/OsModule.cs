@@ -1104,7 +1104,7 @@ public sealed class PyFile : PyObject
     public override string Repr() => $"<{TypeName} name='{_path}' mode='{Mode}'>";
 
     /// <inheritdoc />
-    public override IEnumerable<PyObject>? Iterate() => Lines().Select(static line => (PyObject)new PyStr(line));
+    public override IEnumerable<PyObject>? Iterate() => Pieces();
 
     /// <inheritdoc />
     public override PyObject? GetAttribute(string name)
@@ -1135,9 +1135,6 @@ public sealed class PyFile : PyObject
                     PyExceptionType.UnsupportedOperation, _binary ? "read" : "not readable"));
             }
 
-            var content = Content();
-            var available = _position >= content.Length ? string.Empty : content[_position..];
-
             // A size of None or a negative one reads the rest; anything that is not an
             // integer at all is a TypeError rather than a silent read-everything.
             if (arguments.Length > 0 && arguments[0] is not (PyInt or PyNone))
@@ -1146,32 +1143,67 @@ public sealed class PyFile : PyObject
                     $"'{arguments[0].TypeName}' object cannot be interpreted as an integer"));
             }
 
+            // A binary file is read as bytes and never decoded. Going through a string
+            // would replace every byte that is not valid UTF-8 with U+FFFD, so a PNG read
+            // back would not be the PNG that was written.
+            if (_binary)
+            {
+                var raw = Raw();
+                var rest = Math.Max(0, raw.Length - _position);
+
+                var wanted = arguments.Length > 0 && arguments[0] is PyInt { Value: var count } && count >= 0
+                    ? (int)BigInteger.Min(count, rest)
+                    : rest;
+
+                var slice = raw.AsSpan(Math.Min(_position, raw.Length), wanted).ToArray();
+                _position += wanted;
+                return new PyBytes(slice);
+            }
+
+            var content = Content();
+            var available = _position >= content.Length ? string.Empty : content[_position..];
+
             var text = arguments.Length > 0 && arguments[0] is PyInt { Value: var size } && size >= 0
                 ? available[..(int)BigInteger.Min(size, available.Length)]
                 : available;
 
             _position += text.Length;
-            return _binary ? new PyBytes(Encoding.UTF8.GetBytes(text)) : new PyStr(text);
+            return new PyStr(text);
         }),
 
         "readline" => new PyBuiltinFunction("readline", _ =>
         {
+            if (_binary)
+            {
+                var raw = Raw();
+
+                if (_position >= raw.Length)
+                {
+                    return new PyBytes([]);
+                }
+
+                var stop = Array.IndexOf(raw, (byte)'\n', _position);
+                var last = stop < 0 ? raw.Length : stop + 1;
+                var line = raw[_position..last];
+                _position = last;
+                return new PyBytes(line);
+            }
+
             var content = Content();
 
             if (_position >= content.Length)
             {
-                return Piece(string.Empty);
+                return new PyStr(string.Empty);
             }
 
             var newline = content.IndexOf('\n', _position);
             var end = newline < 0 ? content.Length : newline + 1;
-            var line = content[_position..end];
+            var text = content[_position..end];
             _position = end;
-            return Piece(line);
+            return new PyStr(text);
         }),
 
-        "readlines" => new PyBuiltinFunction("readlines", _ =>
-            new PyList([.. Lines().Select(Piece)])),
+        "readlines" => new PyBuiltinFunction("readlines", _ => new PyList([.. Pieces()])),
 
         "tell" => new PyBuiltinFunction("tell", _ => PyInt.From(_position)),
 
@@ -1188,7 +1220,7 @@ public sealed class PyFile : PyObject
             var target = whence switch
             {
                 1 => _position + offset,
-                2 => Content().Length + offset,
+                2 => (_binary ? Raw().Length : Content().Length) + offset,
                 _ => offset,
             };
 
@@ -1242,7 +1274,13 @@ public sealed class PyFile : PyObject
         {
             foreach (var line in VirtualMachine.RequireIterable(arguments[0]))
             {
-                _fileSystem.Append(_path, Encoding.UTF8.GetBytes(line.Display()));
+                // Bytes go out as they came in, for the same reason `write` keeps them:
+                // a binary file that re-encoded its lines would not round trip.
+                _fileSystem.Append(_path, line switch
+                {
+                    PyBytes bytes => bytes.Value,
+                    var value => Encoding.UTF8.GetBytes(value.Display()),
+                });
             }
 
             return PyNone.Instance;
@@ -1270,25 +1308,51 @@ public sealed class PyFile : PyObject
         };
     }
 
-    /// <summary>Wraps a piece of the content as the mode's type.</summary>
-    private PyObject Piece(string text) =>
-        _binary ? new PyBytes(Encoding.UTF8.GetBytes(text)) : new PyStr(text);
+    /// <summary>The file's bytes, as the filesystem holds them.</summary>
+    private byte[] Raw() => _fileSystem.Read(_path);
 
-    private string Content() => Encoding.UTF8.GetString(_fileSystem.Read(_path));
+    /// <summary>The file's bytes decoded as text, which only a text-mode file does.</summary>
+    private string Content() => Encoding.UTF8.GetString(Raw());
 
-    private IEnumerable<string> Lines()
+    /// <summary>
+    /// The rest of the file, line by line, in the type the mode reads in.
+    /// </summary>
+    /// <remarks>
+    /// One method for both modes because iteration, <c>readlines</c> and the newline rule
+    /// are the same in each; only the unit differs — characters for a text file, bytes for
+    /// a binary one, which is what keeps a binary file from being decoded at all.
+    /// </remarks>
+    private IEnumerable<PyObject> Pieces()
     {
+        if (_binary)
+        {
+            var raw = Raw();
+            var from = _position;
+
+            // A position past the end leaves it there rather than snapping back.
+            _position = Math.Max(_position, raw.Length);
+
+            while (from < raw.Length)
+            {
+                var stop = Array.IndexOf(raw, (byte)'\n', from);
+                var last = stop < 0 ? raw.Length : stop + 1;
+                yield return new PyBytes(raw[from..last]);
+                from = last;
+            }
+
+            yield break;
+        }
+
         var content = Content();
         var start = _position;
 
-        // A position past the end leaves it there rather than snapping back to the length.
         _position = Math.Max(_position, content.Length);
 
         while (start < content.Length)
         {
             var newline = content.IndexOf('\n', start);
             var end = newline < 0 ? content.Length : newline + 1;
-            yield return content[start..end];
+            yield return new PyStr(content[start..end]);
             start = end;
         }
     }
