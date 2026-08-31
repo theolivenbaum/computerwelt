@@ -95,6 +95,7 @@ var bash = Bash.CreateBuilder()
 | `WithoutBuiltin` | a name | taking a command away |
 | `PythonOptions.Libraries` | `PythonLibrary` | a Python module, written in C# or in Python |
 | `PythonOptions.HostFunctions` | `Func<PythonHostContext, PyObject[], PyObject>` | a C# function a Python program calls without importing anything |
+| `VirtualMachine.WhenRunCompleted` | an `Action` | handing back what a library held, when the run ends however it ends |
 
 ### Implementing functionality in C#
 
@@ -260,8 +261,8 @@ Never lower a baseline to make a build green.
 
 `tests/monty-extensions/` is the opposite arrangement: absolute rather than ratcheted, and
 deliberately separate, because every fixture in it exercises something upstream Monty does
-not have — `glob`, `fnmatch`, `os.walk`, `os.scandir`, `io`, `sys.argv`. Run one against
-upstream and it fails at the import. To check that the port still stands on upstream's
+not have — `glob`, `fnmatch`, `os.walk`, `os.scandir`, `io`, `sys.argv`, `__call__`. Run one
+against upstream and it fails at the import, or on the dunder it does not dispatch. To check that the port still stands on upstream's
 corpus alone:
 
 ```bash
@@ -280,8 +281,8 @@ committed anywhere in the repository.
 | shell | **2,521 / 2,521** | 73 commands implemented; 27 cases skipped by upstream directive |
 | python | **557 / 558** | parser, bytecode compiler, VM, types, builtins, the stdlib subset, dunders |
 | joined | **210 / 210** | 153 agent-operation tests plus upstream's 57 `python` command cases |
-| extensions | **11 / 11** | fixtures for what this port adds beyond monty |
-| playwright | **34 / 34** | the navigation policy, and 21 browser scenarios written as Python |
+| extensions | **12 / 12** | fixtures for what this port adds beyond monty |
+| playwright | **40 / 40** | the navigation policy, 22 browser scenarios written as Python, and 5 on context lifetime |
 
 The one Python fixture that does not pass asserts that a temporary's `id()` is handed to
 the next object of the same shape — an artifact of upstream's slot-recycling heap. Object

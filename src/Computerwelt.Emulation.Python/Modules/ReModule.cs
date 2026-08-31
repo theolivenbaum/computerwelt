@@ -436,6 +436,19 @@ public static class ReModule
         /// <summary>The pattern text as written.</summary>
         public string Source { get; }
 
+        /// <summary>
+        /// The compiled form, for host code that has to hand a pattern to something that
+        /// takes a .NET one.
+        /// </summary>
+        /// <remarks>
+        /// This is the translated pattern, not <see cref="Source"/>: the two differ wherever
+        /// Python's syntax and .NET's do — <c>(?P&lt;name&gt;…)</c> against
+        /// <c>(?&lt;name&gt;…)</c>, among others — and it is the translated one that means
+        /// what the program wrote. A caller that needs the text a user typed wants
+        /// <see cref="Source"/> instead.
+        /// </remarks>
+        public Regex Compiled => _regex;
+
         /// <summary>The named groups, mapped to their numbers.</summary>
         public IReadOnlyDictionary<string, int> Names => _names;
 

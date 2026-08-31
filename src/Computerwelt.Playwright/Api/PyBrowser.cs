@@ -50,13 +50,7 @@ internal sealed class PyBrowser : PlaywrightObject
         {
             arguments.String("reason");
             arguments.Done(0);
-
-            foreach (var context in Bridge.Contexts.ToArray())
-            {
-                context.CloseQuietly();
-            }
-
-            Bridge.Contexts.Clear();
+            Bridge.ReleaseAll();
         }),
 
         "new_browser_cdp_session" or "start_tracing" or "stop_tracing" or "bind" or "unbind" =>

@@ -43,8 +43,28 @@ internal sealed class Bridge
     /// <summary>What the browser may reach.</summary>
     public NavigationPolicy Policy => Session.Policy;
 
-    /// <summary>Every browser context this run opened, so <c>stop()</c> can close them all.</summary>
+    /// <summary>Every browser context this run opened, so all of them can be closed at once.</summary>
     public List<Api.PyBrowserContext> Contexts { get; } = [];
+
+    /// <summary>
+    /// Closes every context this run opened and hands its slot back to the session.
+    /// </summary>
+    /// <remarks>
+    /// Reached three ways, and the third is the one that matters: <c>p.stop()</c>, the exit
+    /// of a <c>with sync_playwright()</c> block, and the end of the run itself. The first two
+    /// are the program tidying up after itself; the last is what happens when it did not,
+    /// which is the case a shared browser needs protecting from.
+    /// </remarks>
+    public void ReleaseAll()
+    {
+        // Copied first: closing a context takes it out of this list.
+        foreach (var context in Contexts.ToArray())
+        {
+            context.CloseQuietly();
+        }
+
+        Contexts.Clear();
+    }
 
     /// <summary>
     /// Runs an asynchronous driver call to completion and reports its result to the script.

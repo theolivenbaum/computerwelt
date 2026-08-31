@@ -155,6 +155,64 @@ public sealed class ScenarioTests
             run(body)
             """,
 
+        ["matches_with_regular_expressions"] = """
+            import re
+
+            def body(p, browser, page):
+                page.goto("data:text/html,<title>Report 2026</title>"
+                          "<button>Save draft</button><button>Cancel</button>"
+                          "<p class='row total'>Total: 42</p>")
+
+                # Upstream types these as `str | Pattern`, and the two mean different
+                # things: a string matches loosely and by substring, a pattern as written.
+                assert page.get_by_text(re.compile(r'^Save')).count() == 1
+                assert page.get_by_text(re.compile(r'^ave')).count() == 0
+                assert page.get_by_role('button', name=re.compile(r'Cancel|Save')).count() == 2
+
+                assert page.locator('p').filter(has_text=re.compile(r'\d+')).count() == 1
+                assert page.locator('p', has_text=re.compile(r'^Total')).count() == 1
+
+                expect(page.locator('p')).to_have_text(re.compile(r'Total: \d+'))
+                expect(page.locator('p')).to_have_class(re.compile(r'\btotal\b'))
+                expect(page).to_have_title(re.compile(r'^Report'))
+                expect(page).to_have_url(re.compile(r'^data:'))
+
+                # A sequence asserts about the whole list, including how many there are, so
+                # a one-element list is not the same claim as the bare value.
+                expect(page.locator('button')).to_have_text(['Save draft', 'Cancel'])
+                expect(page.locator('p')).to_have_text([re.compile(r'^Total')])
+
+                try:
+                    expect(page.locator('button')).to_have_text(['Save draft'], timeout=500)
+                    raise Exception('a one-element list should not match two elements')
+                except AssertionError:
+                    pass
+
+                # The driver has no overload for a sequence that mixes the two kinds, so
+                # the mixture is refused rather than being flattened into one of them.
+                try:
+                    expect(page.locator('button')).to_have_text(['Save draft', re.compile('Cancel')])
+                    raise Exception('a mixed sequence should have been refused')
+                except Error as failure:
+                    assert 'all strings or all patterns' in str(failure)
+
+                # A pattern that does not hold still fails as an AssertionError.
+                try:
+                    expect(page.locator('p')).to_have_text(re.compile(r'^Total: \d\d\d$'), timeout=500)
+                    raise Exception('the assertion should have failed')
+                except AssertionError:
+                    pass
+
+                # Anything that is neither is reported rather than stringified.
+                try:
+                    page.get_by_text(7)
+                    raise Exception('the type should have been reported')
+                except TypeError as failure:
+                    assert 're.compile()' in str(failure)
+
+            run(body)
+            """,
+
         ["asserts_with_expect"] = """
             def body(p, browser, page):
                 page.set_content("<h1 id='t'>Hello</h1><button>Save</button><button>Cancel</button>")

@@ -93,15 +93,7 @@ internal sealed class PyPlaywright : PlaywrightObject
     /// other tenant using it. A context is the thing this run created and the thing that
     /// holds its cookies, so it is the thing that goes.
     /// </remarks>
-    public void Stop()
-    {
-        foreach (var context in Bridge.Contexts.ToArray())
-        {
-            context.CloseQuietly();
-        }
-
-        Bridge.Contexts.Clear();
-    }
+    public void Stop() => Bridge.ReleaseAll();
 
     private PyDict Devices()
     {

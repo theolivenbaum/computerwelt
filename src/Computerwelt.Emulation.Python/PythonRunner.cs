@@ -181,6 +181,23 @@ public sealed class PythonRunner
 
         try
         {
+            return Execute(machine, globals, source, fileName);
+        }
+        finally
+        {
+            // Whatever happened — a clean end, an uncaught exception, a limit reached — the
+            // libraries this run built get told it is over, so anything they are holding on
+            // the program's behalf is handed back. The result is already built by here, so
+            // nothing a callback does can change what the run reported.
+            machine.CompleteRun();
+        }
+    }
+
+    /// <summary>Compiles and runs the program, turning however it ended into a result.</summary>
+    private static RunResult Execute(VirtualMachine machine, PyDict globals, string source, string fileName)
+    {
+        try
+        {
             var module = Parser.Parse(source);
             var code = Compiler.CompileModule(module, fileName);
             var value = machine.RunModule(code);

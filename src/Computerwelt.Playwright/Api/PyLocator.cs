@@ -68,13 +68,7 @@ internal sealed class PyLocator : PlaywrightObject
             var filter = Locators.FilterOptions(arguments);
             arguments.Done(1);
 
-            var options = new LocatorLocatorOptions
-            {
-                Has = filter.Has,
-                HasNot = filter.HasNot,
-                HasTextString = filter.HasText,
-                HasNotTextString = filter.HasNotText,
-            };
+            var options = Locators.ForLocator(filter);
 
             return new PyLocator(Bridge, selector switch
             {
@@ -90,14 +84,7 @@ internal sealed class PyLocator : PlaywrightObject
             var filter = Locators.FilterOptions(arguments, withVisible: true);
             arguments.Done(0);
 
-            return new PyLocator(Bridge, Locator.Filter(new LocatorFilterOptions
-            {
-                Has = filter.Has,
-                HasNot = filter.HasNot,
-                HasTextString = filter.HasText,
-                HasNotTextString = filter.HasNotText,
-                Visible = filter.Visible,
-            }));
+            return new PyLocator(Bridge, Locator.Filter(Locators.ForFilter(filter)));
         }),
 
         "or_" => Method("or_", arguments => Combine(arguments, Locator.Or)),
@@ -588,13 +575,7 @@ internal sealed class PyFrameLocator : PlaywrightObject
             var filter = Locators.FilterOptions(arguments);
             arguments.Done(1);
 
-            return new PyLocator(Bridge, _frame.Locator(selector, new FrameLocatorLocatorOptions
-            {
-                Has = filter.Has,
-                HasNot = filter.HasNot,
-                HasTextString = filter.HasText,
-                HasNotTextString = filter.HasNotText,
-            }));
+            return new PyLocator(Bridge, _frame.Locator(selector, Locators.ForFrame(filter)));
         }),
 
         "frame_locator" => Method("frame_locator", arguments =>
